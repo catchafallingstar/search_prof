@@ -79,8 +79,10 @@ TEXT = {
         "query_failed": "⚠️ Failed to query NSF grants for {name}: {error}",
         "hit_grant": "💵 [Grant Hit] {name} ({inst}) found {count} NSF grants, hiring_score +{score}",
         "sync_complete": "\n🎉 NSF grants sync complete!",
-        "crii_start": "🚀 Discovering brand new Assistant Professors from NSF CRII awards...",
+        "crii_start": "🚀 Discovering brand new Assistant Professors from [{prog}] '{search_query}' awards...",
         "crii_skip": "⚠️ Phase 1 CRII Discovery skipped: {error}",
+        "crii_inserted": "  └─ 🌟 Found new CRII AP: {name} ({inst}) -> Adding to radar!",
+        "crii_updated": "  └─ 🎓 Tagged existing PI as CRII AP: {name} ({inst})",
         #search bypass: 
         "search_bypassed": "⚠️ Search bypassed: {error}",
         "phase2_start": "🌐 Running Phase 2: Searching web for unlisted new APs in {domain}...",
@@ -90,6 +92,15 @@ TEXT = {
         "step2_lbl": "💰 Step 2/3: Cross-referencing NSF Grants database...",
         "step3_lbl": "⚡ Step 3/3: Scanning web, social & personal homepage recruiting signals...",
         "step3_aborted": "🛑 Step 3 Aborted",
+        # Taxonomy & System Routing
+        "taxonomy_success": "🏷️ **Taxonomy Routed** | Topic: **{topic}** | Field: **{field}** | Strategy: **{strategy}**",
+        #pfnotfound
+        "no_paper_tag": "⚠️ **[0 Papers Fetched]**",
+        "no_paper_info": (
+            "💡 **Why +100 Points for CRII Base?** This professor was discovered directly via an NSF CRII Award, but we fetched **0 papers** for them in this run. This usually happens for one of two reasons:\n\n"
+            "* They are a brand-new PI who hasn't yet published as a senior author.\n"
+            "* Their recent PI papers simply fell outside your 'Max Papers' limit or didn't match the exact search keywords.\n\n"
+            "Because an NSF CRII grant is such a definitive early-career signal, we assigned 100 base points to ensure this highly qualified candidate stays on your radar!")
     },
     "中文": {
         "title": "🎯 ScholarRadar | 学术导师招人雷达",
@@ -137,6 +148,7 @@ TEXT = {
         "stop_btn": "🛑 终止 / 取消扫描",
         "stop_requested": "🛑 收到终止请求... 正在安全关闭数据库连接并保存进度。",
         "stop_success": "⚠️ 挖掘任务已被用户取消，已保存部分处理结果！",
+        "taxonomy_success": "🏷️ **智能匹配学科分类** | 主题: **{topic}** | 领域: **{field}** | 检索策略: **{strategy}**",
         #hiring: 
         "start_radar": "🚀 启动全渠道高灵敏度雷达，目标: {count} 位导师\n",
         "skip_non_academic": "⏭️ [跳过非高校单位] {name} ({institution})",
@@ -157,6 +169,8 @@ TEXT = {
         "start_query": "💰 开始为 {count} 位导师查询 NSF 经费...",
         "query_failed": "⚠️ 查询 {name} 的 NSF 经费失败: {error}",
         "hit_grant": "💵 [经费命中] {name} ({inst}) 查到 {count} 笔 NSF 经费, hiring_score +{score}",
+        "crii_inserted": "  └─ 🌟 发现新晋 CRII 助理教授: {name} ({inst}) -> 已加入雷达!",
+        "crii_updated": "  └─ 🎓 将已有 PI 标记为 CRII 助理教授: {name} ({inst})",
         "sync_complete": "\n🎉 NSF 经费同步完成！",
         "crii_start": "🚀 正在从 NSF CRII 资助中检索新入职助理教授...",
         "crii_skip": "⚠️ 阶段 1 CRII 检索已跳过: {error}",
@@ -168,6 +182,14 @@ TEXT = {
         "step2_lbl": "💰 步骤 2/3: 交叉比对 NSF 经费数据库...",
         "step3_lbl": "⚡ 步骤 3/3: 扫描主页及社交平台招人信号...",
         "step3_aborted": "🛑 步骤 3 已终止",
+        #noproffound
+        "no_paper_tag": "⚠️ **[未抓取到论文]**",
+        "no_paper_info": (
+            "💡 **为什么加 100 分？** 这位教授是通过 NSF CRII 奖项直接发现的，但在本次运行中我们**没有抓取到他们的任何论文**。这通常是因为以下两个原因之一：\n\n"
+            "* 他们是刚刚建立实验室的新晋 PI, 尚未以通讯作者身份发表过论文。\n"
+            "* 他们近期作为 PI 的论文刚好超出了您在侧边栏设置的“最大论文数”限制，或者与搜索关键词不完全匹配。\n\n"
+            "由于 NSF CRII 奖项是极其明确的早期职业生涯（招聘）信号，我们加了了 100 基础分，以确保这位高潜力候选人留在您的雷达列表中！"
+        )
     },
 }
 TEXT["en"] = TEXT["English"]

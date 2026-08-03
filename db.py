@@ -40,7 +40,9 @@ def get_sqlalchemy_engine():
 def fetch_radar_dataframe(engine, session_id):
     query = text("""
         SELECT p.id AS prof_id, p.name, p.institution, COALESCE(p.hiring_score, 0) AS hiring_score, 
+               p.score_breakdown, 
                p.homepage_url, p.research_domain, p.career_stage,
+               (SELECT COUNT(*) FROM professor_papers pp WHERE pp.professor_id = p.id) AS paper_count,
                hs.signal_type, hs.raw_text, hs.confidence_score, hs.source_url
         FROM professors p
         LEFT JOIN hiring_signals hs ON p.id = hs.professor_id
@@ -85,6 +87,7 @@ def auto_migrate_db(conn):
             cur.execute("""
                 ALTER TABLE professors ADD COLUMN IF NOT EXISTS session_id VARCHAR(255);
                 ALTER TABLE papers ADD COLUMN IF NOT EXISTS session_id VARCHAR(255);
+                ALTER TABLE professors ADD COLUMN IF NOT EXISTS score_breakdown TEXT DEFAULT '';
             """)
             
             # 2. Drop legacy indexes/constraints on openalex_id that cause crashes
@@ -103,7 +106,7 @@ def auto_migrate_db(conn):
                 ALTER TABLE papers DROP CONSTRAINT IF EXISTS papers_openalex_id_key CASCADE;
                 ALTER TABLE papers DROP CONSTRAINT IF EXISTS unique_paper_session CASCADE;
                 ALTER TABLE papers ADD CONSTRAINT unique_paper_session UNIQUE (openalex_id, session_id);
-            """)
+                        """)
 
             # 3.1 hiring_signals needs a raw_text_hash column + unique index so that
             # save_signal_to_db()'s "ON CONFLICT (raw_text_hash) DO NOTHING" actually

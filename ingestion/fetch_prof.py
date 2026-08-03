@@ -4,36 +4,47 @@ import requests
 from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_db_connection
-
-from ingestion.i18n import TEXT, t, get_radar_session
+from ingestion.i18n import t, get_radar_session
 
 OPENALEX_URL = "https://api.openalex.org/works"
 
-def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=100):
+def fetch_professors_by_keywords(tax_meta: dict, max_papers=100):
     session_id = get_radar_session() 
     
     current_year = datetime.now().year
     start_year = current_year - 2
-    
     year_range = f"{start_year}-{current_year}"
-    if not keywords_list:
-        keywords_list = [domain_name]
+    
+    topic_id = tax_meta.get("topic_id")
+    domain_name = tax_meta.get("topic_name") or tax_meta.get("raw_query")
 
     print(t("start_search", domain=domain_name, year_range=year_range))
-    query_str = " OR ".join(keywords_list)
     
     works = []
     page = 1
     remaining = max_papers
 
+    # Clean topic ID format (e.g., "https://openalex.org/T10234" -> "T10234")
+    clean_topic_id = topic_id.split("/")[-1] if topic_id else None
+
     while remaining > 0:
         fetch_count = min(remaining, 100)
-        params = {
-            'filter': f'publication_year:{year_range},institutions.country_code:us',
-            'search': query_str,
-            'per_page': fetch_count,
-            'page': page
-        }
+        
+        # FIX: Filter explicitly by topic ID if Layer 1 found one
+        if clean_topic_id:
+            filter_str = f'publication_year:{year_range},institutions.country_code:us,topics.id:{clean_topic_id}'
+            params = {
+                'filter': filter_str,
+                'per_page': fetch_count,
+                'page': page
+            }
+        else:
+            params = {
+                'filter': f'publication_year:{year_range},institutions.country_code:us',
+                'search': domain_name,
+                'per_page': fetch_count,
+                'page': page
+            }
 
         try:
             res = requests.get(OPENALEX_URL, params=params, timeout=15)
@@ -56,7 +67,6 @@ def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=10
             break
 
     print(t("papers_found", count=len(works)))
-
     if not works:
         return
 
@@ -81,8 +91,6 @@ def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=10
         author_info = pi_author.get('author', {})
         prof_name = author_info.get('display_name')
         openalex_id = author_info.get('id')
-        
-        # 💡 Extract OpenAlex native homepage/ORCID (Tier 1 Data)
         native_homepage = author_info.get('homepage_url') or author_info.get('orcid') or ''
 
         if not prof_name or not openalex_id:
@@ -90,8 +98,7 @@ def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=10
 
         institutions = pi_author.get('institutions', [])
         institution_name = "Unknown Institution"
-        country_code = ""
-        inst_type = ""
+        country_code, inst_type = "", ""
 
         if institutions:
             inst_obj = institutions[0]
@@ -99,18 +106,13 @@ def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=10
             country_code = (inst_obj.get('country_code') or "").upper()
             inst_type = (inst_obj.get('type') or "").lower()
 
-        # 💡 Filter: Must be in US and must be Higher Education
-        if country_code != "US":
-            continue
-            
-        if inst_type and inst_type != "education":
+        if country_code != "US" or (inst_type and inst_type != "education"):
             continue
 
         safe_name = prof_name[:99]
         safe_inst = institution_name[:99]
-        safe_domain = domain_name[:99]
+        safe_domain = raw_domain[:99]
 
-        # 1. Check if the professor already exists in THIS session
         cursor.execute("""
             SELECT id FROM professors 
             WHERE name = %s AND institution = %s AND session_id = %s;
@@ -128,7 +130,6 @@ def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=10
                 WHERE id = %s;
             """, (openalex_id, native_homepage, safe_domain, prof_id))
         else:
-            # 2. Insert as a new professor scoped to this session
             cursor.execute("""
                 INSERT INTO professors (name, institution, openalex_id, research_domain, homepage_url, session_id)
                 VALUES (%s, %s, %s, %s, %s, %s)
@@ -142,29 +143,22 @@ def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=10
 
         paper_title = (work.get('title') or 'Untitled')[:250]
         publication_year = work.get('publication_year')
-
-    
         openalex_paper_id = work.get('id')
 
         primary_loc = work.get('primary_location') or {}
         source_info = primary_loc.get('source') or {}
         venue = (source_info.get('display_name') or 'Conference/Journal')[:99]
 
-        # 1. Insert the paper first (using the correct openalex_id column name we fixed earlier)
         cursor.execute("""
             INSERT INTO papers (title, venue, publication_year, openalex_id, session_id)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (openalex_id, session_id) DO UPDATE
-            SET title = EXCLUDED.title,
-                venue = EXCLUDED.venue
+            SET title = EXCLUDED.title, venue = EXCLUDED.venue
             RETURNING id;
         """, (paper_title, venue, publication_year, openalex_paper_id, session_id))
 
-        
-        # 2. Grab the newly created paper's ID
         paper_id = cursor.fetchone()[0]
         
-        # 3. Link the professor to the paper (using the correct author_position column)
         cursor.execute("""
             INSERT INTO professor_papers (professor_id, paper_id, author_position)
             VALUES (%s, %s, 'corresponding')
@@ -179,6 +173,3 @@ def fetch_professors_by_keywords( domain_name, keywords_list=None, max_papers=10
     conn.close()
 
     print(t("process_complete", count=saved_count))
-
-if __name__ == "__main__":
-    fetch_professors_by_keywords()

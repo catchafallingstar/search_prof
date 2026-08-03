@@ -90,19 +90,26 @@ def save_signal_to_db(prof_id, sig_type, raw_quote, source_url):
             ON CONFLICT (raw_text_hash) DO NOTHING;
         """, (prof_id, signal_category, raw_quote, confidence, source_url, quote_hash))
 
+        breakdown_str = f" +{score_boost} ({signal_category})"
+
+        breakdown_str = f" +{score_boost} ({signal_category})"
+
         if cur.rowcount > 0:
             if is_new_ap:
                 cur.execute("""
                     UPDATE professors 
-                    SET hiring_score = hiring_score + %s, career_stage = 'NEW_AP'
+                    SET hiring_score = hiring_score + %s, 
+                        career_stage = 'NEW_AP',
+                        score_breakdown = COALESCE(score_breakdown, '') || %s
                     WHERE id = %s;
-                """, (score_boost, prof_id))
+                """, (score_boost, breakdown_str, prof_id))
             else:
                 cur.execute("""
                     UPDATE professors 
-                    SET hiring_score = hiring_score + %s
+                    SET hiring_score = hiring_score + %s,
+                        score_breakdown = COALESCE(score_breakdown, '') || %s
                     WHERE id = %s;
-                """, (score_boost, prof_id))
+                """, (score_boost, breakdown_str, prof_id))
 
         conn.commit()
         
@@ -193,7 +200,7 @@ def scan_hiring_signals(domain_name=None, stop_check_callback=None):
                 prof_name = prof_tuple[1]
                 prof_inst = prof_tuple[2]
 
-                    # 👤 Print Analyzing status using i18n
+                    # Print Analyzing status using i18n
                 print(t("analyzing", name=prof_name, institution=prof_inst)) 
 
                 if result:

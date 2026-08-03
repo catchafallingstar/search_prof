@@ -8,7 +8,10 @@ from db import get_db_connection
 from db import auto_migrate_db
 from db import fetch_radar_dataframe, get_sqlalchemy_engine
 from ingestion.i18n import TEXT, t, set_radar_context
-
+from ingestion.fetch_prof import fetch_professors_by_keywords
+from ingestion.parse_hiring_signals import scan_hiring_signals
+from ingestion.taxonomy import normalize_taxonomy
+from ingestion.check_grants import check_and_save_grants  # Renamed/updated function
 st.set_page_config(
     page_title="ScholarRadar | Academic Hiring Radar", page_icon="🎯", layout="wide"
 )
@@ -112,12 +115,22 @@ if submit_btn:
         st.session_state["mining_domain"] = new_domain
 
 # 2. Run the mining process based on the session state
+# In app.py - inside the mining runner block
 if st.session_state.get("is_mining", False):
     domain = st.session_state["mining_domain"]
 
-    st.subheader(t("mine_title", domain=domain))
-        
-    # Stop Button Container
+    # ------------------------------------------------------------------
+    # RUN LAYER 1 & 2: TAXONOMY NORMALIZATION & AGENCY ROUTING
+    # ------------------------------------------------------------------
+    from ingestion.taxonomy import normalize_taxonomy
+    taxonomy_info = normalize_taxonomy(domain)
+    
+    st.subheader(f"🎯 Target Normalized: {taxonomy_info['field_name']} ({taxonomy_info['domain_name']})")
+    st.info(
+        f"**Routed Agency**: {taxonomy_info['router_config']['primary_agency']} "
+        f"| **Target Programs**: {', '.join(taxonomy_info['router_config']['programs'])}"
+    )
+
     stop_col, _ = st.columns([1, 4])
     with stop_col:
         if st.button(t("stop_btn"), type="primary"):
@@ -126,46 +139,40 @@ if st.session_state.get("is_mining", False):
             st.warning(t("stop_requested"))
             st.rerun()
 
-    from ingestion.fetch_prof import fetch_professors_by_keywords
-    from ingestion.check_grants import check_and_save_nsf_grants
-    from ingestion.parse_hiring_signals import scan_hiring_signals
+   
 
     def is_stop_requested():
         return st.session_state.get("stop_mining", False)
 
     try:
-        # 🔍 STEP 1: OpenAlex Search 
+        
+# 1. STEP 0: Layer 1 Taxonomy Normalization
+        tax_meta = normalize_taxonomy(domain)
+        st.success(t(
+                "taxonomy_success",
+                topic=tax_meta.get("topic_name"),
+                field=tax_meta.get("field_name"),
+                strategy=tax_meta.get("agency_category")
+            ))
+
+# 2. STEP 1: OpenAlex Topic-Filtered Search 
         with st.status(t("step1_lbl"), expanded=True) as status1:
             log1 = st.empty()
             sys.stdout.register_ui(st.session_state["session_id"], log1)
             fetch_professors_by_keywords(
-                domain_name=domain,
-                keywords_list=[domain],
+                tax_meta=tax_meta,
                 max_papers=max_papers_input,
             )
             status1.update(label="✅ " + t("step1_lbl"), state="complete", expanded=False)
 
-        # 💰 STEP 2: NSF Grants Search
+# 3. STEP 2: Multi-Agency Grants Engine
         if not is_stop_requested():
             with st.status(t("step2_lbl"), expanded=True) as status2:
                 log2 = st.empty()
                 sys.stdout.register_ui(st.session_state["session_id"], log2)
-                check_and_save_nsf_grants(domain=domain)
+                check_and_save_grants(tax_meta=tax_meta)
                 status2.update(label="✅ " + t("step2_lbl"), state="complete", expanded=False)
 
-        # ⚡ STEP 3: Multi-Channel Hiring Scan
-        if not is_stop_requested():
-            with st.status(t("step3_lbl"), expanded=True) as status3:
-                log3 = st.empty()
-                sys.stdout.register_ui(st.session_state["session_id"], log3)
-                scan_hiring_signals(domain_name=domain, stop_check_callback=is_stop_requested)
-                    
-                if is_stop_requested():
-                    status3.update(label=t("step3_aborted"), state="error", expanded=True)
-                else:
-                    status3.update(label="✅ " + t("step3_lbl"), state="complete", expanded=False)
-                    
-        # 🎉 Finish handling
         if is_stop_requested():
             st.warning(t("stop_success"))
         else:
@@ -174,7 +181,6 @@ if st.session_state.get("is_mining", False):
     except Exception as e:
         st.error(f"❌ Execution error: {e}")
     finally:
-        # No need to reset sys.stdout back to original; SessionAwareStreamCapture safely handles it.
         st.session_state["is_mining"] = False 
         st.cache_data.clear()
 
@@ -307,6 +313,10 @@ for name, group in filtered_df.groupby("name", sort=False):
     inst = first_row["institution"]
     homepage = str(first_row["homepage_url"]).strip()
     
+    # Get the paper count
+    paper_count = first_row.get("paper_count", 0)
+    no_paper_tag = t("no_paper_tag") if paper_count == 0 else ""
+    
     career_stage = first_row.get("career_stage", "ESTABLISHED_PI")
     ap_tag = "🎓 [1st/2nd Yr AP]" if career_stage == "NEW_AP" else ""
     
@@ -314,17 +324,24 @@ for name, group in filtered_df.groupby("name", sort=False):
     signal_tag = "📢 [Hiring Signal]" if has_signals else ""
 
     badge = (
-        t("badge_high")
-        if score >= 100
+        t("badge_high") if score >= 100
         else (t("badge_medium") if score >= 60 else t("badge_low"))
     )
+    
+    breakdown = str(first_row.get("score_breakdown", "")).strip()
+    breakdown_display = f" [{breakdown}]" if breakdown else ""
 
-    with st.expander(f"{badge} **{name}** — {inst} {ap_tag} {signal_tag} | Score: `{score}`"):
+    # Add the no_paper_tag to the title
+    with st.expander(f"{badge} **{name}** — {inst} {ap_tag} {signal_tag} {no_paper_tag} | Score: `{score}`{breakdown_display}"):
+        
+        # Display the localized explanation ONLY if they have 0 papers
+        if paper_count == 0:
+            st.info(t("no_paper_info"))
+        
         if homepage and homepage.lower() != "nan":
             st.markdown(f"{t('homepage')}: [{homepage}]({homepage})")
         else:
             st.markdown(t("no_homepage"))
-
         valid_signals = group[
             group["raw_text"].astype(str).str.strip().ne("") & 
             group["raw_text"].astype(str).str.lower().ne("nan")
