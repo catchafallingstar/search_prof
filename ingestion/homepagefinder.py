@@ -1,89 +1,100 @@
-import random
-import time
-import urllib.parse
-from ddgs import DDGS
-from ingestion.i18n import t
-from ingestion.socialradar import ddg_lock
+import ipaddress
 import os
+import random
+import re
+import socket
+import threading
+import time
+from urllib.parse import urlparse
 
-EXCLUDED_DOMAINS = [
-    'wikipedia.org', 'linkedin.com', 'twitter.com', 'x.com', 
-    'facebook.com', 'youtube.com', 'instagram.com', 'reddit.com',
-    'scholar.google', 'researchgate.net', 'semanticscholar.org', 
-    'arxiv.org', 'nature.com', 'sciencedirect.com', 'ieee.org', 'acm.org',
-    'orcid.org', 'scispace.com', 'zenodo.org', 'f1000research.com', 
-    'theamericanjournals.com', 'mdpi.com', 'springer.com', 'wiley.com'
-]
+from ddgs import DDGS
+
+EXCLUDED_DOMAINS = {
+    "academia.edu",
+    "amazon.com",
+    "facebook.com",
+    "google.com",
+    "linkedin.com",
+    "ratemyprofessors.com",
+    "researchgate.net",
+    "scholar.google.com",
+    "ssrn.com",
+    "wikipedia.org",
+}
+EXCLUDED_SUFFIXES = (".pdf", ".doc", ".docx", ".ppt", ".pptx", ".zip", ".epub")
+_search_lock = threading.Lock()
+
+
+def _result_matches_professor(prof_name: str, result: dict[str, object]) -> bool:
+    parts = re.findall(r"[a-z0-9]+", prof_name.casefold())
+    if not parts:
+        return False
+    combined = " ".join(
+        str(result.get(key) or "") for key in ("title", "body", "href")
+    ).casefold()
+    if len(parts) == 1:
+        return parts[0] in combined
+    return parts[0] in combined and parts[-1] in combined
+
+
+def is_public_http_url(url: str, resolve_dns: bool = False) -> bool:
+    try:
+        parsed = urlparse(str(url).strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        hostname = parsed.hostname.casefold().rstrip(".")
+        if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+            return False
+        if any(hostname == domain or hostname.endswith(f".{domain}") for domain in EXCLUDED_DOMAINS):
+            return False
+        if parsed.path.casefold().endswith(EXCLUDED_SUFFIXES):
+            return False
+        try:
+            literal_ip = ipaddress.ip_address(hostname)
+            if not literal_ip.is_global:
+                return False
+        except ValueError:
+            pass
+        if resolve_dns:
+            addresses = {item[4][0] for item in socket.getaddrinfo(hostname, None)}
+            if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
+
 
 def is_valid_homepage(url: str) -> bool:
-    """Helper to check if a URL is a valid lab/personal homepage."""
-    if not url or not isinstance(url, str):
-        return False
-        
-    url_lower = url.strip().lower()
-    
-    # NEW FIX: Reject relative tracking links returned by DDG
-    if not url_lower.startswith("http"):
-        return False
-    
-    if url_lower.endswith(('.pdf', '.doc', '.docx', '.ppt', '.pptx', '.zip')):
-        return False
-        
-    if any(domain in url_lower for domain in EXCLUDED_DOMAINS):
-        return False
-        
-    return True
+    return is_public_http_url(url, resolve_dns=False)
 
-def get_professor_homepage(prof_name: str, institution: str, openalex_homepage: str = None, **kwargs) -> str:
-    # ------------------------------------------------------------------
-    # TIER 1: OpenAlex Native URL (Instant hit, no web call required)
-    # ------------------------------------------------------------------
-    if openalex_homepage and str(openalex_homepage).startswith("http"):
-        if is_valid_homepage(openalex_homepage):
-            return openalex_homepage.strip()
 
-    # ------------------------------------------------------------------
-    # TIER 2: Fast DDG Search (Clean queries without OR syntax)
-    # ------------------------------------------------------------------
-    clean_inst = (institution or "").split('(')[0].strip()
-    proxy_url = os.getenv("ROTATING_PROXY_URL")
+def get_professor_homepage(
+    prof_name: str,
+    institution: str,
+    openalex_homepage: str | None = None,
+    **_: object,
+) -> str:
+    if openalex_homepage and is_valid_homepage(openalex_homepage):
+        return openalex_homepage.strip()
 
-    # CLEAN QUERIES: No parentheses, no "OR" keywords
-    candidate_queries = [
-        f'"{prof_name}" "{clean_inst}" faculty homepage',
-        f'{prof_name} {clean_inst} lab website'
+    clean_institution = (institution or "").split("(")[0].strip()
+    queries = [
+        f'"{prof_name}" "{clean_institution}" faculty homepage',
+        f'"{prof_name}" "{clean_institution}" lab website',
     ]
-
-    for query in candidate_queries:
+    proxy_url = os.getenv("ROTATING_PROXY_URL")
+    for query in queries:
         try:
-            # 1. ONLY hold the lock to stagger the requests (anti-bot protection)
-            with ddg_lock:
-                time.sleep(random.uniform(0.5, 1.5))
-
-            # 2. Configure arguments OUTSIDE the lock
-            ddgs_kwargs = {"timeout": 6} # You can safely keep 6 seconds now!
+            with _search_lock:
+                time.sleep(random.uniform(0.4, 0.9))
+            kwargs: dict[str, object] = {"timeout": 8}
             if proxy_url:
-                ddgs_kwargs["proxy"] = proxy_url
-
-            # 3. Execute Network I/O OUTSIDE the lock so threads run concurrently
-            ddgs = DDGS(**ddgs_kwargs)
-            results = list(ddgs.text(query, max_results=4, backend="api"))
-            
-            if not results:
-                continue
-
-            for res in results:
-                url = res.get('href', '')
-                if is_valid_homepage(url):
-                    return url
-                    
-            if results:
-                break # Got valid search results, no need for second query
-        except Exception:
-            continue
-
-    # ------------------------------------------------------------------
-    # TIER 3: Guaranteed Fallback URL
-    # ------------------------------------------------------------------
-    encoded_query = urllib.parse.quote(f"{prof_name} {clean_inst}")
-    return f"https://scholar.google.com/citations?view_op=search_authors&mauthors={encoded_query}"
+                kwargs["proxy"] = proxy_url
+            results = list(DDGS(**kwargs).text(query, max_results=5))
+            for result in results:
+                candidate = result.get("href", "")
+                if is_valid_homepage(candidate) and _result_matches_professor(prof_name, result):
+                    return candidate
+        except Exception as error:
+            print(f"Homepage search failed for {prof_name}: {error}")
+    return ""

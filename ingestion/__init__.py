@@ -1,0 +1,2 @@
+"""ScholarRadar discovery pipeline."""
+

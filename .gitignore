@@ -23,3 +23,11 @@ dist-ssr
 *.sln
 *.sw?
 .env*
+!.env.example
+!.env.production.example
+.streamlit/secrets.toml
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.coverage

@@ -1,172 +1,144 @@
-# ingestion/check_grants.py
-
-import sys
-import os
-import requests
 import hashlib
+import re
+from datetime import date, datetime
+from typing import Any
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import requests
+
 from db import get_db_connection
-from ingestion.i18n import t, get_radar_session
 
 NSF_API_URL = "https://api.nsf.gov/services/v1/awards.json"
 
-def get_funding_hash(prof_id, award_title):
-    session_id = get_radar_session()
-    raw = f"{session_id}_{prof_id}_{award_title.strip()}"
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
-def check_and_save_grants(tax_meta: dict):
-    session_id = get_radar_session()
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def get_funding_hash(professor_id: int, grant_id: str, award_title: str) -> str:
+    raw = f"{professor_id}|{grant_id.strip()}|{award_title.strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    router_config = tax_meta.get("router_config", {})
-    allowed_programs = router_config.get("programs", [])
-    domain = tax_meta.get("raw_query")
 
-    # Ensure schema updates
-    cursor.execute("""
-        ALTER TABLE fundings ADD COLUMN IF NOT EXISTS funding_hash VARCHAR(64);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_fundings_hash ON fundings(funding_hash);
-        ALTER TABLE professors ADD COLUMN IF NOT EXISTS career_stage VARCHAR(50) DEFAULT 'ESTABLISHED_PI';
-    """)
-    conn.commit()
+def _normalize_name(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 2}
 
-    # ----------------------------------------------------------------------
-    # PHASE 1: DISCOVER NEW APs VIA CRII (ONLY FOR CISE / ENGINEERING FIELDS)
-    # ----------------------------------------------------------------------
-    # ----------------------------------------------------------------------
-    # PHASE 1: DISCOVER NEW APs VIA ALL TAXONOMY-LISTED EARLY-CAREER GRANTS
-    # ----------------------------------------------------------------------
-    for prog in allowed_programs:
-        # Clean program name (e.g., strip 'NSF ' prefix for clean keyword matching)
-        prog_keyword = prog.replace("NSF ", "").strip()
-        search_query = f'{prog_keyword} "{domain}"'
-        print(t("crii_start", prog=prog, search_query=search_query))
+
+def _person_matches(expected: str, actual: str) -> bool:
+    """Require the expected family name and at least one given-name token."""
+    expected_parts = re.findall(r"[a-z0-9]+", expected.casefold())
+    actual_parts = set(re.findall(r"[a-z0-9]+", actual.casefold()))
+    if not expected_parts or not actual_parts:
+        return False
+    if len(expected_parts) == 1:
+        return expected_parts[0] in actual_parts
+    family_name = expected_parts[-1]
+    given_names = set(expected_parts[:-1])
+    return family_name in actual_parts and bool(given_names & actual_parts)
+
+
+def _institution_matches(expected: str, actual: str) -> bool:
+    expected_tokens = _normalize_name(expected) - {"university", "college", "institute", "the"}
+    actual_tokens = _normalize_name(actual) - {"university", "college", "institute", "the"}
+    return bool(expected_tokens and len(expected_tokens & actual_tokens) >= min(2, len(expected_tokens)))
+
+
+def _parse_nsf_date(value: Any) -> date | None:
+    if not value:
+        return None
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
         try:
-            grant_res = requests.get(
-                NSF_API_URL, 
-                params={
-                    'keyword': search_query, 
-                    'rpp': 50, 
-                    'printFields': 'id,title,piFirstName,piLastName,awardeeName'
-                }, 
-                timeout=10
+            return datetime.strptime(str(value), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def check_and_save_grants(tax_meta: dict[str, Any]) -> dict[str, int]:
+    """Check NSF only. Other agencies require separate provider modules."""
+    router = tax_meta.get("router_config") or {}
+    if router.get("primary_agency") != "NSF":
+        print(f"Skipping grants: {router.get('primary_agency', 'unknown')} needs its own API connector.")
+        return {"professors_checked": 0, "grants_added": 0}
+
+    research_domain = str(tax_meta.get("topic_name") or "").strip()
+    if not research_domain:
+        return {"professors_checked": 0, "grants_added": 0}
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            # A radar run must not recheck every professor accumulated by every
+            # previous research-area scan.
+            cursor.execute(
+                """
+                SELECT id, name, institution_name
+                FROM professors
+                WHERE research_domain = %s
+                ORDER BY id
+                """,
+                (research_domain,),
             )
-            if grant_res.status_code == 200:
-                grant_data = grant_res.json()
-                for award in grant_data.get('response', {}).get('award', []):
-                    first_name = award.get('piFirstName', '').strip()
-                    last_name = award.get('piLastName', '').strip()
-                    full_name = f"{first_name} {last_name}".strip()
-                    inst = award.get('awardeeName', '').strip()
+            professors = list(cursor.fetchall())
+            grants_added = 0
+            for professor in professors:
+                try:
+                    response = requests.get(
+                        NSF_API_URL,
+                        params={
+                            "pdPIName": professor["name"],
+                            "ActiveAwards": "true",
+                            "rpp": 25,
+                        },
+                        timeout=15,
+                    )
+                    response.raise_for_status()
+                except requests.RequestException as error:
+                    print(f"NSF request failed for {professor['name']}: {error}")
+                    continue
 
-                    if full_name and inst:
-                        cursor.execute("""
-                            SELECT id FROM professors 
-                            WHERE name = %s AND institution = %s AND session_id = %s;
-                        """, (full_name, inst, session_id))
-
-                        existing_prof = cursor.fetchone()
-                        if existing_prof:
-                            cursor.execute("""
-                                UPDATE professors 
-                                SET career_stage = 'NEW_AP' 
-                                WHERE id = %s;
-                            """, (existing_prof[0],))
-                            print(t("crii_updated", name=full_name, inst=inst))
-                        else:
-                            cursor.execute("""
-                                INSERT INTO professors (name, institution, hiring_score, career_stage, session_id, score_breakdown)
-                                VALUES (%s, %s, 100, 'NEW_AP', %s, %s);
-                            """, (full_name, inst, session_id, f' +100 ({prog} Base)'))
-                            print(t("crii_inserted", name=full_name, inst=inst))
-                conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"⚠️ Discovery skipped for grant '{prog}': {e}")
-        
-
-    # ----------------------------------------------------------------------
-    # PHASE 2: CHECK EXISTING PROFESSORS FOR GRANTS WITH INST MATCHER
-    # ----------------------------------------------------------------------
-    cursor.execute("SELECT id, name, institution FROM professors WHERE session_id = %s;", (session_id,))
-    professors = cursor.fetchall()
-
-    print(t("start_query", count=len(professors)))
-
-    for prof_id, name, institution in professors:
-        # Include institution in query to reduce false-positive grant hits
-        clean_inst = (institution or "").split('(')[0].strip()
-        params = {
-            'keyword': f'"{name}"',
-            'printFields': 'id,title,fundsAvailableAmt,startDate,expDate,awardeeName'
-        }
-
-        try:
-            res = requests.get(NSF_API_URL, params=params, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-        except Exception as e:
-            print(t("query_failed", name=name, error=e))
-            continue
-
-        awards = data.get('response', {}).get('award', [])
-        if not awards:
-            continue
-
-        funding_added = 0
-        total_score_boost = 0
-        is_crii_winner = False
-
-        for award in awards:
-            awardee = award.get('awardeeName', '').lower()
-            
-            # Simple verification: Ensure grant awardee institution aligns with professor institution
-            if clean_inst and len(clean_inst) > 3 and clean_inst.lower() not in awardee:
-                continue
-
-            award_title = award.get('title', '')
-            amount_str = award.get('fundsAvailableAmt', '0')
-            start_date = award.get('startDate') or '01/01/2024'
-
-            try:
-                amount = float(amount_str)
-            except ValueError:
-                amount = 0.0
-
-            grant_score = 15
-            if 'CRII' in award_title.upper():
-                grant_score = 40  
-                is_crii_winner = True
-            elif 'CAREER' in award_title.upper():
-                grant_score = 30  
-
-            funding_hash = get_funding_hash(prof_id, award_title)
-
-            cursor.execute("""
-                INSERT INTO fundings (professor_id, funder, grant_title, amount, award_date, funding_hash)
-                VALUES (%s, 'NSF', %s, %s, TO_DATE(%s, 'MM/DD/YYYY'), %s)
-                ON CONFLICT (funding_hash) DO NOTHING;
-            """, (prof_id, award_title, amount, start_date, funding_hash))
-
-            if cursor.rowcount > 0:
-                funding_added += 1
-                total_score_boost += grant_score
-
-        if total_score_boost > 0:
-            breakdown_str = f" +{total_score_boost} (Grants x{funding_added})"
-            cursor.execute("""
-                UPDATE professors 
-                SET hiring_score = hiring_score + %s,
-                    career_stage = CASE WHEN %s THEN 'NEW_AP' ELSE career_stage END,
-                    score_breakdown = COALESCE(score_breakdown, '') || %s
-                WHERE id = %s;
-            """, (total_score_boost, is_crii_winner, breakdown_str, prof_id))
-            print(t("hit_grant", name=name, inst=institution, count=funding_added, score=total_score_boost))
-        conn.commit()
-
-    cursor.close()
-    conn.close()
-    print(t("sync_complete"))
+                score_boost = 0
+                for award in response.json().get("response", {}).get("award", []):
+                    pi_name = str(award.get("pdPIName") or " ".join(award.get("pi") or []))
+                    if not _person_matches(professor["name"], pi_name):
+                        continue
+                    if not _institution_matches(professor["institution_name"], str(award.get("awardeeName") or "")):
+                        continue
+                    expiration_date = _parse_nsf_date(award.get("expDate"))
+                    if expiration_date and expiration_date < date.today():
+                        continue
+                    title = str(award.get("title") or "Untitled NSF award")
+                    grant_id = str(award.get("id") or "")
+                    try:
+                        amount = float(
+                            award.get("fundsObligatedAmt")
+                            or award.get("estimatedTotalAmt")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        amount = None
+                    funding_hash = get_funding_hash(professor["id"], grant_id, title)
+                    cursor.execute(
+                        """
+                        INSERT INTO fundings (
+                            professor_id, funding_hash, grant_title, grant_id, funder,
+                            amount, award_date, expiration_date, source_url
+                        ) VALUES (%s, %s, %s, %s, 'NSF', %s, %s, %s, %s)
+                        ON CONFLICT (funding_hash) DO NOTHING
+                        """,
+                        (
+                            professor["id"], funding_hash, title, grant_id, amount,
+                            _parse_nsf_date(award.get("startDate")), expiration_date,
+                            f"https://www.nsf.gov/awardsearch/showAward?AWD_ID={grant_id}" if grant_id else None,
+                        ),
+                    )
+                    if cursor.rowcount:
+                        grants_added += 1
+                        upper_title = title.upper()
+                        score_boost += 40 if "CRII" in upper_title else 30 if "CAREER" in upper_title else 15
+                if score_boost:
+                    cursor.execute(
+                        """
+                        UPDATE professors
+                        SET radar_score = radar_score + %s,
+                            score_breakdown = score_breakdown || %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (score_boost, f" +{score_boost} (active NSF awards)", professor["id"]),
+                    )
+    return {"professors_checked": len(professors), "grants_added": grants_added}
