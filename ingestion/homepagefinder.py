@@ -1,13 +1,9 @@
 import ipaddress
-import os
-import random
 import re
 import socket
-import threading
-import time
 from urllib.parse import urlparse
 
-from ddgs import DDGS
+from ingestion.websearch import search_web
 
 EXCLUDED_DOMAINS = {
     "academia.edu",
@@ -22,7 +18,9 @@ EXCLUDED_DOMAINS = {
     "wikipedia.org",
 }
 EXCLUDED_SUFFIXES = (".pdf", ".doc", ".docx", ".ppt", ".pptx", ".zip", ".epub")
-_search_lock = threading.Lock()
+INSTITUTION_STOP_WORDS = {
+    "and", "at", "college", "institute", "of", "school", "the", "university"
+}
 
 
 def _result_matches_professor(prof_name: str, result: dict[str, object]) -> bool:
@@ -35,6 +33,20 @@ def _result_matches_professor(prof_name: str, result: dict[str, object]) -> bool
     if len(parts) == 1:
         return parts[0] in combined
     return parts[0] in combined and parts[-1] in combined
+
+
+def result_matches_institution(institution: str, *values: object) -> bool:
+    """Require a distinctive institution token or a familiar initialism."""
+    words = re.findall(r"[a-z0-9]+", (institution or "").casefold())
+    distinctive = [word for word in words if word not in INSTITUTION_STOP_WORDS and len(word) > 2]
+    if not distinctive:
+        return True
+    combined = " ".join(str(value or "") for value in values).casefold()
+    combined_tokens = set(re.findall(r"[a-z0-9]+", combined))
+    if any(word in combined_tokens for word in distinctive):
+        return True
+    initialism = "".join(word[0] for word in words if word not in {"and", "at", "of", "the"})
+    return len(initialism) >= 2 and initialism in combined_tokens
 
 
 def is_public_http_url(url: str, resolve_dns: bool = False) -> bool:
@@ -78,22 +90,22 @@ def get_professor_homepage(
         return openalex_homepage.strip()
 
     clean_institution = (institution or "").split("(")[0].strip()
-    queries = [
-        f'"{prof_name}" "{clean_institution}" faculty homepage',
-        f'"{prof_name}" "{clean_institution}" lab website',
-    ]
-    proxy_url = os.getenv("ROTATING_PROXY_URL")
+    queries = [f'"{prof_name}" "{clean_institution}" faculty lab homepage']
     for query in queries:
         try:
-            with _search_lock:
-                time.sleep(random.uniform(0.4, 0.9))
-            kwargs: dict[str, object] = {"timeout": 8}
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-            results = list(DDGS(**kwargs).text(query, max_results=5))
+            results = search_web(query, max_results=3)
             for result in results:
                 candidate = result.get("href", "")
-                if is_valid_homepage(candidate) and _result_matches_professor(prof_name, result):
+                if (
+                    is_valid_homepage(candidate)
+                    and _result_matches_professor(prof_name, result)
+                    and result_matches_institution(
+                        institution,
+                        result.get("title"),
+                        result.get("body"),
+                        result.get("href"),
+                    )
+                ):
                     return candidate
         except Exception as error:
             print(f"Homepage search failed for {prof_name}: {error}")

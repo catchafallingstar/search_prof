@@ -1,9 +1,9 @@
-import os
 import re
 from itertools import product
 from typing import Any
 
 import requests
+from settings import setting
 
 AGENCY_MATRIX = {
     "CISE_NSF": {
@@ -151,7 +151,7 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
         "router_config": AGENCY_MATRIX["UNSUPPORTED"],
     }
     params: dict[str, object] = {"search": clean_query, "per_page": 25}
-    contact_email = os.getenv("OPENALEX_EMAIL", "").strip()
+    contact_email = setting("OPENALEX_EMAIL").strip()
     if contact_email:
         params["mailto"] = contact_email
 

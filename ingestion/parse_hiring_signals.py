@@ -1,8 +1,7 @@
-import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Callable
 from urllib.parse import urljoin
 
@@ -13,6 +12,7 @@ from db import get_db_connection
 from ingestion.homepagefinder import get_professor_homepage, is_public_http_url
 from ingestion.matchers import clean_and_extract_hiring_quote, extract_roles_and_funding, get_text_hash, is_valid_signal_text
 from ingestion.socialradar import check_social_hiring
+from settings import setting_int
 
 NEW_AP_PATTERN = re.compile(
     r"(?:joining|starting\s+(?:my\s+)?lab|new\s+assistant\s+professor|incoming\s+(?:faculty|professor))",
@@ -82,7 +82,13 @@ def fetch_and_parse_homepage(homepage_url: str) -> list[str]:
         return []
 
 
-def save_signal_to_db(professor_id: int, signal_type: str, raw_quote: str, source_url: str) -> bool:
+def save_signal_to_db(
+    professor_id: int,
+    signal_type: str,
+    raw_quote: str,
+    source_url: str,
+    radar_run_id: int | None = None,
+) -> dict[str, Any]:
     roles, has_funding = extract_roles_and_funding(raw_quote)
     is_new_ap = bool(NEW_AP_PATTERN.search(raw_quote))
     score_boost = 40 + (20 if has_funding else 0) + (30 if is_new_ap else 0)
@@ -136,10 +142,11 @@ def save_signal_to_db(professor_id: int, signal_type: str, raw_quote: str, sourc
                         professor_id, institution_id, title, institution_name,
                         professor_name, research_area, position_type, description,
                         funding_status, gpa_policy, international_eligible,
-                        application_url, source_kind, status, published_at, expires_at
+                        application_url, source_kind, organic_score, status,
+                        published_at, expires_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s,
-                        'unknown', 'not_stated', NULL, %s, 'public_signal',
+                        'unknown', 'not_stated', NULL, %s, 'public_signal', %s,
                         'pending', NULL, NOW() + INTERVAL '120 days'
                     ) RETURNING id
                     """,
@@ -153,6 +160,7 @@ def save_signal_to_db(professor_id: int, signal_type: str, raw_quote: str, sourc
                         position_type,
                         raw_quote,
                         source_url,
+                        75 if signal_type == "homepage" else 60,
                     ),
                 )
                 opportunity_id = cursor.fetchone()["id"]
@@ -182,7 +190,32 @@ def save_signal_to_db(professor_id: int, signal_type: str, raw_quote: str, sourc
                     """,
                     (quote_hash,),
                 )
-            return inserted
+                cursor.execute(
+                    """
+                    SELECT opportunity_id FROM opportunity_sources
+                    WHERE source_external_id = %s
+                    """,
+                    (quote_hash,),
+                )
+                existing = cursor.fetchone()
+                opportunity_id = existing["opportunity_id"] if existing else None
+            if radar_run_id and opportunity_id:
+                cursor.execute(
+                    """
+                    INSERT INTO radar_run_results (radar_run_id, opportunity_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (radar_run_id, opportunity_id),
+                )
+            return {
+                "inserted": inserted,
+                "opportunity_id": opportunity_id,
+                "professor_id": professor_id,
+                "signal_type": signal_type,
+                "quote": raw_quote,
+                "source_url": source_url,
+            }
 
 
 def process_single_professor(professor: dict[str, Any], domain_name: str | None = None) -> tuple[str, int, str, str] | None:
@@ -206,11 +239,30 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
 
 def scan_hiring_signals(
     domain_name: str | None = None,
+    professor_ids: list[int] | None = None,
     stop_check_callback: Callable[[], bool] | None = None,
-) -> dict[str, int]:
+    progress_callback: Callable[[str, int, dict[str, int]], None] | None = None,
+    radar_run_id: int | None = None,
+) -> dict[str, Any]:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            if domain_name:
+            if professor_ids is not None:
+                if not professor_ids:
+                    return {
+                        "professors_checked": 0,
+                        "signals_added": 0,
+                        "results": [],
+                        "timed_out": False,
+                        "checked_professor_ids": [],
+                    }
+                cursor.execute(
+                    """
+                    SELECT id, name, institution_name, homepage_url
+                    FROM professors WHERE id = ANY(%s) ORDER BY id
+                    """,
+                    (professor_ids,),
+                )
+            elif domain_name:
                 cursor.execute(
                     "SELECT id, name, institution_name, homepage_url FROM professors WHERE research_domain = %s",
                     (domain_name,),
@@ -219,26 +271,80 @@ def scan_hiring_signals(
                 cursor.execute("SELECT id, name, institution_name, homepage_url FROM professors")
             professors = list(cursor.fetchall())
 
-    max_workers = max(1, min(8, int(os.getenv("RADAR_MAX_WORKERS", "2"))))
+    max_workers = setting_int("RADAR_MAX_WORKERS", 2, 1, 8)
     hits = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_single_professor, professor, domain_name): professor for professor in professors}
-        for future in as_completed(futures):
-            if stop_check_callback and stop_check_callback():
-                for pending in futures:
-                    pending.cancel()
+    checked = 0
+    results: list[dict[str, Any]] = []
+    checked_professor_ids: list[int] = []
+    timeout_seconds = setting_int("PUBLIC_RADAR_TIMEOUT_SECONDS", 55, 15, 180)
+    deadline = time.monotonic() + timeout_seconds
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {
+        executor.submit(process_single_professor, professor, domain_name): professor
+        for professor in professors
+    }
+    pending = set(futures)
+    timed_out = False
+    try:
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
                 break
-            professor = futures[future]
-            try:
-                result = future.result()
-                if result:
-                    signal_type, professor_id, quote, source_url = result
-                    if save_signal_to_db(professor_id, signal_type, quote, source_url):
-                        hits += 1
-                        print(f"Hiring evidence found for {professor['name']}: {source_url}")
-            except Exception as error:
-                print(f"Signal scan failed for {professor['name']}: {error}")
-    return {"professors_checked": len(professors), "signals_added": hits}
+            completed, pending = wait(
+                pending,
+                timeout=min(1.0, remaining),
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                if progress_callback:
+                    progress_callback(
+                        f"Checking public sources ({checked}/{len(professors)})",
+                        55 + int(35 * checked / max(1, len(professors))),
+                        {"professors_checked": checked, "signals_added": hits},
+                    )
+                continue
+            for future in completed:
+                professor = futures[future]
+                if stop_check_callback and stop_check_callback():
+                    timed_out = True
+                    pending.clear()
+                    break
+                try:
+                    result = future.result()
+                    checked += 1
+                    checked_professor_ids.append(int(professor["id"]))
+                    if result:
+                        signal_type, professor_id, quote, source_url = result
+                        saved = save_signal_to_db(
+                            professor_id, signal_type, quote, source_url, radar_run_id
+                        )
+                        results.append(saved)
+                        if saved["inserted"]:
+                            hits += 1
+                            print(f"Hiring evidence found for {professor['name']}: {source_url}")
+                    if progress_callback:
+                        total = max(1, len(professors))
+                        progress_callback(
+                            f"Checking public sources ({checked}/{len(professors)})",
+                            55 + int(35 * checked / total),
+                            {"professors_checked": checked, "signals_added": hits},
+                        )
+                except Exception as error:
+                    checked += 1
+                    checked_professor_ids.append(int(professor["id"]))
+                    print(f"Signal scan failed for {professor['name']}: {error}")
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+    return {
+        "professors_checked": checked,
+        "signals_added": hits,
+        "results": results,
+        "timed_out": timed_out,
+        "checked_professor_ids": checked_professor_ids,
+    }
 
 
 if __name__ == "__main__":

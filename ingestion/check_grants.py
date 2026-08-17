@@ -1,5 +1,6 @@
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any
 
@@ -49,50 +50,72 @@ def _parse_nsf_date(value: Any) -> date | None:
     return None
 
 
-def check_and_save_grants(tax_meta: dict[str, Any]) -> dict[str, int]:
-    """Check NSF only. Other agencies require separate provider modules."""
-    router = tax_meta.get("router_config") or {}
-    if router.get("primary_agency") != "NSF":
-        print(f"Skipping grants: {router.get('primary_agency', 'unknown')} needs its own API connector.")
-        return {"professors_checked": 0, "grants_added": 0}
-
+def check_and_save_grants(
+    tax_meta: dict[str, Any],
+    professor_ids: list[int] | None = None,
+) -> dict[str, int]:
+    """Check active NSF awards for identified US professors in every field."""
     research_domain = str(tax_meta.get("topic_name") or "").strip()
     if not research_domain:
         return {"professors_checked": 0, "grants_added": 0}
 
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            # A radar run must not recheck every professor accumulated by every
-            # previous research-area scan.
-            cursor.execute(
-                """
-                SELECT id, name, institution_name
-                FROM professors
-                WHERE research_domain = %s
-                ORDER BY id
-                """,
-                (research_domain,),
-            )
+            if professor_ids is not None:
+                if not professor_ids:
+                    return {"professors_checked": 0, "grants_added": 0}
+                cursor.execute(
+                    """
+                    SELECT id, name, institution_name
+                    FROM professors
+                    WHERE id = ANY(%s)
+                    ORDER BY id
+                    """,
+                    (professor_ids,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, name, institution_name
+                    FROM professors
+                    WHERE research_domain = %s
+                    ORDER BY id
+                    """,
+                    (research_domain,),
+                )
             professors = list(cursor.fetchall())
-            grants_added = 0
-            for professor in professors:
-                try:
-                    response = requests.get(
-                        NSF_API_URL,
-                        params={
-                            "pdPIName": professor["name"],
-                            "ActiveAwards": "true",
-                            "rpp": 25,
-                        },
-                        timeout=15,
-                    )
-                    response.raise_for_status()
-                except requests.RequestException as error:
-                    print(f"NSF request failed for {professor['name']}: {error}")
-                    continue
 
+    def fetch_awards(professor: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        try:
+            response = requests.get(
+                NSF_API_URL,
+                params={
+                    "pdPIName": professor["name"],
+                    "ActiveAwards": "true",
+                    "rpp": 25,
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            awards = response.json().get("response", {}).get("award", [])
+            return professor, awards
+        except requests.RequestException as error:
+            print(f"NSF request failed for {professor['name']}: {error}")
+            return professor, []
+
+    fetched: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    if professors:
+        with ThreadPoolExecutor(max_workers=min(4, len(professors))) as executor:
+            futures = [executor.submit(fetch_awards, professor) for professor in professors]
+            for future in as_completed(futures):
+                fetched.append(future.result())
+
+    grants_added = 0
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for professor, awards in fetched:
                 score_boost = 0
-                for award in response.json().get("response", {}).get("award", []):
+                for award in awards:
                     pi_name = str(award.get("pdPIName") or " ".join(award.get("pi") or []))
                     if not _person_matches(professor["name"], pi_name):
                         continue

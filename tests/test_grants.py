@@ -24,6 +24,13 @@ class GrantMatchingTests(unittest.TestCase):
         )
         self.assertIn("WHERE research_domain = %s", source)
 
+    def test_unknown_taxonomy_does_not_disable_nsf_checks(self) -> None:
+        source = (PROJECT_DIR / "ingestion" / "check_grants.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("primary_agency') != \"NSF\"", source)
+        self.assertIn("ThreadPoolExecutor", source)
+
 
 if __name__ == "__main__":
     unittest.main()

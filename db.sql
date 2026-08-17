@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS opportunities (
     application_url TEXT,
     source_kind TEXT NOT NULL
         CHECK (source_kind IN ('verified_post', 'public_signal', 'university_post')),
+    organic_score INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('draft', 'pending', 'active', 'rejected', 'expired', 'closed')),
     published_at TIMESTAMPTZ,
@@ -144,6 +145,18 @@ CREATE TABLE IF NOT EXISTS opportunities (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Existing installations receive the ranking column when this idempotent schema
+-- is reapplied. Direct verified posts outrank public-web discoveries organically.
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS organic_score INTEGER NOT NULL DEFAULT 0;
+UPDATE opportunities
+SET organic_score = CASE source_kind
+    WHEN 'verified_post' THEN 100
+    WHEN 'university_post' THEN 95
+    WHEN 'public_signal' THEN 60
+    ELSE 0
+END
+WHERE organic_score = 0;
 
 CREATE TABLE IF NOT EXISTS opportunity_sources (
     id BIGSERIAL PRIMARY KEY,
@@ -228,6 +241,67 @@ CREATE TABLE IF NOT EXISTS hiring_signals (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- A run is targeted to one user query. ScholarRadar never attempts to preload
+-- every professor or every field.
+CREATE TABLE IF NOT EXISTS radar_runs (
+    id BIGSERIAL PRIMARY KEY,
+    query_key CHAR(64) NOT NULL,
+    requested_query TEXT NOT NULL,
+    normalized_topic TEXT,
+    requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+    stage TEXT NOT NULL DEFAULT 'Starting radar',
+    progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+    professors_found INTEGER NOT NULL DEFAULT 0,
+    papers_found INTEGER NOT NULL DEFAULT 0,
+    professors_checked INTEGER NOT NULL DEFAULT 0,
+    grants_added INTEGER NOT NULL DEFAULT 0,
+    signals_added INTEGER NOT NULL DEFAULT 0,
+    max_papers INTEGER NOT NULL DEFAULT 10 CHECK (max_papers BETWEEN 1 AND 100),
+    target_professors INTEGER NOT NULL DEFAULT 25
+        CHECK (target_professors IN (10, 25, 50, 100)),
+    web_check_limit INTEGER NOT NULL DEFAULT 12
+        CHECK (web_check_limit BETWEEN 1 AND 25),
+    error_message TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS target_professors INTEGER NOT NULL DEFAULT 25;
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS web_check_limit INTEGER NOT NULL DEFAULT 12;
+
+-- Every professor discovered for a run is retained, even if no explicit hiring
+-- statement is found. Hiring evidence and probable-opportunity signals are
+-- displayed as separate confidence categories in the UI.
+CREATE TABLE IF NOT EXISTS radar_run_professors (
+    radar_run_id BIGINT NOT NULL REFERENCES radar_runs(id) ON DELETE CASCADE,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    result_rank INTEGER NOT NULL,
+    research_score NUMERIC(5, 2) NOT NULL DEFAULT 0,
+    matching_papers INTEGER NOT NULL DEFAULT 0,
+    latest_paper_title TEXT,
+    latest_paper_year INTEGER,
+    latest_paper_url TEXT,
+    grant_sources_checked BOOLEAN NOT NULL DEFAULT FALSE,
+    public_sources_checked BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_run_id, professor_id)
+);
+ALTER TABLE radar_run_professors
+    ADD COLUMN IF NOT EXISTS grant_sources_checked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE radar_run_professors
+    ADD COLUMN IF NOT EXISTS public_sources_checked BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS radar_run_results (
+    radar_run_id BIGINT NOT NULL REFERENCES radar_runs(id) ON DELETE CASCADE,
+    opportunity_id BIGINT NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_run_id, opportunity_id)
+);
+
 CREATE INDEX IF NOT EXISTS opportunities_active_search_idx
     ON opportunities (status, position_type, research_area, application_deadline);
 CREATE INDEX IF NOT EXISTS opportunities_institution_idx ON opportunities (institution_name);
@@ -239,3 +313,10 @@ CREATE INDEX IF NOT EXISTS admin_audit_log_created_idx ON admin_audit_log (creat
 CREATE INDEX IF NOT EXISTS professors_domain_idx ON professors (research_domain);
 CREATE INDEX IF NOT EXISTS professors_score_idx ON professors (radar_score DESC);
 CREATE INDEX IF NOT EXISTS hiring_signals_professor_idx ON hiring_signals (professor_id);
+CREATE INDEX IF NOT EXISTS opportunities_organic_score_idx
+    ON opportunities (status, organic_score DESC, published_at DESC);
+CREATE INDEX IF NOT EXISTS radar_runs_query_cache_idx
+    ON radar_runs (query_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS radar_runs_status_idx ON radar_runs (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS radar_run_professors_rank_idx
+    ON radar_run_professors (radar_run_id, result_rank);

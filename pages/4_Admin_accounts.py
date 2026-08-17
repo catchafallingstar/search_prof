@@ -23,7 +23,8 @@ if not database_is_ready():
 
 owner, _ = require_site_admin(owner_only=True)
 st.success(f"Owner authority confirmed for {owner['email']}")
-st.link_button("Return to moderation queue", "/Admin_review")
+if st.button("Return to moderation queue"):
+    st.switch_page("pages/3_Admin_review.py")
 
 users = list_users_for_admin(owner["id"])
 grant_candidates = [

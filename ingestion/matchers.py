@@ -18,7 +18,7 @@ NEGATIVE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 SEARCH_DATE_PREFIX = re.compile(
-    r"^(?P<date>(?:[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}))\s*\.{2,3}\s*",
+    r"^(?P<date>(?:[A-Z][a-z]{2,8}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{1,2}-\d{1,2}))\s*(?:\.{2,3}|[·•|:—-])\s*",
     re.IGNORECASE,
 )
 
@@ -47,7 +47,7 @@ def extract_roles_and_funding(text: str) -> tuple[list[str], bool]:
 
 def _prefix_is_stale(match: re.Match[str], max_age_years: int = 1) -> bool:
     value = match.group("date")
-    for fmt in ("%b %d, %Y", "%m/%d/%Y", "%m/%d/%y"):
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
         try:
             observed = datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
             return observed.year < datetime.now(timezone.utc).year - max_age_years
@@ -72,4 +72,3 @@ def clean_and_extract_hiring_quote(raw_snippet: str) -> str:
     if matches:
         return " ".join(matches[:2])[:500]
     return ""
-

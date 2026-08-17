@@ -21,7 +21,10 @@ class HiringMatcherTests(unittest.TestCase):
         text = "Jan 2, 2020 ... I am looking for PhD students to join my lab."
         self.assertEqual(clean_and_extract_hiring_quote(text), "")
 
+    def test_rejects_stale_search_result_with_middle_dot(self) -> None:
+        text = "Aug 15, 2020 · Hiring: I am looking to hire multiple PhDs."
+        self.assertEqual(clean_and_extract_hiring_quote(text), "")
+
 
 if __name__ == "__main__":
     unittest.main()
-

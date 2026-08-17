@@ -1,17 +1,16 @@
-import os
+import hashlib
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
 import psycopg
-from dotenv import load_dotenv
 from psycopg.rows import dict_row
-
-load_dotenv()
+from settings import setting, setting_int
 
 
 def database_url() -> str:
-    value = os.getenv("DATABASE_URL", "").strip()
+    value = setting("DATABASE_URL").strip()
     if not value:
         raise RuntimeError("DATABASE_URL is not configured.")
     return value
@@ -25,7 +24,7 @@ def get_db_connection() -> Iterator[psycopg.Connection]:
 
 
 def database_is_configured() -> bool:
-    return bool(os.getenv("DATABASE_URL", "").strip())
+    return bool(setting("DATABASE_URL").strip())
 
 
 def database_is_ready() -> bool:
@@ -88,6 +87,7 @@ def fetch_active_opportunities(
             o.position_type, o.description, o.funding_status, o.gpa_policy,
             o.international_eligible, o.start_term, o.application_deadline,
             o.application_url, o.source_kind, o.published_at, o.expires_at,
+            o.organic_score,
             COALESCE(pp.verification_status, im.verification_status, 'unclaimed') AS verification_status,
             EXISTS (
                 SELECT 1 FROM sponsorships s
@@ -107,7 +107,8 @@ def fetch_active_opportunities(
             LIMIT 1
         ) src ON TRUE
         WHERE {' AND '.join(where)}
-        ORDER BY sponsored DESC, o.published_at DESC NULLS LAST, o.created_at DESC
+        ORDER BY o.organic_score DESC, sponsored DESC,
+                 o.published_at DESC NULLS LAST, o.created_at DESC
         LIMIT 100
     """
     with get_db_connection() as connection:
@@ -129,6 +130,322 @@ def count_active_opportunities() -> int:
                 """
             )
             return int(cursor.fetchone()["count"])
+
+
+def _radar_query_key(query: str, target_professors: int, web_check_limit: int) -> str:
+    normalized = " ".join(re.findall(r"[a-z0-9]+", query.casefold()))
+    identity = f"{normalized}|professors={target_professors}|web={web_check_limit}|v=3"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def start_or_reuse_radar_run(
+    query: str,
+    target_professors: int,
+    web_check_limit: int,
+    requested_by: int | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Return a cached/running scan, or atomically create a new targeted scan."""
+    clean_query = " ".join(query.split())
+    if not 3 <= len(clean_query) <= 120:
+        raise ValueError("Research area must contain between 3 and 120 characters.")
+    target_professors = int(target_professors)
+    if target_professors not in {10, 25, 50, 100}:
+        raise ValueError("Professor result count must be 10, 25, 50, or 100.")
+    web_check_limit = max(1, min(25, int(web_check_limit)))
+    cache_hours = setting_int("PUBLIC_RADAR_CACHE_HOURS", 24, 1, 168)
+    hourly_limit = setting_int("PUBLIC_RADAR_HOURLY_LIMIT", 30, 1, 500)
+    query_key = _radar_query_key(clean_query, target_professors, web_check_limit)
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (query_key,))
+            cursor.execute(
+                """
+                UPDATE radar_runs
+                SET status = 'failed', stage = 'Interrupted', completed_at = NOW(),
+                    error_message = 'The previous worker stopped before completion.'
+                WHERE status = 'running'
+                  AND heartbeat_at < NOW() - INTERVAL '2 minutes'
+                """
+            )
+            cursor.execute(
+                """
+                SELECT * FROM radar_runs
+                WHERE query_key = %s
+                  AND (
+                    (status = 'completed' AND completed_at > NOW() - (%s * INTERVAL '1 hour'))
+                    OR (status = 'running' AND heartbeat_at > NOW() - INTERVAL '2 minutes')
+                  )
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (query_key, cache_hours),
+            )
+            reusable = cursor.fetchone()
+            if reusable:
+                return reusable, True
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM radar_runs WHERE created_at > NOW() - INTERVAL '1 hour'"
+            )
+            if int(cursor.fetchone()["count"]) >= hourly_limit:
+                raise RuntimeError("The public radar is busy. Please try again later.")
+            cursor.execute(
+                """
+                INSERT INTO radar_runs (
+                    query_key, requested_query, requested_by, max_papers,
+                    target_professors, web_check_limit
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    query_key, clean_query, requested_by, target_professors,
+                    target_professors, web_check_limit,
+                ),
+            )
+            return cursor.fetchone(), False
+
+
+def save_radar_prospects(run_id: int, prospects: list[dict[str, Any]]) -> None:
+    """Persist every research-matched professor, not only hiring-signal hits."""
+    if not prospects:
+        return
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for rank, prospect in enumerate(prospects, start=1):
+                cursor.execute(
+                    """
+                    INSERT INTO radar_run_professors (
+                        radar_run_id, professor_id, result_rank, research_score,
+                        matching_papers, latest_paper_title, latest_paper_year,
+                        latest_paper_url
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (radar_run_id, professor_id) DO UPDATE
+                    SET result_rank = EXCLUDED.result_rank,
+                        research_score = EXCLUDED.research_score,
+                        matching_papers = EXCLUDED.matching_papers,
+                        latest_paper_title = EXCLUDED.latest_paper_title,
+                        latest_paper_year = EXCLUDED.latest_paper_year,
+                        latest_paper_url = EXCLUDED.latest_paper_url
+                    """,
+                    (
+                        run_id,
+                        prospect["professor_id"],
+                        rank,
+                        prospect["research_score"],
+                        prospect["matching_papers"],
+                        prospect.get("latest_paper_title"),
+                        prospect.get("latest_paper_year"),
+                        prospect.get("latest_paper_url"),
+                    ),
+                )
+
+
+def mark_radar_prospects_checked(
+    run_id: int,
+    professor_ids: list[int],
+    source_kind: str,
+) -> None:
+    column = {
+        "grants": "grant_sources_checked",
+        "public": "public_sources_checked",
+    }.get(source_kind)
+    if not column:
+        raise ValueError("Unknown radar source kind.")
+    if not professor_ids:
+        return
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE radar_run_professors SET {column} = TRUE
+                WHERE radar_run_id = %s AND professor_id = ANY(%s)
+                """,
+                (run_id, professor_ids),
+            )
+
+
+def update_radar_run(run_id: int, stage: str, progress: int, **counters: int) -> None:
+    allowed = {
+        "professors_found", "papers_found", "professors_checked",
+        "grants_added", "signals_added",
+    }
+    assignments = ["stage = %s", "progress = %s", "heartbeat_at = NOW()"]
+    params: list[Any] = [stage[:160], max(0, min(100, int(progress)))]
+    for key, value in counters.items():
+        if key in allowed:
+            assignments.append(f"{key} = %s")
+            params.append(max(0, int(value)))
+    params.append(run_id)
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE radar_runs SET {', '.join(assignments)} WHERE id = %s",
+                params,
+            )
+
+
+def finish_radar_run(
+    run_id: int,
+    normalized_topic: str,
+    counters: dict[str, int],
+) -> None:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE radar_runs
+                SET normalized_topic = %s, status = 'completed', stage = 'Complete',
+                    progress = 100, professors_found = %s, papers_found = %s,
+                    professors_checked = %s, grants_added = %s, signals_added = %s,
+                    heartbeat_at = NOW(), completed_at = NOW(), error_message = NULL
+                WHERE id = %s
+                """,
+                (
+                    normalized_topic,
+                    counters.get("professors_found", 0), counters.get("papers_found", 0),
+                    counters.get("professors_checked", 0), counters.get("grants_added", 0),
+                    counters.get("signals_added", 0), run_id,
+                ),
+            )
+
+
+def fail_radar_run(run_id: int, error: str) -> None:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE radar_runs SET status = 'failed', stage = 'Failed',
+                    error_message = %s, heartbeat_at = NOW(), completed_at = NOW()
+                WHERE id = %s
+                """,
+                (str(error)[:1000], run_id),
+            )
+
+
+def fetch_radar_run(run_id: int) -> dict[str, Any] | None:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM radar_runs WHERE id = %s", (run_id,))
+            return cursor.fetchone()
+
+
+def fetch_radar_results(run_id: int, position_type: str = "All") -> list[dict[str, Any]]:
+    params: list[Any] = [run_id]
+    position_filter = ""
+    if position_type != "All":
+        position_filter = "AND o.position_type = %s"
+        params.append(position_type)
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT o.id, o.title, o.professor_name, o.institution_name,
+                       o.research_area, o.position_type, o.description,
+                       o.application_url, o.gpa_policy, o.funding_status,
+                       o.status, o.source_kind, o.organic_score,
+                       os.source_url, os.evidence_text, os.confidence,
+                       os.last_checked_at
+                FROM radar_run_results rr
+                JOIN opportunities o ON o.id = rr.opportunity_id
+                LEFT JOIN LATERAL (
+                    SELECT source_url, evidence_text, confidence, last_checked_at
+                    FROM opportunity_sources
+                    WHERE opportunity_id = o.id
+                    ORDER BY observed_at DESC LIMIT 1
+                ) os ON TRUE
+                WHERE rr.radar_run_id = %s
+                  AND o.status <> 'rejected'
+                  {position_filter}
+                ORDER BY o.organic_score DESC, o.created_at DESC
+                """,
+                params,
+            )
+            return list(cursor.fetchall())
+
+
+def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
+    """Return all discovered professors with evidence-based confidence categories."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    rrp.professor_id, rrp.result_rank, rrp.research_score,
+                    rrp.matching_papers, rrp.latest_paper_title,
+                    rrp.latest_paper_year, rrp.latest_paper_url,
+                    rrp.grant_sources_checked, rrp.public_sources_checked,
+                    p.name AS professor_name, p.institution_name,
+                    p.research_domain, p.homepage_url, p.openalex_id, p.career_stage,
+                    COALESCE(f.active_grants, 0) AS active_grants,
+                    f.grant_title, f.funder, f.amount AS grant_amount,
+                    f.expiration_date AS grant_expiration, f.source_url AS grant_url,
+                    o.id AS opportunity_id, o.position_type, o.description,
+                    os.source_url AS hiring_source_url,
+                    os.evidence_text AS hiring_evidence,
+                    os.confidence AS hiring_confidence,
+                    CASE
+                        WHEN o.id IS NOT NULL THEN 'hiring_signal'
+                        WHEN COALESCE(f.active_grants, 0) > 0
+                             OR p.career_stage = 'NEW_AP' THEN 'likely_hiring'
+                        ELSE 'research_match'
+                    END AS result_category,
+                    LEAST(
+                        100,
+                        rrp.research_score
+                        + CASE WHEN o.id IS NOT NULL THEN 35 ELSE 0 END
+                        + CASE WHEN COALESCE(f.active_grants, 0) > 0 THEN 15 ELSE 0 END
+                        + CASE WHEN p.career_stage = 'NEW_AP' THEN 10 ELSE 0 END
+                    ) AS opportunity_score
+                FROM radar_run_professors rrp
+                JOIN professors p ON p.id = rrp.professor_id
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(*) OVER () AS active_grants, grant_title, funder,
+                           amount, expiration_date, source_url
+                    FROM fundings
+                    WHERE professor_id = p.id
+                      AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
+                    ORDER BY expiration_date DESC NULLS LAST, created_at DESC
+                    LIMIT 1
+                ) f ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT candidate.*
+                    FROM radar_run_results rr
+                    JOIN opportunities candidate ON candidate.id = rr.opportunity_id
+                    WHERE rr.radar_run_id = rrp.radar_run_id
+                      AND candidate.professor_id = p.id
+                      AND candidate.status <> 'rejected'
+                    ORDER BY candidate.organic_score DESC, candidate.created_at DESC
+                    LIMIT 1
+                ) o ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT source_url, evidence_text, confidence
+                    FROM opportunity_sources
+                    WHERE opportunity_id = o.id
+                    ORDER BY observed_at DESC LIMIT 1
+                ) os ON TRUE
+                WHERE rrp.radar_run_id = %s
+                ORDER BY
+                    CASE
+                        WHEN o.id IS NOT NULL THEN 1
+                        WHEN COALESCE(f.active_grants, 0) > 0
+                             OR p.career_stage = 'NEW_AP' THEN 2
+                        ELSE 3
+                    END,
+                    opportunity_score DESC,
+                    rrp.result_rank
+                """,
+                (run_id,),
+            )
+            return list(cursor.fetchall())
+
+
+def list_recent_radar_runs(admin_user_id: int, limit: int = 30) -> list[dict[str, Any]]:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, admin_user_id)
+            cursor.execute(
+                "SELECT * FROM radar_runs ORDER BY created_at DESC LIMIT %s",
+                (max(1, min(100, limit)),),
+            )
+            return list(cursor.fetchall())
 
 
 def upsert_authenticated_user(subject: str, email: str, display_name: str) -> dict[str, Any]:
@@ -456,10 +773,10 @@ def submit_opportunity(user_id: int, values: dict[str, Any]) -> int:
                     institution_name, professor_name, research_area, position_type,
                     description, funding_status, gpa_policy, international_eligible,
                     start_term, application_deadline, application_url,
-                    source_kind, status
+                    source_kind, organic_score, status
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, 'pending'
+                    %s, %s, %s, %s, %s, 'pending'
                 ) RETURNING id
                 """,
                 (
@@ -473,6 +790,7 @@ def submit_opportunity(user_id: int, values: dict[str, Any]) -> int:
                     values.get("application_deadline") or None,
                     values["application_url"].strip(),
                     source_kind,
+                    100 if verified_profile else 95,
                 ),
             )
             opportunity_id = cursor.fetchone()["id"]

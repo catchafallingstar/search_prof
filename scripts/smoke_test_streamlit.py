@@ -12,6 +12,7 @@ PAGES = [
     PROJECT_DIR / "pages" / "2_Verification.py",
     PROJECT_DIR / "pages" / "3_Admin_review.py",
     PROJECT_DIR / "pages" / "4_Admin_accounts.py",
+    PROJECT_DIR / "pages" / "5_Radar_control.py",
 ]
 
 

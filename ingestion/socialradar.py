@@ -1,14 +1,11 @@
-import os
-import random
 import threading
-import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-from ddgs import DDGS
 
-from ingestion.homepagefinder import is_public_http_url
+from ingestion.homepagefinder import is_public_http_url, result_matches_institution
 from ingestion.matchers import is_valid_signal_text
+from ingestion.websearch import search_web
 
 EXCLUDED_DOMAINS = {
     "glassdoor.com",
@@ -20,7 +17,6 @@ EXCLUDED_DOMAINS = {
     "wikipedia.org",
     "ziprecruiter.com",
 }
-_search_lock = threading.Lock()
 _bluesky_state_lock = threading.Lock()
 _bluesky_unavailable = False
 
@@ -102,19 +98,10 @@ def check_social_hiring(
         return bluesky_text, bluesky_url
 
     clean_institution = (institution or "").split("(")[0].strip()
-    queries = [
-        f'"{prof_name}" "{clean_institution}" hiring PhD students',
-        f'"{prof_name}" recruiting prospective students lab',
-    ]
-    proxy_url = os.getenv("ROTATING_PROXY_URL")
+    queries = [f'"{prof_name}" "{clean_institution}" hiring recruiting PhD students']
     for query in queries:
         try:
-            with _search_lock:
-                time.sleep(random.uniform(0.4, 0.9))
-            kwargs: dict[str, object] = {"timeout": 8}
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-            for result in DDGS(**kwargs).text(query, max_results=5):
+            for result in search_web(query, max_results=3):
                 snippet = str(result.get("body", ""))
                 title = str(result.get("title", ""))
                 url = str(result.get("href", ""))
@@ -124,6 +111,8 @@ def check_social_hiring(
                 if not is_public_http_url(url):
                     continue
                 if not _identity_matches(prof_name, snippet, title, url):
+                    continue
+                if not result_matches_institution(institution or "", snippet, title, url):
                     continue
                 if is_valid_signal_text(snippet):
                     return " ".join(snippet.split()), url

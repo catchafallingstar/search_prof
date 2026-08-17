@@ -12,29 +12,48 @@ class NavigationContractTests(unittest.TestCase):
             "/2_Verification",
             "/3_Admin_review",
             "/4_Admin_accounts",
+            "/5_Radar_control",
         )
         python_files = [PROJECT_DIR / "app.py", PROJECT_DIR / "ui.py"]
         python_files.extend((PROJECT_DIR / "pages").glob("*.py"))
         combined = "\n".join(path.read_text(encoding="utf-8") for path in python_files)
         for route in numeric_routes:
-            self.assertNotIn(route, combined)
+            self.assertNotIn(f'"{route}"', combined)
+            self.assertNotIn(f"'{route}'", combined)
 
-    def test_custom_navigation_stays_in_the_current_tab(self) -> None:
+    def test_internal_navigation_does_not_use_raw_url_links(self) -> None:
+        python_files = [PROJECT_DIR / "app.py", PROJECT_DIR / "ui.py"]
+        python_files.extend((PROJECT_DIR / "pages").glob("*.py"))
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in python_files)
+        for route in (
+            "/Post_an_opening",
+            "/Verification",
+            "/Admin_review",
+            "/Admin_accounts",
+            "/Radar_control",
+        ):
+            self.assertNotIn(f'"{route}"', combined)
+            self.assertNotIn(f"'{route}'", combined)
+
+    def test_custom_navigation_uses_streamlit_page_switching(self) -> None:
         source = (PROJECT_DIR / "ui.py").read_text(encoding="utf-8")
-        self.assertIn('<nav class="sr-nav"', source)
-        self.assertEqual(source.count('target="_self"'), 5)
+        self.assertIn('with st.container(key="sr_nav"):', source)
+        self.assertEqual(source.count("st.switch_page("), 5)
+        self.assertNotIn('target="_self"', source)
         self.assertNotIn('target="_blank"', source)
 
-    def test_brand_returns_home_and_unused_sidebar_control_is_hidden(self) -> None:
+    def test_unused_sidebar_control_is_hidden(self) -> None:
         source = (PROJECT_DIR / "ui.py").read_text(encoding="utf-8")
-        self.assertIn(
-            '<a class="sr-brand" href="/" target="_self" aria-label="ScholarRadar home">',
-            source,
-        )
         self.assertIn(
             '[data-testid="stExpandSidebarButton"] { display: none !important; }',
             source,
         )
+
+    def test_native_sidebar_navigation_is_disabled(self) -> None:
+        config = (PROJECT_DIR / ".streamlit" / "config.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("showSidebarNavigation = false", config)
 
 
 if __name__ == "__main__":

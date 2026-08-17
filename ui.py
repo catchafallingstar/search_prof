@@ -41,56 +41,45 @@ def configure_page(title: str) -> None:
         /* Streamlit's fixed header is about 3.5rem tall. Keep the custom
            navigation below it so the header cannot wash out or intercept it. */
         .block-container { max-width: 1180px; padding-top: 4.25rem; padding-bottom: 4rem; }
-        .sr-nav {
-          display: flex;
-          align-items: center;
-          gap: 1.5rem;
+        .st-key-sr_nav {
           padding: .2rem 0 1.15rem;
           margin-bottom: .25rem;
           border-bottom: 1px solid rgba(49, 51, 63, .18);
         }
-        .sr-brand {
-          flex: 1 1 auto;
-          font-size: 1.2rem;
-          font-weight: 750;
-          color: #1e5d3b;
-          white-space: nowrap;
-          text-decoration: none !important;
-        }
-        .sr-brand:hover,
-        .sr-brand:focus-visible {
-          color: #17482e;
-          text-decoration: none !important;
-        }
-        .sr-nav-links {
-          display: grid;
-          grid-template-columns: repeat(4, minmax(8.5rem, 1fr));
-          gap: .7rem;
-        }
-        .sr-nav-links a {
-          display: flex;
-          align-items: center;
-          justify-content: center;
+        .st-key-sr_nav button {
           min-height: 2.5rem;
-          padding: .45rem .9rem;
           border: 1px solid rgba(49, 51, 63, .22);
           border-radius: .55rem;
           background: #ffffff;
-          color: #253129 !important;
+          color: #253129;
           font-weight: 600;
-          line-height: 1.15;
-          text-align: center;
-          text-decoration: none !important;
           box-shadow: 0 1px 2px rgba(20, 40, 28, .04);
           transition: border-color .15s ease, background-color .15s ease,
                       transform .15s ease;
         }
-        .sr-nav-links a:hover,
-        .sr-nav-links a:focus-visible {
+        .st-key-sr_nav button:hover,
+        .st-key-sr_nav button:focus-visible {
           border-color: #2f6d4b;
           background: #edf7f0;
-          color: #17482e !important;
+          color: #17482e;
           transform: translateY(-1px);
+        }
+        .st-key-nav_home button {
+          justify-content: flex-start;
+          border-color: transparent;
+          background: transparent;
+          box-shadow: none;
+          font-size: 1.2rem;
+          font-weight: 750;
+          color: #1e5d3b;
+          white-space: nowrap;
+        }
+        .st-key-nav_home button:hover,
+        .st-key-nav_home button:focus-visible {
+          border-color: transparent;
+          background: transparent;
+          color: #17482e;
+          transform: none;
         }
         .sr-hero { text-align: center; padding: 3.3rem 1rem 1.6rem; }
         .sr-kicker { color: #2f6d4b; font-weight: 700; letter-spacing: .02em; }
@@ -101,19 +90,28 @@ def configure_page(title: str) -> None:
         @media (prefers-color-scheme: dark) {
           [data-testid="stAppViewContainer"] { background: #111713; }
           [data-testid="stHeader"] { background: rgba(17,23,19,.88); }
-          .sr-brand { color: #a9ddba; }
-          .sr-brand:hover, .sr-brand:focus-visible { color: #d7f3df; }
-          .sr-nav { border-bottom-color: rgba(230, 239, 232, .18); }
-          .sr-nav-links a {
+          .st-key-sr_nav { border-bottom-color: rgba(230, 239, 232, .18); }
+          .st-key-sr_nav button {
             border-color: rgba(230, 239, 232, .24);
             background: #19221c;
-            color: #e4eee7 !important;
+            color: #e4eee7;
           }
-          .sr-nav-links a:hover,
-          .sr-nav-links a:focus-visible {
+          .st-key-sr_nav button:hover,
+          .st-key-sr_nav button:focus-visible {
             border-color: #91cba4;
             background: #223129;
-            color: #ffffff !important;
+            color: #ffffff;
+          }
+          .st-key-nav_home button {
+            border-color: transparent;
+            background: transparent;
+            color: #a9ddba;
+          }
+          .st-key-nav_home button:hover,
+          .st-key-nav_home button:focus-visible {
+            border-color: transparent;
+            background: transparent;
+            color: #d7f3df;
           }
           .sr-kicker { color: #91cba4; }
           .sr-hero p, .sr-evidence { color: #aeb9b1; }
@@ -121,8 +119,9 @@ def configure_page(title: str) -> None:
         }
         @media (max-width: 760px) {
           .block-container { padding-top: 4rem; }
-          .sr-nav { align-items: stretch; flex-direction: column; gap: .8rem; }
-          .sr-nav-links { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          .st-key-sr_nav [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap;
+          }
         }
         </style>
         """,
@@ -131,20 +130,20 @@ def configure_page(title: str) -> None:
 
 
 def navigation() -> None:
-    st.markdown(
-        """
-        <nav class="sr-nav" aria-label="Primary navigation">
-          <a class="sr-brand" href="/" target="_self" aria-label="ScholarRadar home">◉ ScholarRadar</a>
-          <div class="sr-nav-links">
-            <a href="/" target="_self">Browse</a>
-            <a href="/Post_an_opening" target="_self">Post an opening</a>
-            <a href="/Verification" target="_self">Verification</a>
-            <a href="/Admin_review" target="_self">Staff</a>
-          </div>
-        </nav>
-        """,
-        unsafe_allow_html=True,
-    )
+    with st.container(key="sr_nav"):
+        brand, browse, post, verify, staff = st.columns(
+            [2.7, 1.3, 1.7, 1.5, 1.2], vertical_alignment="center"
+        )
+        if brand.button("◉ ScholarRadar", key="nav_home", width="stretch"):
+            st.switch_page("app.py")
+        if browse.button("Browse", key="nav_browse", width="stretch"):
+            st.switch_page("app.py")
+        if post.button("Post an opening", key="nav_post", width="stretch"):
+            st.switch_page("pages/1_Post_an_opening.py")
+        if verify.button("Verification", key="nav_verify", width="stretch"):
+            st.switch_page("pages/2_Verification.py")
+        if staff.button("Staff", key="nav_staff", width="stretch"):
+            st.switch_page("pages/3_Admin_review.py")
 
 
 def demo_opportunities() -> list[dict[str, Any]]:
@@ -273,3 +272,79 @@ def render_opportunity(row: dict[str, Any]) -> None:
             st.link_button("View opportunity", row["application_url"], width="stretch")
         if source_url and is_http_url(str(source_url)) and source_url != row.get("application_url"):
             st.link_button("View evidence", source_url, width="stretch")
+
+
+def render_radar_candidate(row: dict[str, Any]) -> None:
+    """Render machine-found evidence without presenting it as an approved job ad."""
+    with st.container(border=True):
+        st.caption(
+            f"Unreviewed public signal · {str(row.get('confidence') or 'medium').title()} confidence"
+        )
+        st.subheader(row["professor_name"] or row["title"])
+        st.caption(f"{row['institution_name']} · {row['research_area']}")
+        st.write(row.get("evidence_text") or row["description"])
+        st.write(f"**Possible role:** {row['position_type']}")
+        st.write("**GPA policy:** Not stated—do not assume flexibility from this signal.")
+        st.warning("This public-web result is awaiting moderator review and is not a confirmed opening.")
+        source_url = str(row.get("source_url") or row.get("application_url") or "")
+        if is_http_url(source_url):
+            st.link_button("Check original evidence", source_url, width="stretch")
+
+
+def render_professor_prospect(row: dict[str, Any]) -> None:
+    """Render a research match without turning probabilistic signals into claims."""
+    category = row.get("result_category")
+    with st.container(border=True):
+        if category == "hiring_signal":
+            st.caption("Strong public hiring signal · Not yet moderator-confirmed")
+        elif category == "likely_hiring":
+            reasons = []
+            if row.get("active_grants"):
+                reasons.append("active public grant")
+            if row.get("career_stage") == "NEW_AP":
+                reasons.append("newer faculty/lab signal")
+            st.caption(f"Promising lab · {', '.join(reasons)} · Hiring not confirmed")
+        else:
+            st.caption("Research match · Hiring not confirmed")
+
+        st.subheader(row["professor_name"])
+        st.caption(f"{row['institution_name']} · Match score {float(row['research_score']):.0f}/40")
+        st.caption(
+            "Identity basis: probable senior/corresponding author at a university; "
+            "faculty title is not verified unless the linked evidence says so."
+        )
+        if row.get("latest_paper_title"):
+            year = f" ({row['latest_paper_year']})" if row.get("latest_paper_year") else ""
+            st.write(f"**Recent matching paper:** {row['latest_paper_title']}{year}")
+            st.caption(f"Matching recent papers found: {row.get('matching_papers') or 0}")
+        if row.get("grant_title"):
+            st.write(f"**Active grant:** {row['grant_title']} — {row.get('funder') or 'public funder'}")
+        elif row.get("grant_sources_checked"):
+            st.caption("NSF checked: no active matching award found.")
+        else:
+            st.caption("NSF not checked in this bounded pass.")
+        if row.get("hiring_evidence"):
+            st.write(f"**Hiring evidence:** {row['hiring_evidence']}")
+        elif row.get("public_sources_checked"):
+            st.caption("Public hiring sources checked: no explicit current statement found.")
+        else:
+            st.caption("Public hiring sources not yet checked in this bounded pass.")
+
+        st.write("**GPA policy:** Not stated. Check both the lab and graduate-program requirements.")
+        if category != "hiring_signal":
+            st.info(
+                "This person is shown because of research fit and opportunity indicators. "
+                "ScholarRadar did not confirm that the lab is currently recruiting."
+            )
+
+        links = [
+            ("Check hiring evidence", row.get("hiring_source_url")),
+            ("View active grant", row.get("grant_url")),
+            ("Professor/lab page", row.get("homepage_url")),
+            ("Recent paper", row.get("latest_paper_url")),
+            ("OpenAlex profile", row.get("openalex_id")),
+        ]
+        for label, url in links:
+            if is_http_url(str(url or "")):
+                st.link_button(label, str(url), width="stretch")
+                break

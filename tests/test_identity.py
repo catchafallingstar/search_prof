@@ -1,6 +1,6 @@
 import unittest
 
-from ingestion.homepagefinder import _result_matches_professor
+from ingestion.homepagefinder import _result_matches_professor, result_matches_institution
 from ingestion.socialradar import _identity_matches
 
 
@@ -17,6 +17,20 @@ class IdentityMatchingTests(unittest.TestCase):
         }
         self.assertTrue(_result_matches_professor("Ying Lin", result))
         self.assertFalse(_result_matches_professor("Brian Lin", result))
+
+    def test_search_result_must_match_professor_institution(self) -> None:
+        self.assertTrue(
+            result_matches_institution(
+                "University of Southern California",
+                "Yue Wang | USC Computer Science",
+            )
+        )
+        self.assertFalse(
+            result_matches_institution(
+                "Illinois Institute of Technology",
+                "Yan Lab, Shanghai Institute of Immunity and Infection",
+            )
+        )
 
 
 if __name__ == "__main__":
