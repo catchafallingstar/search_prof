@@ -1,64 +1,119 @@
 import streamlit as st
 
 from auth import account_controls, require_site_admin
-from db import database_is_ready, list_recent_radar_runs
-from ingestion.radar_pipeline import execute_radar
-from ui import configure_page, navigation, render_professor_prospect
+from db import database_is_ready
+from radar_store import (
+    cancel_radar_job,
+    list_radar_operations,
+    request_topic_index,
+    retry_radar_job,
+)
+from ui import configure_page, navigation
+
 
 configure_page("Radar operations")
 navigation()
 account_controls()
 
-st.title("Radar operations")
+st.title("Radar indexing operations")
 st.write(
-    "Run a targeted discovery scan and watch each stage. This searches one research "
-    "area; it does not build a database of every professor."
+    "Monitor the shared professor index, its background worker, identity-review "
+    "queue, and failed external-source checks."
 )
 if not database_is_ready():
     st.error("The database is not ready.")
     st.stop()
 
 user, admin = require_site_admin()
-st.caption(f"Signed in with {admin['admin_role']} authority")
+if admin["admin_role"] != "owner":
+    st.error("Only the site owner can manage indexing operations.")
+    st.stop()
+st.caption("Signed in with owner authority")
 
-with st.form("staff_radar"):
+with st.form("schedule_topic"):
     research_area = st.text_input(
-        "Research area", placeholder="Adversarial machine learning, robotics, neuroscience…"
+        "Research area to index",
+        placeholder="Adversarial machine learning, robotics, neuroscience…",
     )
-    target_professors = st.selectbox("Professor prospects to return", [10, 25, 50, 100], index=1)
-    run_scan = st.form_submit_button("Run targeted radar", type="primary")
+    schedule = st.form_submit_button("Add or refresh shared index", type="primary")
 
-if run_scan:
-    status = st.status("Starting radar…", expanded=True)
-    bar = st.progress(0)
-    details = st.empty()
-
-    def show(stage: str, percent: int, counters: dict[str, int]) -> None:
-        status.update(label=stage, state="running", expanded=True)
-        bar.progress(percent)
-        details.write(counters)
-
+if schedule:
     try:
-        result = execute_radar(
+        topic, job = request_topic_index(
             research_area,
-            target_professors=target_professors,
-            requested_by=user["id"],
-            progress_callback=show,
+            requested_by=int(user["id"]),
+            desired_results=100,
         )
-        status.update(label="Radar complete", state="complete", expanded=False)
-        if result["professors"]:
-            st.subheader("Professor prospects")
-            for professor in result["professors"]:
-                render_professor_prospect(professor)
+        if job and job.get("reused"):
+            st.info("This research area is already queued or being indexed.")
+        elif job:
+            st.success("The research area was added to the indexing queue.")
         else:
-            st.info("No relevant professor prospects were found for this exact query.")
+            st.success("The shared index is current; no duplicate work was created.")
+        st.caption(
+            f"Current coverage: {int(topic.get('verified_count') or 0)} verified "
+            f"from {int(topic.get('candidates_seen') or 0)} candidates."
+        )
     except Exception as error:
-        status.update(label="Radar failed", state="error", expanded=True)
         st.error(str(error))
 
-st.subheader("Recent radar runs")
-runs = list_recent_radar_runs(user["id"])
-if runs:
-    st.dataframe(runs, width="stretch", hide_index=True)
+operations = list_radar_operations(int(user["id"]))
+counts = {row["status"]: int(row["count"]) for row in operations["job_counts"]}
+metric_columns = st.columns(5)
+for column, status in zip(
+    metric_columns, ["queued", "running", "failed", "completed", "cancelled"]
+):
+    column.metric(status.title(), counts.get(status, 0))
+
+st.subheader("Worker health")
+if operations["workers"]:
+    st.dataframe(operations["workers"], width="stretch", hide_index=True)
+    if not any(row["healthy"] for row in operations["workers"]):
+        st.error(
+            "No worker heartbeat has been seen in the last 10 minutes. Public searches "
+            "still return stored results, but new research areas will not advance."
+        )
 else:
-    st.info("No radar runs have been recorded yet.")
+    st.error("No indexing worker has registered yet. Start it with: make worker")
+
+st.subheader("Shared research indexes")
+if operations["topics"]:
+    st.dataframe(operations["topics"], width="stretch", hide_index=True)
+else:
+    st.info("No research areas have been requested yet.")
+
+st.subheader("Background jobs")
+if operations["jobs"]:
+    st.dataframe(operations["jobs"], width="stretch", hide_index=True)
+    action_columns = st.columns(2)
+    failed_ids = [row["id"] for row in operations["jobs"] if row["status"] == "failed"]
+    cancellable_ids = [
+        row["id"] for row in operations["jobs"]
+        if row["status"] in {"queued", "failed"}
+    ]
+    with action_columns[0]:
+        if failed_ids:
+            retry_id = st.selectbox("Failed job", failed_ids, key="retry_job_id")
+            if st.button("Retry failed job"):
+                retry_radar_job(int(user["id"]), int(retry_id))
+                st.rerun()
+    with action_columns[1]:
+        if cancellable_ids:
+            cancel_id = st.selectbox(
+                "Queued/failed job", cancellable_ids, key="cancel_job_id"
+            )
+            if st.button("Cancel selected job"):
+                cancel_radar_job(int(user["id"]), int(cancel_id))
+                st.rerun()
+else:
+    st.info("No indexing jobs have been recorded yet.")
+
+st.subheader("Faculty identities needing review")
+if operations["identity_review"]:
+    st.dataframe(operations["identity_review"], width="stretch", hide_index=True)
+    st.caption(
+        "CONFLICT and MANUAL_REVIEW records remain hidden from public results. "
+        "Use retained evidence before changing an identity decision."
+    )
+else:
+    st.success("No faculty identity currently requires manual review.")

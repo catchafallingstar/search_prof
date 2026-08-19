@@ -2,9 +2,7 @@ import streamlit as st
 
 from auth import account_controls
 from db import count_active_opportunities, database_is_ready, fetch_active_opportunities
-from ingestion.matchers import extract_roles_and_funding
-from ingestion.radar_pipeline import execute_radar
-from settings import setting, setting_bool
+from radar_store import fetch_indexed_professors, request_topic_index
 from ui import (
     GPA_LABELS,
     configure_page,
@@ -15,6 +13,11 @@ from ui import (
     render_opportunity,
 )
 
+
+PAGE_SIZE = 25
+MAX_VISIBLE_RESULTS = 100
+
+
 configure_page("Find active PhD opportunities")
 navigation()
 account_controls()
@@ -24,224 +27,250 @@ st.markdown(
     <section class="sr-hero">
       <div class="sr-kicker">OPPORTUNITY-FIRST PhD SEARCH</div>
       <h1>Find labs that are actively looking for people like you</h1>
-      <p>Search verified openings and fresh public hiring signals. See funding,
-      requirements, and evidence before you spend time applying.</p>
+      <p>Search verified openings and an expanding index of verified faculty.
+      See funding, requirements, and evidence before you spend time applying.</p>
     </section>
     """,
     unsafe_allow_html=True,
 )
 
+saved_search = st.session_state.get(
+    "sr_search",
+    {"area": "", "position": "All", "gpa_policy": "All", "institution": ""},
+)
+
 with st.form("opportunity_search", border=True):
-    area_col, type_col, gpa_col, count_col, button_col = st.columns(
-        [2.2, 1.05, 1.35, 0.8, 0.75], vertical_alignment="bottom"
+    area_col, type_col, gpa_col, school_col, button_col = st.columns(
+        [2.1, 1.05, 1.35, 1.4, 0.75], vertical_alignment="bottom"
     )
-    area = area_col.text_input("Research area", placeholder="Machine learning, robotics, neuroscience…")
-    position = type_col.selectbox("Looking for", ["All", "PhD", "Postdoc", "Research Assistant", "Masters", "Internship"])
-    gpa_policy = gpa_col.selectbox("GPA policy", ["All", *GPA_LABELS.keys()], format_func=lambda key: "All policies" if key == "All" else GPA_LABELS[key])
-    results_wanted = count_col.selectbox(
-        "Verified faculty goal",
-        [10, 25, 50, 100],
-        index=1,
-        format_func=lambda value: {
-            10: "10 — quick",
-            25: "25 — standard",
-            50: "50 — deep",
-            100: "100 — deep index",
-        }[value],
-        help=(
-            "This is a goal, not a guaranteed result count. ScholarRadar hides authors whose "
-            "faculty identity cannot be verified. Deep goals use a larger candidate pool and "
-            "normally need multiple continuation passes."
-        ),
+    area = area_col.text_input(
+        "Research area",
+        value=saved_search["area"],
+        placeholder="Machine learning, robotics, neuroscience…",
     )
-    include_live_radar = st.checkbox(
-        "Include a live public-web radar when searching",
-        value=True,
-        help=(
-            "A bounded pass usually takes one to two minutes. If a large search is incomplete, "
-            "press Search again to continue with unchecked candidates; completed decisions are reused."
-        ),
+    position_options = [
+        "All", "PhD", "Postdoc", "Research Assistant", "Masters", "Internship"
+    ]
+    position = type_col.selectbox(
+        "Looking for",
+        position_options,
+        index=position_options.index(saved_search["position"]),
     )
-    include_unknown_gpa = st.checkbox(
-        "Include promising professors when their GPA policy and current hiring status are not confirmed",
-        value=True,
-        help=(
-            "Useful when you want broader options. These professors are never labeled GPA-flexible "
-            "unless a verified source explicitly says so."
-        ),
+    gpa_options = ["All", *GPA_LABELS.keys()]
+    gpa_policy = gpa_col.selectbox(
+        "GPA policy",
+        gpa_options,
+        index=gpa_options.index(saved_search["gpa_policy"]),
+        format_func=lambda key: "All policies" if key == "All" else GPA_LABELS[key],
     )
-    continue_incomplete = st.checkbox(
-        "Continue checking an incomplete cached search",
-        value=False,
-        help=(
-            "Leave this off to open recent results immediately. Turn it on and submit the same "
-            "search to verify the next unchecked candidates without repeating completed work."
-        ),
+    institution = school_col.text_input(
+        "University (optional)", value=saved_search["institution"]
     )
-    search_submitted = button_col.form_submit_button("Search", type="primary", width="stretch")
+    search_submitted = button_col.form_submit_button(
+        "Search", type="primary", width="stretch"
+    )
 
 ready = database_is_ready()
+if search_submitted:
+    if len(area.strip()) < 3:
+        st.info("Enter a specific research area of at least three characters.")
+    else:
+        st.session_state["sr_search"] = {
+            "area": " ".join(area.split()),
+            "position": position,
+            "gpa_policy": gpa_policy,
+            "institution": " ".join(institution.split()),
+        }
+        st.session_state["sr_professor_limit"] = PAGE_SIZE
+        saved_search = st.session_state["sr_search"]
+        if ready:
+            try:
+                request_topic_index(saved_search["area"], desired_results=100)
+            except Exception as error:
+                st.error(f"ScholarRadar could not schedule this research index: {error}")
+
+active_area = saved_search["area"]
+active_position = saved_search["position"]
+active_gpa = saved_search["gpa_policy"]
+active_institution = saved_search["institution"]
+
 if ready:
     try:
-        opportunities = fetch_active_opportunities(area, position, gpa_policy)
+        opportunities = fetch_active_opportunities(
+            active_area, active_position, active_gpa
+        )
+        if active_institution:
+            opportunities = [
+                row for row in opportunities
+                if active_institution.casefold() in str(row["institution_name"]).casefold()
+            ]
     except Exception as error:
         st.error(f"The opportunity database could not be loaded: {error}")
         opportunities = []
 else:
-    st.info("Preview mode: connect PostgreSQL and apply db.sql to replace these example opportunities with live data.")
-    opportunities = filter_demo(demo_opportunities(), area, position, gpa_policy)
-
-radar_professors = []
-public_radar_enabled = setting_bool("PUBLIC_RADAR_ENABLED", True)
-if search_submitted and include_live_radar and ready and public_radar_enabled:
-    if len(area.strip()) < 3:
-        st.info("Enter a specific research area of at least three characters to run the web radar.")
-    else:
-        if not setting("BRAVE_SEARCH_API_KEY").strip():
-            st.warning(
-                "Limited public-web coverage: BRAVE_SEARCH_API_KEY is not configured, so this "
-                "local scan uses the slower DuckDuckGo fallback. OpenAlex research discovery "
-                "still works, but hiring-page coverage will be less reliable."
-            )
-        if results_wanted >= 50:
-            st.info(
-                f"{results_wanted} is a deep-search goal. This pass is time-bounded so the page "
-                "does not appear frozen; repeat the search with continuation enabled until the "
-                "goal is reached or the candidate pool is exhausted."
-            )
-        status = st.status("Starting targeted public-web radar…", expanded=True)
-        progress_bar = st.progress(0)
-        progress_text = st.empty()
-
-        def show_progress(stage: str, percent: int, counters: dict[str, int]) -> None:
-            status.update(label=stage, state="running", expanded=True)
-            progress_bar.progress(percent)
-            summary = " · ".join(
-                f"{key.replace('_', ' ').title()}: {value}"
-                for key, value in counters.items()
-                if value
-            )
-            progress_text.caption(summary or "Preparing sources…")
-
-        try:
-            scan = execute_radar(
-                area,
-                target_professors=results_wanted,
-                progress_callback=show_progress,
-                continue_partial=continue_incomplete,
-            )
-            radar_professors = scan["professors"]
-            if position != "All":
-                wanted_signal_role = "Intern" if position == "Internship" else position
-                radar_professors = [
-                    professor
-                    for professor in radar_professors
-                    if professor["result_category"] not in {
-                        "confirmed_opening", "public_hiring_signal"
-                    }
-                    or professor.get("position_type") == position
-                    or wanted_signal_role in extract_roles_and_funding(
-                        str(professor.get("hiring_evidence") or "")
-                    )[0]
-                ]
-            run = scan["run"]
-            progress_text.caption(
-                f"Goal: {int(run.get('target_professors') or results_wanted)} verified · "
-                f"{int(run.get('candidates_ranked') or 0)} candidates ranked · "
-                f"{int(run.get('faculty_identities_checked') or 0)} identities checked · "
-                f"{int(run.get('professors_found') or len(radar_professors))} verified"
-            )
-            remaining_candidates = max(
-                0,
-                int(run.get("candidates_ranked") or 0)
-                - int(run.get("faculty_identities_checked") or 0),
-            )
-            if run["status"] == "running":
-                status.update(
-                    label="This topic is already being scanned; refresh shortly",
-                    state="running",
-                    expanded=False,
-                )
-            else:
-                status.update(
-                    label=(
-                        "Radar continuation complete"
-                        if scan.get("continued")
-                        else "Radar scan complete" + (
-                            " (recent cache reused)" if scan["cached"] else ""
-                        )
-                    ),
-                    state="complete",
-                    expanded=False,
-                )
-                progress_bar.progress(100)
-                if (
-                    remaining_candidates > 0
-                    and int(run.get("professors_found") or 0) < results_wanted
-                ):
-                    st.info(
-                        f"This bounded pass still has {remaining_candidates} ranked candidates "
-                        "whose faculty identities have not been checked. Enable “Continue checking "
-                        "an incomplete cached search” and press Search to continue; prior decisions "
-                        "are reused."
-                    )
-        except Exception as error:
-            status.update(label="Radar scan could not complete", state="error", expanded=True)
-            st.error(str(error))
+    st.info(
+        "Preview mode: connect PostgreSQL and apply db.sql to replace these "
+        "example opportunities with live data."
+    )
+    opportunities = filter_demo(
+        demo_opportunities(), active_area, active_position, active_gpa
+    )
 
 st.subheader(f"Confirmed ScholarRadar openings ({len(opportunities)})")
-st.caption("Every result identifies its source, verification level, and evidence. Funding signals are not treated as confirmed openings.")
+st.caption(
+    "Every result identifies its source, verification level, and evidence. "
+    "Funding signals are not treated as confirmed openings."
+)
 
 if not opportunities:
     indexed_count = count_active_opportunities() if ready else 0
     if ready and indexed_count == 0:
         st.warning(
-            "No approved on-site openings have been indexed yet. Submit this search with the "
-            "live public-web radar enabled to look for recruiting evidence outside ScholarRadar."
+            "No approved on-site openings have been indexed yet. Faculty and "
+            "university recruiters can submit an opening for verification."
         )
-    else:
-        st.warning("No indexed opportunities match those filters. Try All positions and All policies.")
-        if gpa_policy != "All":
-            st.caption(
-                "Radar-discovered public signals use 'GPA policy not stated' unless an authorized "
-                "submitter explicitly supplies a GPA policy."
-            )
+    elif active_area:
+        st.warning("No approved openings match these filters.")
 else:
     columns = st.columns(3)
     for index, opportunity in enumerate(opportunities):
         with columns[index % 3]:
             render_opportunity(opportunity)
 
-if radar_professors and include_unknown_gpa:
-    st.subheader(f"Professor radar ({len(radar_professors)})")
-    st.caption(
-        "Results are ordered by evidence strength: confirmed ScholarRadar openings first, then "
-        "current public hiring evidence, early-career/funding indicators, and finally research fit. "
-        "A title or grant never proves that a professor is hiring."
-    )
-    if gpa_policy != "All":
-        st.info(
-            "The professor results below have GPA policy not stated. They are broader options, "
-            "not matches to your selected GPA policy. Verify both lab and graduate-school rules."
+radar_professors: list[dict] = []
+topic = None
+if ready and active_area:
+    visible_limit = int(st.session_state.get("sr_professor_limit", PAGE_SIZE))
+    try:
+        topic, radar_professors = fetch_indexed_professors(
+            active_area,
+            position_type=active_position,
+            gpa_policy=active_gpa,
+            institution=active_institution,
+            limit=visible_limit,
         )
-    # Keep the six evidence lanes internally for accurate badges and ordering,
-    # but present only three concepts to students. The previous six headings
-    # made closely related opportunity indicators look like different claims.
+    except Exception as error:
+        st.error(f"The verified professor index could not be loaded: {error}")
+
+if active_area and topic:
+    available = int(topic.get("verified_count") or 0)
+    if topic.get("status") in {"new", "indexing", "partial"}:
+        candidates = int(topic.get("candidates_seen") or 0)
+        topic_identity = str(topic["topic_key"])
+        if st.session_state.get("sr_seen_topic") != topic_identity:
+            st.session_state["sr_seen_topic"] = topic_identity
+            st.session_state["sr_seen_verified"] = available
+
+        refresh_requested = (
+            st.session_state.pop("sr_refresh_requested", False)
+            and st.session_state.pop("sr_refresh_topic", None) == topic_identity
+        )
+        if refresh_requested:
+            previous_available = int(
+                st.session_state.get("sr_seen_verified", available)
+            )
+            newly_verified = max(0, available - previous_available)
+            if newly_verified:
+                st.success(
+                    f"Refresh complete: {newly_verified} new verified faculty "
+                    f"profile{'s' if newly_verified != 1 else ''} added."
+                )
+            else:
+                st.info(
+                    "Refresh complete: no new verified profiles since your last "
+                    "check. Indexing is still continuing in the background."
+                )
+            st.session_state["sr_seen_verified"] = available
+
+        active_job_type = topic.get("active_job_type")
+        active_job_status = topic.get("active_job_status")
+        stage_labels = {
+            ("DISCOVER_CANDIDATES", "queued"): "Research discovery is waiting to start",
+            ("DISCOVER_CANDIDATES", "running"): "Finding research-matched candidates",
+            ("REINDEX_RESEARCH", "queued"): "Research refresh is waiting to start",
+            ("REINDEX_RESEARCH", "running"): "Refreshing research matches",
+            ("VERIFY_FACULTY", "queued"): "Faculty verification is waiting to start",
+            ("VERIFY_FACULTY", "running"): "Verifying faculty identities",
+            ("CHECK_GRANTS", "queued"): "Funding checks are waiting to start",
+            ("CHECK_GRANTS", "running"): "Checking public funding evidence",
+            ("CHECK_HIRING", "queued"): "Hiring checks are waiting to start",
+            ("CHECK_HIRING", "running"): "Checking public hiring evidence",
+        }
+        indexing_label = stage_labels.get(
+            (active_job_type, active_job_status),
+            "Current research set checked"
+            if topic.get("sources_exhausted")
+            else "Indexing in the background",
+        )
+        indexing_state = "complete" if topic.get("sources_exhausted") else "running"
+        index_status = st.status(
+            indexing_label, state=indexing_state, expanded=False
+        )
+        index_status.write(
+            f"**{available}** verified faculty profiles currently available."
+        )
+        index_status.write(
+            f"**{candidates}** research-matched candidates discovered."
+        )
+        if not topic.get("sources_exhausted"):
+            index_status.write(
+                "ScholarRadar is verifying identities and checking hiring and "
+                "funding evidence. You can leave this page while it works."
+            )
+            if active_job_status == "queued":
+                index_status.write(
+                    "The worker is finishing another scheduled task first. This "
+                    "research area is safely queued and has not failed."
+                )
+
+        if st.button("Refresh results", key="refresh_index"):
+            st.session_state["sr_refresh_requested"] = True
+            st.session_state["sr_refresh_topic"] = topic_identity
+            st.rerun()
+
+if radar_professors:
+    total_count = int(radar_professors[0].get("total_count") or len(radar_professors))
+    visible_limit = int(st.session_state.get("sr_professor_limit", PAGE_SIZE))
+    visible_count = min(len(radar_professors), total_count)
+    st.subheader(f"Professor radar ({total_count})")
+    st.caption(
+        "Results are ordered by evidence strength: confirmed openings, current public "
+        "hiring evidence, early-career/funding indicators, and research fit. A title "
+        "or grant never proves that a professor is hiring."
+    )
+    page_text, page_action = st.columns([4, 1], vertical_alignment="center")
+    page_text.caption(
+        f"Showing {visible_count} of {min(total_count, MAX_VISIBLE_RESULTS)} "
+        "available verified matches."
+    )
+    if visible_limit < min(total_count, MAX_VISIBLE_RESULTS):
+        if page_action.button(
+            "Load next 25", key="load_more_top", width="stretch"
+        ):
+            st.session_state["sr_professor_limit"] = min(
+                MAX_VISIBLE_RESULTS, visible_limit + PAGE_SIZE
+            )
+            st.rerun()
+    if active_gpa != "All":
+        st.info(
+            "Professor profiles with GPA policy not stated are broader options, not "
+            "matches to the selected GPA policy. Verify both lab and graduate-school rules."
+        )
     category_sections = [
         (
             {"confirmed_opening", "public_hiring_signal"},
             "Hiring now — current evidence",
-            "Confirmed ScholarRadar openings appear first, followed by current public recruiting evidence.",
+            "Approved ScholarRadar openings appear first, followed by moderated public recruiting evidence.",
         ),
         (
             {"early_career_funded", "early_career", "funded_lab"},
             "Likely opportunities — hiring not confirmed",
-            "Early-career faculty and/or relevant active funding can make outreach promising, but neither proves an opening.",
+            "Early-career faculty and relevant active funding can make outreach promising, but neither proves an opening.",
         ),
         (
             {"research_match"},
             "Other verified faculty matches — hiring unknown",
-            "These are verified faculty with matching recent research and no current hiring, early-career, or relevant-funding indicator.",
+            "Verified faculty with matching recent research and no current hiring, early-career, or relevant-funding indicator.",
         ),
     ]
     for categories, heading, explanation in category_sections:
@@ -254,16 +283,24 @@ if radar_professors and include_unknown_gpa:
         for index, professor in enumerate(rows):
             with columns[index % 2]:
                 render_professor_prospect(professor)
-elif radar_professors and not include_unknown_gpa:
+
+    if visible_limit < min(total_count, MAX_VISIBLE_RESULTS):
+        if st.button("Load next 25", key="load_more_bottom", width="stretch"):
+            st.session_state["sr_professor_limit"] = min(
+                MAX_VISIBLE_RESULTS, visible_limit + PAGE_SIZE
+            )
+            st.rerun()
+    elif total_count > MAX_VISIBLE_RESULTS:
+        st.caption("Showing the first 100 verified faculty matches.")
+elif active_area and topic:
     st.info(
-        f"The radar found {len(radar_professors)} research-matched professors, but their GPA "
-        "policies are not verified. Enable the broader-professor option to see them."
+        "No verified professor profile matches these filters yet. ScholarRadar has "
+        "recorded the research area and will add results after identity checks pass."
     )
-elif search_submitted and include_live_radar and area.strip() and ready:
+elif active_area and ready:
     st.info(
-        "No faculty-verified professors were found in this bounded pass. Research authors without "
-        "an official university faculty page are intentionally hidden. Try a related phrase or a "
-        "larger result count."
+        "ScholarRadar has recorded this research area. Verified professor matches "
+        "will appear as the shared index grows."
     )
 
 st.divider()

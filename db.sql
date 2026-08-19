@@ -67,8 +67,10 @@ CREATE TABLE IF NOT EXISTS professors (
         CHECK (faculty_confidence BETWEEN 0 AND 1),
     faculty_checked_at TIMESTAMPTZ,
     faculty_verified_at TIMESTAMPTZ,
+    next_identity_check_at TIMESTAMPTZ,
     public_hiring_checked_at TIMESTAMPTZ,
     grant_checked_at TIMESTAMPTZ,
+    previous_institutions TEXT[] NOT NULL DEFAULT '{}',
     official_institution_domain TEXT,
     appointment_year INTEGER CHECK (appointment_year IS NULL OR appointment_year BETWEEN 1900 AND 2200),
     graduate_faculty_status TEXT NOT NULL DEFAULT 'UNKNOWN'
@@ -89,11 +91,22 @@ ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verification_version INT
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_confidence NUMERIC(4, 3) NOT NULL DEFAULT 0;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verified_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS next_identity_check_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS grant_checked_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS previous_institutions TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS official_institution_domain TEXT;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_year INTEGER;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS graduate_faculty_status TEXT NOT NULL DEFAULT 'UNKNOWN';
+
+UPDATE professors
+SET next_identity_check_at = faculty_checked_at + CASE
+        WHEN faculty_status = 'VERIFIED' THEN INTERVAL '90 days'
+        WHEN faculty_status = 'NOT_FACULTY' THEN INTERVAL '75 days'
+        WHEN faculty_status = 'CONFLICT' THEN INTERVAL '45 days'
+        ELSE INTERVAL '30 days'
+    END
+WHERE next_identity_check_at IS NULL AND faculty_checked_at IS NOT NULL;
 
 DO $$
 BEGIN
@@ -113,6 +126,8 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS professors_faculty_status_idx
     ON professors (faculty_status, faculty_checked_at DESC);
+CREATE INDEX IF NOT EXISTS professors_identity_refresh_idx
+    ON professors (next_identity_check_at, faculty_status);
 
 CREATE TABLE IF NOT EXISTS faculty_verification_evidence (
     id BIGSERIAL PRIMARY KEY,
@@ -178,10 +193,14 @@ SET faculty_status = 'VERIFIED',
     faculty_title = pp.title,
     faculty_source_url = pp.official_profile_url,
     faculty_verification_method = 'manual_review',
-    faculty_verification_version = 2,
+    faculty_verification_version = 3,
     faculty_confidence = 1.0,
     faculty_checked_at = COALESCE(pp.verified_at, NOW()),
     faculty_verified_at = COALESCE(pp.verified_at, NOW()),
+    next_identity_check_at = COALESCE(
+        pp.verification_expires_at, pp.verified_at + INTERVAL '1 year',
+        NOW() + INTERVAL '1 year'
+    ),
     homepage_url = COALESCE(p.homepage_url, pp.official_profile_url),
     updated_at = NOW()
 FROM professor_profiles pp
@@ -349,6 +368,83 @@ CREATE TABLE IF NOT EXISTS hiring_signals (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Shared, user-independent research indexes. A normalized topic is discovered
+-- once and reused by every visitor; personal filters are applied at read time.
+CREATE TABLE IF NOT EXISTS radar_topics (
+    id BIGSERIAL PRIMARY KEY,
+    topic_key CHAR(64) NOT NULL UNIQUE,
+    requested_query TEXT NOT NULL,
+    normalized_query TEXT NOT NULL,
+    normalized_topic TEXT,
+    status TEXT NOT NULL DEFAULT 'new'
+        CHECK (status IN ('new', 'indexing', 'partial', 'ready', 'failed')),
+    desired_results INTEGER NOT NULL DEFAULT 100
+        CHECK (desired_results BETWEEN 1 AND 100),
+    candidates_seen INTEGER NOT NULL DEFAULT 0,
+    verified_count INTEGER NOT NULL DEFAULT 0,
+    papers_found INTEGER NOT NULL DEFAULT 0,
+    sources_exhausted BOOLEAN NOT NULL DEFAULT FALSE,
+    search_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_indexed_at TIMESTAMPTZ,
+    next_refresh_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS radar_topic_professors (
+    radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    result_rank INTEGER NOT NULL,
+    research_score NUMERIC(5, 2) NOT NULL DEFAULT 0,
+    matching_papers INTEGER NOT NULL DEFAULT 0,
+    latest_paper_title TEXT,
+    latest_paper_year INTEGER,
+    latest_paper_url TEXT,
+    first_matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_topic_id, professor_id)
+);
+
+-- Durable work queue. The partial unique index prevents duplicate active work
+-- for the same topic/professor while allowing a later refresh job.
+CREATE TABLE IF NOT EXISTS radar_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    radar_topic_id BIGINT REFERENCES radar_topics(id) ON DELETE CASCADE,
+    professor_id BIGINT REFERENCES professors(id) ON DELETE CASCADE,
+    requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    job_type TEXT NOT NULL CHECK (job_type IN (
+        'DISCOVER_CANDIDATES', 'VERIFY_FACULTY', 'REFRESH_FACULTY',
+        'CHECK_HIRING', 'CHECK_GRANTS', 'REINDEX_RESEARCH'
+    )),
+    dedupe_key TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 50 CHECK (priority BETWEEN 0 AND 100),
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts BETWEEN 1 AND 20),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    locked_at TIMESTAMPTZ,
+    locked_by TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    last_error TEXT,
+    result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS radar_worker_heartbeats (
+    worker_id TEXT PRIMARY KEY,
+    process_id INTEGER,
+    hostname TEXT,
+    current_job_id BIGINT REFERENCES radar_jobs(id) ON DELETE SET NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    stopped_at TIMESTAMPTZ
+);
+
 -- A run is targeted to one user query. ScholarRadar never attempts to preload
 -- every professor or every field.
 CREATE TABLE IF NOT EXISTS radar_runs (
@@ -432,3 +528,17 @@ CREATE INDEX IF NOT EXISTS radar_runs_query_cache_idx
 CREATE INDEX IF NOT EXISTS radar_runs_status_idx ON radar_runs (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS radar_run_professors_rank_idx
     ON radar_run_professors (radar_run_id, result_rank);
+CREATE INDEX IF NOT EXISTS radar_topics_requested_idx
+    ON radar_topics (last_requested_at DESC);
+CREATE INDEX IF NOT EXISTS radar_topics_refresh_idx
+    ON radar_topics (next_refresh_at, status);
+CREATE INDEX IF NOT EXISTS radar_topic_professors_rank_idx
+    ON radar_topic_professors (radar_topic_id, result_rank);
+CREATE INDEX IF NOT EXISTS radar_jobs_claim_idx
+    ON radar_jobs (status, available_at, priority DESC, created_at)
+    WHERE status = 'queued';
+CREATE UNIQUE INDEX IF NOT EXISTS radar_jobs_active_dedupe_idx
+    ON radar_jobs (dedupe_key)
+    WHERE status IN ('queued', 'running');
+CREATE INDEX IF NOT EXISTS radar_worker_last_seen_idx
+    ON radar_worker_heartbeats (last_seen_at DESC);

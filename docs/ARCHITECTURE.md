@@ -11,13 +11,18 @@ Browser
             -> database functions (db.py)
                  -> PostgreSQL tables (db.sql)
 
-Scheduled/manual radar command (scripts/run_radar.py)
+Background worker (scripts/run_worker.py)
+  -> PostgreSQL radar_jobs queue
   -> ingestion modules
-       -> public APIs and public web pages
-       -> PostgreSQL
+       -> OpenAlex, NSF, official pages, and public web search
+       -> shared radar_topics index in PostgreSQL
 ```
 
-The public homepage reads approved openings. A signed-in submitter requests proof of a faculty or university role. An administrator manually checks the official evidence. Only after role approval can the user submit an opening, and the opening has its own second moderation step.
+The public homepage reads approved openings and verified professor matches from
+PostgreSQL; it never waits on external websites. A signed-in submitter requests
+proof of a faculty or university role. An administrator manually checks the
+official evidence. Only after role approval can the user submit an opening, and
+the opening has its own second moderation step.
 
 ## 2. The important distinction: professor is not moderator
 
@@ -60,10 +65,16 @@ The owner account is created outside the UI so a visitor cannot make themselves 
 app.py
   -> database_is_ready()
   -> fetch_active_opportunities()
+  -> radar_store.request_topic_index()
+       -> one deduplicated radar_jobs row when coverage is missing
+  -> radar_store.fetch_indexed_professors()
   -> ui.render_opportunity()
 ```
 
-Only active, unexpired database opportunities are returned. When PostgreSQL is unavailable, the homepage intentionally shows preview data so the design can still be viewed.
+Only active, unexpired database opportunities and currently verified professor
+records are returned. Searches are shared by normalized topic. Personal position,
+GPA, and university choices filter the shared data instead of starting duplicate
+network scans.
 
 ### Professor verification and opening submission
 
@@ -113,21 +124,27 @@ pages/4_Admin_accounts.py
 
 The page is owner-only. Hiding a link is not the security control; the checks in `auth.py` and `db.py` are the controls.
 
-### Radar ingestion flow
+### Radar indexing flow
 
 ```text
-scripts/run_radar.py
-  -> ingestion/taxonomy.py
-  -> ingestion/fetch_prof.py
-  -> ingestion/check_grants.py
-  -> ingestion/parse_hiring_signals.py
-       -> homepagefinder.py
-       -> socialradar.py
-       -> matchers.py
-  -> PostgreSQL professors, papers, fundings, and hiring_signals
+app.py records topic demand
+  -> radar_jobs (deduplicated durable queue)
+scripts/run_worker.py
+  -> ingestion/index_worker.py
+       -> DISCOVER_CANDIDATES: OpenAlex papers/authors
+       -> VERIFY_FACULTY: official university identity evidence
+       -> CHECK_GRANTS: NSF evidence, independently cached
+       -> CHECK_HIRING: official/public evidence, independently cached
+  -> radar_topic_professors shared topic index
 ```
 
-Radar data is evidence, not a guaranteed vacancy. A qualifying public hiring quote creates a `pending` public-signal opportunity. An owner or moderator must review it before it becomes `active` and searchable. Papers and grants alone never create a public opening, and the radar never invents a GPA policy.
+Jobs survive worker restarts, retry with backoff, and release stale locks. Faculty
+identity has its own status and next-check time; hiring, funding, research relevance,
+and GPA are separate evidence types. Radar data is evidence, not a guaranteed
+vacancy. A qualifying public hiring quote creates a `pending` public-signal
+opportunity. An owner or moderator must review it before it becomes an active
+hiring result. Papers and grants alone never prove hiring, and the radar never
+invents a GPA policy.
 
 ## 4. Database tables
 
@@ -147,6 +164,10 @@ Radar data is evidence, not a guaranteed vacancy. A qualifying public hiring quo
 - `professor_papers`: many-to-many link between professors and papers.
 - `fundings`: public grant evidence linked to professors.
 - `hiring_signals`: time-bounded public web/social hiring text.
+- `radar_topics`: one shared normalized research-area index and its coverage.
+- `radar_topic_professors`: research evidence and rank linking a topic to professors.
+- `radar_jobs`: durable, deduplicated discovery, verification, and enrichment work.
+- `radar_worker_heartbeats`: worker health and current-job diagnostics.
 
 `db.sql` contains constraints and indexes as well as tables. Those constraints reject invalid status values even if a future programming error sends one.
 
@@ -154,7 +175,10 @@ Radar data is evidence, not a guaranteed vacancy. A qualifying public hiring quo
 
 ### Root application files
 
-- `app.py`: public homepage. Builds search filters, obtains active opportunities, and renders cards. Falls back to sample records if the database is not ready.
+- `app.py`: public homepage. Builds simple filters, queues missing shared coverage,
+  reads only PostgreSQL, paginates 25 at a time, and renders three evidence sections.
+- `radar_store.py`: shared topic index and durable job-queue data layer. It owns
+  normalization, deduplication, paging, ranking, retries, and owner diagnostics.
 - `auth.py`: identity and authorization boundary. Uses an explicit fake identity for local development, real Streamlit OIDC in production, and checks `site_admins` for protected pages.
 - `db.py`: the only general database access layer. Opens PostgreSQL connections, parameterizes SQL inputs, reads public data, saves verification/opening submissions, enforces admin authority, and logs privileged actions.
 - `db.sql`: declarative PostgreSQL schema. Run it before the app. It is idempotent for a fresh/current schema and deliberately is not executed automatically by the web request process.
@@ -174,6 +198,8 @@ Radar data is evidence, not a guaranteed vacancy. A qualifying public hiring quo
 - `pages/2_Verification.py`: public explanation of why email alone is insufficient and what evidence/review is used.
 - `pages/3_Admin_review.py`: protected queue for owners and moderators. Approves/rejects profiles, memberships, and openings.
 - `pages/4_Admin_accounts.py`: protected owner-only moderator management and audit-log view.
+- `pages/5_Radar_control.py`: protected owner-only topic coverage, worker health,
+  job retry/cancel, and identity-conflict dashboard.
 
 The numeric prefixes control Streamlit's page order. The custom navigation in `ui.py` supplies the public-facing links, including a Staff link; protected URLs still enforce authorization if opened directly. The owner sees a moderator-management link from the review page.
 
@@ -187,6 +213,8 @@ The numeric prefixes control Streamlit's page order. The custom navigation in `u
 - `ingestion/socialradar.py`: checks public social/search sources for possible hiring text, with throttling and identity matching.
 - `ingestion/matchers.py`: pure text helpers: signal phrases, roles, funding terms, stale dates, cleaned quotes, and hashes.
 - `ingestion/parse_hiring_signals.py`: orchestrates homepage/social checks, validates evidence, computes confidence, and saves time-limited hiring signals.
+- `ingestion/index_worker.py`: executes durable queue jobs and coordinates adaptive
+  candidate discovery, batched identity verification, and independent enrichment.
 
 These modules are not unnecessary duplicates. `matchers.py` contains reusable pure logic; `homepagefinder.py` owns URL discovery/safety; `socialradar.py` owns social-source collection; and `parse_hiring_signals.py` coordinates them.
 
@@ -201,6 +229,8 @@ These modules are not unnecessary duplicates. `matchers.py` contains reusable pu
 - `scripts/smoke_test_db.py`: verifies important tables and exactly one active owner.
 - `scripts/smoke_test_streamlit.py`: executes every Streamlit page without opening a browser and fails on uncaught page exceptions.
 - `scripts/run_radar.py`: command-line entry point for a full research-area radar scan.
+- `scripts/run_worker.py`: entry point for the durable background worker. Use
+  `--once` for one queued job or omit it for the continuous service.
 - `scripts/inspect_signals.py`: developer/admin command for reading recently stored signals; it is useful for diagnosis but is not part of a web request.
 
 The old standalone `ins-db.py` from the original submission is not needed in this corrected project. Its responsibilities are covered by `db.sql`, the controlled submission functions in `db.py`, and the explicit ingestion scripts. Keeping an ad-hoc insert script would create a second, easier-to-misuse path into the same tables.
@@ -221,11 +251,16 @@ The original `ingestion/i18n.py` is also omitted from this English-only MVP. It 
 
 ## 6. Which files run when?
 
-For ordinary browsing, Python loads `app.py`, which imports `auth.py`, `db.py`, and `ui.py`. It does not load the ingestion pipeline.
+For ordinary browsing, Python loads `app.py`, which imports `auth.py`, `db.py`,
+`radar_store.py`, and `ui.py`. It does not load or execute the network ingestion
+pipeline.
 
 For a Streamlit subpage, Streamlit executes that page as the entry file; the page imports the shared modules it needs. The numbered pages do not call one another.
 
-For radar collection, you explicitly run `python -m scripts.run_radar ...`. It imports ingestion modules and `db.py`; it does not run Streamlit.
+For radar collection, `python -m scripts.run_worker` claims PostgreSQL jobs and
+imports the ingestion modules. Local `make start` launches this worker beside
+Streamlit. `scripts/run_radar.py` remains a developer CLI for diagnostics and
+backward compatibility; public searches do not call it.
 
 For setup/testing, the shell scripts orchestrate Docker and Python. They are operations tooling, not part of the deployed web UI.
 

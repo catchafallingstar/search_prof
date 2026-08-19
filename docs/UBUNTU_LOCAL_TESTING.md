@@ -50,7 +50,10 @@ make start
 7. Creates the local development user and makes it the one owner.
 8. Runs all test layers.
 
-`make start` keeps Streamlit in the foreground. Press Ctrl+C to stop Streamlit; PostgreSQL remains in Docker until `make db-down`.
+`make start` starts the durable radar worker in the background and keeps Streamlit
+in the foreground. Press Ctrl+C to stop both processes; PostgreSQL remains in
+Docker until `make db-down`. Worker logs are written to
+`/tmp/scholarradar-worker.log`.
 
 ## Test layers
 
@@ -72,6 +75,7 @@ Useful diagnosis:
 docker compose ps
 make db-logs
 make schema
+make backup
 .venv/bin/python -m scripts.smoke_test_db
 .venv/bin/python -m scripts.smoke_test_streamlit
 ```
@@ -90,15 +94,23 @@ With local development auth, your `.env` user is the owner.
 
 To test a second local identity, change `DEV_USER_EMAIL` and `DEV_USER_NAME`, restart Streamlit, and visit a protected/user page once. That creates the second `users` row. Restore the owner's email, restart, open Admin accounts, and grant the second user moderator access. Change back to the second identity to confirm that it can use Admin review but cannot use Admin accounts.
 
-## Run the radar manually
+## Test the shared radar index
 
-After the database and virtual environment are ready:
+Start the site with `make start`, enter a research area, and press Search. Existing
+verified matches should appear immediately. A new topic creates a background job;
+use the homepage refresh button later to see new records. The owner can inspect
+coverage and failures from Staff → Radar operations.
+
+Worker commands for diagnosis:
 
 ```bash
-make radar AREA="robotics"
+make worker-once  # process one queued job
+make worker       # keep processing jobs
+tail -f /tmp/scholarradar-worker.log
 ```
 
-For a smaller API-only run that skips public web signal scanning:
+The older foreground radar CLI remains useful for ingestion diagnostics, but the
+website does not call it:
 
 ```bash
 .venv/bin/python -m scripts.run_radar "robotics" --max-papers 20 --skip-web-signals
@@ -140,3 +152,11 @@ APP_ENV=production DATABASE_URL='postgresql://...' \
 ```
 
 The command only grants the first owner or confirms the same owner. It refuses to replace a different active owner. There is intentionally no public "create admin" button.
+
+## Production worker requirement
+
+The Streamlit process and the worker must share the same managed `DATABASE_URL`.
+Run `python -m scripts.run_worker` as an always-on process on a worker-capable host.
+Streamlit Community Cloud alone does not keep a second background process alive.
+If the worker is absent, indexed results remain readable but new jobs stay queued;
+the owner dashboard will show that no healthy worker is connected.

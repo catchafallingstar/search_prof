@@ -32,19 +32,29 @@ class PublicRadarContractTests(unittest.TestCase):
         )
         self.assertIn("'unknown', 'not_stated'", source)
 
-    def test_public_app_has_visible_live_radar_progress(self) -> None:
+    def test_public_app_is_database_only_and_hides_indexing_controls(self) -> None:
         source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")
-        self.assertIn("Include a live public-web radar", source)
-        self.assertIn("st.status", source)
-        self.assertIn("st.progress", source)
-        self.assertIn("[10, 25, 50, 100]", source)
-        self.assertIn("Verified faculty goal", source)
-        self.assertIn("100 — deep index", source)
-        self.assertIn("press Search", source)
-        self.assertIn("Continue checking an incomplete cached search", source)
+        self.assertIn("request_topic_index", source)
+        self.assertIn("fetch_indexed_professors", source)
+        self.assertIn("PAGE_SIZE = 25", source)
+        self.assertIn("Load next 25", source)
+        self.assertIn("Showing {visible_count} of", source)
+        self.assertIn('key="load_more_top"', source)
+        self.assertIn('key="load_more_bottom"', source)
+        self.assertIn("Refresh complete: no new verified profiles", source)
+        self.assertIn("Indexing in the background", source)
+        self.assertIn("research-matched candidates discovered", source)
+        self.assertIn("Faculty verification is waiting to start", source)
+        self.assertIn("safely queued and has not failed", source)
+        self.assertIn("Showing the first 100 verified faculty matches.", source)
+        self.assertNotIn("execute_radar", source)
+        self.assertNotIn("Include a live public-web radar", source)
+        self.assertNotIn("Continue checking an incomplete cached search", source)
+        self.assertNotIn("candidate pool", source)
+        self.assertNotIn("bounded pass", source)
 
     def test_professor_categories_follow_evidence_strength(self) -> None:
-        database_source = (PROJECT_DIR / "db.py").read_text(encoding="utf-8")
+        database_source = (PROJECT_DIR / "radar_store.py").read_text(encoding="utf-8")
         app_source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")
         expected = [
             "confirmed_opening",
@@ -61,12 +71,42 @@ class PublicRadarContractTests(unittest.TestCase):
             app_source.index("public_hiring_signal"),
             app_source.index("early_career_funded"),
         )
-        self.assertIn("shared_latest_paper_count", database_source)
-        self.assertNotIn("LIKE '%assistant professor%'", database_source)
-        self.assertIn("LIKE '%%assistant professor%%'", database_source)
+        self.assertIn("o.source_kind IN ('verified_post', 'university_post')", database_source)
+        self.assertIn("WHEN o.id IS NOT NULL THEN 'public_hiring_signal'", database_source)
+        self.assertIn("rtp.research_score", database_source)
         self.assertIn("Hiring now — current evidence", app_source)
         self.assertIn("Likely opportunities — hiring not confirmed", app_source)
         self.assertIn("Other verified faculty matches — hiring unknown", app_source)
+
+    def test_shared_index_and_durable_queue_are_in_the_schema(self) -> None:
+        schema = (PROJECT_DIR / "db.sql").read_text(encoding="utf-8")
+        for table in (
+            "radar_topics",
+            "radar_topic_professors",
+            "radar_jobs",
+            "radar_worker_heartbeats",
+        ):
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS {table}", schema)
+        self.assertIn("next_identity_check_at TIMESTAMPTZ", schema)
+        self.assertIn("previous_institutions TEXT[]", schema)
+        self.assertIn("radar_jobs_active_dedupe_idx", schema)
+
+    def test_worker_owns_slow_network_indexing(self) -> None:
+        worker = (PROJECT_DIR / "ingestion" / "index_worker.py").read_text(
+            encoding="utf-8"
+        )
+        for job_type in (
+            "DISCOVER_CANDIDATES",
+            "VERIFY_FACULTY",
+            "REFRESH_FACULTY",
+            "CHECK_HIRING",
+            "CHECK_GRANTS",
+            "REINDEX_RESEARCH",
+        ):
+            self.assertIn(job_type, worker)
+        self.assertIn("claim_next_radar_job", worker)
+        self.assertIn("reschedule_radar_job", worker)
+        self.assertIn("json.dumps", worker)
 
     def test_continuation_rotates_public_checks_to_unchecked_professors(self) -> None:
         database_source = (PROJECT_DIR / "db.py").read_text(encoding="utf-8")

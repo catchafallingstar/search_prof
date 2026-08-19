@@ -960,20 +960,23 @@ def review_item(review_type: str, item_id: int, approve: bool, reviewer_id: int,
                             faculty_title, faculty_source_url,
                             faculty_verification_method, faculty_verification_version,
                             faculty_confidence,
-                            faculty_checked_at, faculty_verified_at, homepage_url
+                            faculty_checked_at, faculty_verified_at,
+                            next_identity_check_at, homepage_url
                         )
                         VALUES (%s, %s, %s, 'VERIFIED', %s, %s,
-                                'manual_review', 2, 1.0, NOW(), NOW(), %s)
+                                'manual_review', 3, 1.0, NOW(), NOW(),
+                                NOW() + INTERVAL '1 year', %s)
                         ON CONFLICT (name, institution_name) DO UPDATE
                         SET institution_id = EXCLUDED.institution_id,
                             faculty_status = 'VERIFIED',
                             faculty_title = EXCLUDED.faculty_title,
                             faculty_source_url = EXCLUDED.faculty_source_url,
                             faculty_verification_method = 'manual_review',
-                            faculty_verification_version = 2,
+                            faculty_verification_version = 3,
                             faculty_confidence = 1.0,
                             faculty_checked_at = NOW(),
                             faculty_verified_at = NOW(),
+                            next_identity_check_at = NOW() + INTERVAL '1 year',
                             homepage_url = EXCLUDED.homepage_url,
                             updated_at = NOW()
                         RETURNING id

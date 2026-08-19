@@ -37,4 +37,4 @@ python -m scripts.bootstrap_owner
 bash scripts/test_local.sh
 
 echo
-echo "Setup complete. Start the site with: make start"
+echo "Setup complete. Start the site and indexing worker with: make start"

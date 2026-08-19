@@ -15,9 +15,9 @@ if not database_is_ready():
 
 user, admin = require_site_admin()
 st.caption(f"Signed in with {admin['admin_role']} authority")
-if st.button("Radar operations"):
-    st.switch_page("pages/5_Radar_control.py")
 if admin["admin_role"] == "owner":
+    if st.button("Radar operations"):
+        st.switch_page("pages/5_Radar_control.py")
     if st.button("Manage moderator accounts"):
         st.switch_page("pages/4_Admin_accounts.py")
 

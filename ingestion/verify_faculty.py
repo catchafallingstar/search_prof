@@ -385,6 +385,12 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     faculty_confidence = %s,
                     faculty_checked_at = NOW(),
                     faculty_verified_at = CASE WHEN %s = 'VERIFIED' THEN NOW() ELSE NULL END,
+                    next_identity_check_at = NOW() + CASE
+                        WHEN %s = 'VERIFIED' THEN INTERVAL '90 days'
+                        WHEN %s = 'NOT_FACULTY' THEN INTERVAL '75 days'
+                        WHEN %s = 'CONFLICT' THEN INTERVAL '45 days'
+                        ELSE INTERVAL '30 days'
+                    END,
                     official_institution_domain = CASE
                         WHEN %s = 'VERIFIED' THEN %s
                         WHEN faculty_verification_method = 'official_directory' THEN NULL
@@ -392,6 +398,13 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     END,
                     appointment_year = COALESCE(%s, appointment_year),
                     career_stage = COALESCE(%s, career_stage),
+                    previous_institutions = CASE
+                        WHEN %s = 'VERIFIED'
+                             AND institution_name <> %s
+                             AND NOT (institution_name = ANY(previous_institutions))
+                            THEN array_append(previous_institutions, institution_name)
+                        ELSE previous_institutions
+                    END,
                     institution_id = CASE WHEN %s = 'VERIFIED' THEN %s ELSE institution_id END,
                     institution_name = CASE WHEN %s = 'VERIFIED' THEN %s ELSE institution_name END,
                     homepage_url = CASE WHEN %s = 'VERIFIED' THEN %s ELSE homepage_url END,
@@ -406,9 +419,11 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     FACULTY_VERIFICATION_VERSION,
                     float(result.get("confidence") or 0),
                     status,
+                    status, status, status,
                     status, result.get("source_domain"),
                     result.get("appointment_year"),
                     result.get("career_stage"),
+                    status, institution_name,
                     status, institution_id,
                     status, institution_name,
                     status, result.get("source_url"),
@@ -460,6 +475,7 @@ def verify_faculty_candidates(
                 """
                 SELECT id, name, institution_id, institution_name, homepage_url,
                        research_domain, faculty_status, faculty_checked_at,
+                       next_identity_check_at,
                        faculty_verification_method, faculty_verification_version
                 FROM professors
                 WHERE id = ANY(%s)
@@ -479,11 +495,23 @@ def verify_faculty_candidates(
             (now - candidate["faculty_checked_at"]).total_seconds() / 86_400
             if candidate.get("faculty_checked_at") else None
         )
+        refresh_is_current = (
+            candidate.get("next_identity_check_at") is not None
+            and candidate["next_identity_check_at"] > now
+        )
         if (
             candidate["faculty_status"] == "VERIFIED"
-            and int(candidate.get("faculty_verification_version") or 0) >= FACULTY_VERIFICATION_VERSION
-            and age_days is not None
-            and age_days <= 90
+            and (
+                candidate.get("faculty_verification_method") == "manual_review"
+                or int(candidate.get("faculty_verification_version") or 0)
+                    >= FACULTY_VERIFICATION_VERSION
+            )
+            and (
+                candidate.get("faculty_verification_method") == "manual_review"
+                or refresh_is_current
+                or (candidate.get("next_identity_check_at") is None
+                    and age_days is not None and age_days <= 90)
+            )
         ):
             verified_ids.append(professor_id)
         elif (
@@ -491,8 +519,11 @@ def verify_faculty_candidates(
                 "NOT_FACULTY", "UNVERIFIED", "CONFLICT", "MANUAL_REVIEW"
             }
             and int(candidate.get("faculty_verification_version") or 0) >= FACULTY_VERIFICATION_VERSION
-            and age_days is not None
-            and age_days <= 30
+            and (
+                refresh_is_current
+                or (candidate.get("next_identity_check_at") is None
+                    and age_days is not None and age_days <= 30)
+            )
         ):
             continue
         else:
@@ -536,13 +567,20 @@ def get_cached_faculty_decisions(professor_ids: list[int]) -> dict[str, list[int
                 WHERE id = ANY(%s)
                   AND faculty_verification_version >= %s
                   AND (
-                      (faculty_status = 'VERIFIED'
-                       AND faculty_checked_at >= NOW() - INTERVAL '90 days')
+                      (faculty_status = 'VERIFIED' AND (
+                           next_identity_check_at > NOW()
+                           OR (next_identity_check_at IS NULL
+                               AND faculty_checked_at >= NOW() - INTERVAL '90 days')
+                       ))
                       OR
                       (faculty_status IN (
                            'NOT_FACULTY', 'UNVERIFIED', 'CONFLICT', 'MANUAL_REVIEW'
                        )
-                       AND faculty_checked_at >= NOW() - INTERVAL '30 days')
+                       AND (
+                           next_identity_check_at > NOW()
+                           OR (next_identity_check_at IS NULL
+                               AND faculty_checked_at >= NOW() - INTERVAL '30 days')
+                       ))
                   )
                 """,
                 (ordered_ids, FACULTY_VERIFICATION_VERSION),

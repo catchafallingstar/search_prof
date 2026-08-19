@@ -23,4 +23,19 @@ if ! .venv/bin/python -c "import psycopg, psycopg_binary, streamlit"; then
   exit 1
 fi
 
-exec .venv/bin/python -m streamlit run app.py
+worker_pid=""
+cleanup() {
+  if [[ -n "$worker_pid" ]] && kill -0 "$worker_pid" 2>/dev/null; then
+    kill "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+.venv/bin/python -m scripts.run_worker \
+  --poll-seconds "${RADAR_WORKER_POLL_SECONDS:-3}" \
+  > /tmp/scholarradar-worker.log 2>&1 &
+worker_pid=$!
+echo "ScholarRadar worker started (PID $worker_pid; log: /tmp/scholarradar-worker.log)"
+
+.venv/bin/python -m streamlit run app.py

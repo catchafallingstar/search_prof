@@ -9,12 +9,12 @@ ScholarRadar combines five evidence levels:
 5. Other research-matched, officially verified faculty. Titles and grants are
    opportunity indicators rather than proof of hiring.
 
-Public search is targeted, not a preload of every academic field. A visitor first
-searches active approved records. With **Include a live public-web radar** enabled,
-ScholarRadar can then run a bounded scan for that exact research area, show its
-progress, and return both explicit public recruiting evidence and relevant
-professor prospects. Public hiring candidates are clearly labeled unreviewed
-and are also added to the staff moderation queue.
+Public search is targeted, not a preload of every academic field. It reads a
+shared, persistent professor index from PostgreSQL and returns immediately. A
+separate worker discovers researchers, verifies current faculty identities,
+checks grants, and looks for hiring evidence. New searches create one deduplicated
+background job; later visitors reuse the same topic index instead of repeating
+the network work.
 
 The app is built with Streamlit and PostgreSQL. The included Docker Compose configuration is for local Ubuntu development; use managed PostgreSQL when deploying to Streamlit Community Cloud.
 
@@ -46,6 +46,10 @@ make setup
 make start
 ```
 
+`make start` starts both the background index worker and Streamlit. Keep that
+terminal open while testing. To run them separately, use `make worker` in one
+terminal and `streamlit run app.py` in another.
+
 Open `http://localhost:8501`. The local `.env` identity is also the sole site owner, so it can open `/Admin_review` and `/Admin_accounts`.
 
 Useful commands:
@@ -55,44 +59,29 @@ make test       # unit tests, PostgreSQL checks, and headless Streamlit page tes
 make schema     # safely reapply the idempotent schema
 make db-logs    # inspect PostgreSQL logs
 make db-down    # stop PostgreSQL without deleting data
+make backup     # private timestamped local PostgreSQL snapshot in backups/
 ```
 
 ## Radar search and ranking
 
-The live radar progresses through topic interpretation, expanded recent-paper
-discovery, a small hiring-first public-web search, broad researcher-candidate
-identification, progressive current faculty-role verification, public grant checks,
-official faculty/lab-page discovery, web/social hiring-language checks, and
-moderation storage. Recent identical scans are cached,
-concurrent duplicate scans are collapsed, and an hourly global limit prevents a
-public deployment from repeatedly hitting external services.
+The visitor supplies a research area, desired position, GPA preference, and
+optional university. Search returns up to 25 indexed records at once; **Load 25
+more** paginates to a public maximum of 100. There are no continuation or live-scan
+controls. If coverage is still growing, the page says that indexing is happening
+and offers a simple refresh button.
 
-Visitors can choose a goal of 10, 25, 50, or 100 verified faculty results. A goal is
-not a promise: authors whose faculty identity cannot be verified are intentionally
-hidden. Discovery keeps a candidate pool up to six times larger (capped at 600), prioritizes explicit
-hiring leads, includes safely cached faculty decisions at any research rank, and
-verifies additional candidates in batches until the goal, candidate pool, or
-verification time budget is reached. Fewer results are valid when identities cannot
-be verified safely. Live NSF and detailed homepage enrichment remains bounded to
-the top 10, 12, 15, or 20 respectively. Every card says whether each source class was checked.
-The website opens recent results immediately by default. Select **Continue checking an
-incomplete cached search** and submit the same query to advance through unchecked
-candidates. The CLI continues when the same command is rerun, or can build a deep
-cache in several bounded passes with:
+The worker expands recent OpenAlex papers into corresponding, last, repeated, and
+selected first-author candidates. It uses the OpenAlex author ID as the external
+identity, reuses fresh positive and negative decisions, and checks unknown or stale
+people against official university pages. A person is public only after current
+faculty status is verified. The worker then checks NSF and public hiring sources in
+separate cached jobs. Finished and failed jobs survive application and worker
+restarts.
 
-```bash
-python -m scripts.run_radar "AI security" --professors 100 --passes 5
-```
-
-Current positive decisions
-are cached for 90 days and current negative decisions for 30 days, so continuation passes
-do not repeat completed identity checks.
-Grant and public-hiring timestamps are stored per professor, so later passes prioritize
-people whose enrichment sources have not yet been checked instead of repeatedly checking
-the same top 20.
-The cache identity includes the query, requested professor count, enrichment size,
-and algorithm version, so a previous 10-result scan cannot satisfy a 100-result
-request.
+Faculty decisions have explicit next-check dates: verified roles are normally
+refreshed after 90 days; non-faculty after 75 days; conflicts after 45 days; and
+unverified records after 30 days. Funding and public-hiring checks use their own
+timestamps because neither one proves the other.
 
 Professor-prospect ranking keeps six evidence lanes internally:
 
@@ -136,8 +125,9 @@ Funding alone never creates an opening. Public web evidence uses `GPA policy not
 stated`; only a verified submitter may claim GPA flexibility. Sponsored placement
 remains separately labeled.
 
-Owners and moderators can run larger scans and inspect run history on the Staff
-**Radar operations** page.
+The owner can inspect topic coverage, pending and failed jobs, worker health, and
+faculty conflicts on the Staff **Radar operations** page. Only the owner can retry
+or cancel indexing jobs.
 
 If shell execution bits were lost while copying the project, the Make targets still invoke the scripts with `bash`. You can also run `chmod +x scripts/*.sh`.
 
@@ -183,7 +173,11 @@ APP_ENV=production DATABASE_URL='postgresql://...' \
 
 In Streamlit Community Cloud, select `app.py` as the entrypoint and Python 3.12
 in Advanced settings, then paste the completed values from
-`.streamlit/secrets.example.toml` into the Secrets editor.
+`.streamlit/secrets.example.toml` into the Secrets editor. Streamlit Community
+Cloud does not provide a durable second process, so run
+`python -m scripts.run_worker` on a separate always-on worker service connected to
+the same managed PostgreSQL database. Without that worker, existing indexed
+results still display, but new topics will remain queued.
 
 Before making the GitHub repository public:
 
@@ -198,11 +192,13 @@ Before making the GitHub repository public:
    and bootstrap the owner before inviting test users.
 5. Keep `DEV_AUTH_BYPASS`, `DEV_USER_EMAIL`, and `DEV_USER_NAME` out of production
    secrets.
+6. Enable automated managed-database backups and test restoration. `make backup`
+   is a local Docker safety tool; production backups should be scheduled by the
+   PostgreSQL provider with retention and off-site storage.
 
-For a single Streamlit instance, the bounded scan can execute during the request as
-implemented here. For significant public traffic, move `execute_radar` to a durable
-worker/queue so scans continue across app restarts. PostgreSQL already stores run
-status, counters, cache identity, and candidate links for that migration.
+The browser-facing Streamlit process never calls DuckDuckGo, OpenAlex, university
+sites, or NSF while answering a search. All slow or failure-prone network work is
+owned by the durable worker queue.
 
 ## Learn the codebase
 
