@@ -45,6 +45,23 @@ AGENCY_MATRIX = {
 OPENALEX_TOPICS_URL = "https://api.openalex.org/topics"
 STOPWORDS = {"and", "for", "from", "into", "of", "research", "systems", "the", "using", "with"}
 
+# Query expansion is data-driven and shared by every field.  OpenAlex topics
+# supply most expansions.  Compound entries cover phrases whose everyday name
+# is broader than the titles used in papers (for example, "AI security").
+COMPOUND_QUERY_EXPANSIONS: dict[frozenset[str], list[str]] = {
+    frozenset({"ai", "security"}): [
+        "network intrusion detection",
+        "adversarial machine learning",
+        "privacy preserving machine learning",
+        "trustworthy artificial intelligence",
+    ],
+    frozenset({"machine", "learning", "security"}): [
+        "adversarial machine learning",
+        "network intrusion detection",
+        "privacy preserving machine learning",
+    ],
+}
+
 
 def _tokens(value: str) -> set[str]:
     return {
@@ -135,6 +152,30 @@ def _topic_relevance(raw_query: str, topic: dict[str, Any]) -> float:
     return 2.0 if phrase_covers_query(raw_query, display_name) else 1.0
 
 
+def build_search_queries(raw_query: str, topic: dict[str, Any] | None = None) -> list[str]:
+    """Return a small, deduplicated set of research searches for any field."""
+    raw_tokens = _tokens(raw_query) - STOPWORDS
+    queries: list[str] = []
+    for required, expansions in COMPOUND_QUERY_EXPANSIONS.items():
+        if required.issubset(raw_tokens):
+            queries.extend(expansions)
+    if topic:
+        display_name = str(topic.get("display_name") or "").strip()
+        if display_name:
+            queries.append(display_name)
+        queries.extend(value for value in _keyword_phrases(topic)[:3] if value.strip())
+    queries.append(raw_query.strip())
+
+    distinct: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        normalized = " ".join(query.casefold().split())
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            distinct.append(" ".join(query.split()))
+    return distinct[:6]
+
+
 def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
     clean_query = raw_query.strip()
     if not clean_query:
@@ -147,6 +188,7 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
         "field_name": "Unknown",
         "domain_name": "Unknown",
         "keywords": [clean_query],
+        "search_queries": build_search_queries(clean_query),
         "agency_category": "UNSUPPORTED",
         "router_config": AGENCY_MATRIX["UNSUPPORTED"],
     }
@@ -154,6 +196,9 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
     contact_email = setting("OPENALEX_EMAIL").strip()
     if contact_email:
         params["mailto"] = contact_email
+    api_key = setting("OPENALEX_API_KEY").strip()
+    if api_key:
+        params["api_key"] = api_key
 
     try:
         response = requests.get(OPENALEX_TOPICS_URL, params=params, timeout=10)
@@ -184,6 +229,7 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
             "field_name": field_name,
             "domain_name": domain_name,
             "keywords": topic.get("keywords") or [clean_query],
+            "search_queries": build_search_queries(clean_query, topic),
             "agency_category": category,
             "router_config": AGENCY_MATRIX[category],
         }

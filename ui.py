@@ -295,28 +295,39 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
     """Render a research match without turning probabilistic signals into claims."""
     category = row.get("result_category")
     with st.container(border=True):
-        if category == "hiring_signal":
-            st.caption("Strong public hiring signal · Not yet moderator-confirmed")
-        elif category == "likely_hiring":
-            reasons = []
-            if row.get("active_grants"):
-                reasons.append("active public grant")
-            if row.get("career_stage") == "NEW_AP":
-                reasons.append("newer faculty/lab signal")
-            st.caption(f"Promising lab · {', '.join(reasons)} · Hiring not confirmed")
+        if category == "confirmed_opening":
+            st.caption("Confirmed opening · Posted through a role-verified ScholarRadar account")
+        elif category == "public_hiring_signal":
+            st.caption("Current public hiring evidence · Not yet moderator-confirmed")
+        elif category == "early_career_funded":
+            st.caption("Assistant professor · Active public funding · Hiring unknown")
+        elif category == "early_career":
+            st.caption("Assistant professor · Hiring and funding not confirmed")
+        elif category == "funded_lab":
+            st.caption("Established faculty · Active public funding · Hiring unknown")
         else:
-            st.caption("Research match · Hiring not confirmed")
+            st.caption("Verified faculty research match · Hiring and funding not confirmed")
 
         st.subheader(row["professor_name"])
-        st.caption(f"{row['institution_name']} · Match score {float(row['research_score']):.0f}/40")
+        verified_title = str(row.get("faculty_title") or "Faculty").strip()
         st.caption(
-            "Identity basis: probable senior/corresponding author at a university; "
-            "faculty title is not verified unless the linked evidence says so."
+            f"✅ Faculty role verified · {verified_title} · {row['institution_name']} · "
+            f"Match score {float(row['research_score']):.0f}/40"
+        )
+        st.caption(
+            "The faculty identity is backed by an official university page. "
+            "Hiring and GPA claims are verified separately."
         )
         if row.get("latest_paper_title"):
             year = f" ({row['latest_paper_year']})" if row.get("latest_paper_year") else ""
             st.write(f"**Recent matching paper:** {row['latest_paper_title']}{year}")
             st.caption(f"Matching recent papers found: {row.get('matching_papers') or 0}")
+            shared_count = int(row.get("shared_latest_paper_count") or 0)
+            if shared_count > 1:
+                st.caption(
+                    f"This paper is shared by {shared_count} displayed coauthors. Each person's "
+                    "faculty identity is verified separately."
+                )
         if row.get("grant_title"):
             st.write(f"**Active grant:** {row['grant_title']} — {row.get('funder') or 'public funder'}")
         elif row.get("grant_sources_checked"):
@@ -331,7 +342,7 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
             st.caption("Public hiring sources not yet checked in this bounded pass.")
 
         st.write("**GPA policy:** Not stated. Check both the lab and graduate-program requirements.")
-        if category != "hiring_signal":
+        if category not in {"confirmed_opening", "public_hiring_signal"}:
             st.info(
                 "This person is shown because of research fit and opportunity indicators. "
                 "ScholarRadar did not confirm that the lab is currently recruiting."
@@ -339,6 +350,7 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
 
         links = [
             ("Check hiring evidence", row.get("hiring_source_url")),
+            ("Official faculty page", row.get("faculty_source_url")),
             ("View active grant", row.get("grant_url")),
             ("Professor/lab page", row.get("homepage_url")),
             ("Recent paper", row.get("latest_paper_url")),

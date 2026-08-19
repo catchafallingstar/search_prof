@@ -57,6 +57,22 @@ CREATE TABLE IF NOT EXISTS professors (
     research_domain TEXT,
     career_stage TEXT NOT NULL DEFAULT 'UNKNOWN'
         CHECK (career_stage IN ('NEW_AP', 'ESTABLISHED_PI', 'UNKNOWN')),
+    faculty_status TEXT NOT NULL DEFAULT 'UNVERIFIED'
+        CHECK (faculty_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'CONFLICT', 'MANUAL_REVIEW')),
+    faculty_title TEXT,
+    faculty_source_url TEXT,
+    faculty_verification_method TEXT,
+    faculty_verification_version INTEGER NOT NULL DEFAULT 0,
+    faculty_confidence NUMERIC(4, 3) NOT NULL DEFAULT 0
+        CHECK (faculty_confidence BETWEEN 0 AND 1),
+    faculty_checked_at TIMESTAMPTZ,
+    faculty_verified_at TIMESTAMPTZ,
+    public_hiring_checked_at TIMESTAMPTZ,
+    grant_checked_at TIMESTAMPTZ,
+    official_institution_domain TEXT,
+    appointment_year INTEGER CHECK (appointment_year IS NULL OR appointment_year BETWEEN 1900 AND 2200),
+    graduate_faculty_status TEXT NOT NULL DEFAULT 'UNKNOWN'
+        CHECK (graduate_faculty_status IN ('UNKNOWN', 'VERIFIED', 'NOT_LISTED')),
     radar_score INTEGER NOT NULL DEFAULT 0,
     score_breakdown TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -64,6 +80,78 @@ CREATE TABLE IF NOT EXISTS professors (
     CONSTRAINT professors_openalex_unique UNIQUE (openalex_id),
     CONSTRAINT professors_name_institution_unique UNIQUE (name, institution_name)
 );
+
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_status TEXT NOT NULL DEFAULT 'UNVERIFIED';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_title TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_source_url TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verification_method TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verification_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_confidence NUMERIC(4, 3) NOT NULL DEFAULT 0;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_checked_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verified_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_checked_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS grant_checked_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS official_institution_domain TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_year INTEGER;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS graduate_faculty_status TEXT NOT NULL DEFAULT 'UNKNOWN';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'professors_faculty_status_check') THEN
+        ALTER TABLE professors ADD CONSTRAINT professors_faculty_status_check
+            CHECK (faculty_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'CONFLICT', 'MANUAL_REVIEW'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'professors_faculty_confidence_check') THEN
+        ALTER TABLE professors ADD CONSTRAINT professors_faculty_confidence_check
+            CHECK (faculty_confidence BETWEEN 0 AND 1);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'professors_graduate_faculty_status_check') THEN
+        ALTER TABLE professors ADD CONSTRAINT professors_graduate_faculty_status_check
+            CHECK (graduate_faculty_status IN ('UNKNOWN', 'VERIFIED', 'NOT_LISTED'));
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS professors_faculty_status_idx
+    ON professors (faculty_status, faculty_checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS faculty_verification_evidence (
+    id BIGSERIAL PRIMARY KEY,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    source_url TEXT NOT NULL,
+    source_domain TEXT NOT NULL,
+    observed_title TEXT,
+    observed_institution TEXT,
+    evidence_text TEXT,
+    verification_status TEXT NOT NULL
+        CHECK (verification_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'CONFLICT', 'MANUAL_REVIEW')),
+    confidence NUMERIC(4, 3) NOT NULL DEFAULT 0
+        CHECK (confidence BETWEEN 0 AND 1),
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT faculty_verification_evidence_unique UNIQUE (professor_id, source_url)
+);
+
+CREATE INDEX IF NOT EXISTS faculty_verification_evidence_professor_idx
+    ON faculty_verification_evidence (professor_id, checked_at DESC);
+
+-- Version 1 accepted same-name directory/listing pages too easily. Preserve its
+-- evidence for audit, but require those machine decisions to pass the stricter
+-- verifier before they can return to public results.
+UPDATE professors
+SET faculty_status = 'MANUAL_REVIEW',
+    faculty_confidence = 0,
+    faculty_verified_at = NULL,
+    updated_at = NOW()
+WHERE faculty_verification_method = 'official_directory'
+  AND faculty_verification_version < 2
+  AND faculty_status = 'VERIFIED';
+
+UPDATE faculty_verification_evidence fve
+SET verification_status = 'MANUAL_REVIEW', confidence = 0
+FROM professors p
+WHERE fve.professor_id = p.id
+  AND p.faculty_verification_method = 'official_directory'
+  AND p.faculty_verification_version < 2
+  AND fve.verification_status = 'VERIFIED';
 
 CREATE TABLE IF NOT EXISTS professor_profiles (
     id BIGSERIAL PRIMARY KEY,
@@ -82,6 +170,23 @@ CREATE TABLE IF NOT EXISTS professor_profiles (
     CONSTRAINT professor_profiles_owner_unique UNIQUE (owner_user_id),
     CONSTRAINT professor_profiles_professor_unique UNIQUE (professor_id)
 );
+
+-- Preserve the stronger identity verification already performed for claimed
+-- professor accounts.
+UPDATE professors p
+SET faculty_status = 'VERIFIED',
+    faculty_title = pp.title,
+    faculty_source_url = pp.official_profile_url,
+    faculty_verification_method = 'manual_review',
+    faculty_verification_version = 2,
+    faculty_confidence = 1.0,
+    faculty_checked_at = COALESCE(pp.verified_at, NOW()),
+    faculty_verified_at = COALESCE(pp.verified_at, NOW()),
+    homepage_url = COALESCE(p.homepage_url, pp.official_profile_url),
+    updated_at = NOW()
+FROM professor_profiles pp
+WHERE pp.professor_id = p.id
+  AND pp.verification_status = 'verified';
 
 CREATE TABLE IF NOT EXISTS institution_memberships (
     id BIGSERIAL PRIMARY KEY,
@@ -224,8 +329,11 @@ CREATE TABLE IF NOT EXISTS fundings (
     award_date DATE,
     expiration_date DATE,
     source_url TEXT,
+    research_domains TEXT[] NOT NULL DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE fundings
+    ADD COLUMN IF NOT EXISTS research_domains TEXT[] NOT NULL DEFAULT '{}';
 
 CREATE TABLE IF NOT EXISTS hiring_signals (
     id BIGSERIAL PRIMARY KEY,
@@ -255,6 +363,8 @@ CREATE TABLE IF NOT EXISTS radar_runs (
     progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
     professors_found INTEGER NOT NULL DEFAULT 0,
     papers_found INTEGER NOT NULL DEFAULT 0,
+    candidates_ranked INTEGER NOT NULL DEFAULT 0,
+    faculty_identities_checked INTEGER NOT NULL DEFAULT 0,
     professors_checked INTEGER NOT NULL DEFAULT 0,
     grants_added INTEGER NOT NULL DEFAULT 0,
     signals_added INTEGER NOT NULL DEFAULT 0,
@@ -272,6 +382,8 @@ CREATE TABLE IF NOT EXISTS radar_runs (
 ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS target_professors INTEGER NOT NULL DEFAULT 25;
 ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS web_check_limit INTEGER NOT NULL DEFAULT 12;
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS candidates_ranked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS faculty_identities_checked INTEGER NOT NULL DEFAULT 0;
 
 -- Every professor discovered for a run is retained, even if no explicit hiring
 -- statement is found. Hiring evidence and probable-opportunity signals are

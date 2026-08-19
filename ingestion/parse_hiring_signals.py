@@ -3,7 +3,7 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Callable
-from urllib.parse import urljoin
+from urllib.parse import urldefrag, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,6 +16,11 @@ from settings import setting_int
 
 NEW_AP_PATTERN = re.compile(
     r"(?:joining|starting\s+(?:my\s+)?lab|new\s+assistant\s+professor|incoming\s+(?:faculty|professor))",
+    re.IGNORECASE,
+)
+RELATED_ACADEMIC_LINK_PATTERN = re.compile(
+    r"(?:\blab\b|laborator|research\s+group|opening|prospective|join\s+us|"
+    r"personal\s+(?:site|website|homepage)|\bwebsite\b|\bhomepage\b)",
     re.IGNORECASE,
 )
 
@@ -82,6 +87,35 @@ def fetch_and_parse_homepage(homepage_url: str) -> list[str]:
         return []
 
 
+def discover_linked_research_pages(homepage_url: str, max_links: int = 3) -> list[str]:
+    """Follow a few lab/openings links that an official faculty page endorses."""
+    if not is_public_http_url(homepage_url, resolve_dns=True):
+        return []
+    try:
+        response = _fetch_with_safe_redirects(homepage_url)
+        response.raise_for_status()
+        if "text/html" not in response.headers.get("content-type", "").casefold():
+            return []
+        soup = BeautifulSoup(response.text, "html.parser")
+        results: list[str] = []
+        seen: set[str] = {homepage_url.rstrip("/")}
+        for anchor in soup.find_all("a", href=True):
+            label = " ".join(anchor.get_text(" ", strip=True).split())
+            href = str(anchor.get("href") or "").strip()
+            candidate = urldefrag(urljoin(homepage_url, href))[0]
+            if not RELATED_ACADEMIC_LINK_PATTERN.search(f"{label} {href}"):
+                continue
+            if candidate.rstrip("/") in seen or not is_public_http_url(candidate):
+                continue
+            seen.add(candidate.rstrip("/"))
+            results.append(candidate)
+            if len(results) >= max(1, min(max_links, 5)):
+                break
+        return results
+    except (OSError, requests.RequestException):
+        return []
+
+
 def save_signal_to_db(
     professor_id: int,
     signal_type: str,
@@ -90,6 +124,14 @@ def save_signal_to_db(
     radar_run_id: int | None = None,
 ) -> dict[str, Any]:
     roles, has_funding = extract_roles_and_funding(raw_quote)
+    role_priority = ("PhD", "Postdoc", "Research Assistant", "Intern")
+    primary_role = next((role for role in role_priority if role in roles), None)
+    position_type = {
+        "PhD": "PhD",
+        "Postdoc": "Postdoc",
+        "Research Assistant": "Research Assistant",
+        "Intern": "Internship",
+    }.get(primary_role or "", "PhD")
     is_new_ap = bool(NEW_AP_PATTERN.search(raw_quote))
     score_boost = 40 + (20 if has_funding else 0) + (30 if is_new_ap else 0)
     quote_hash = get_text_hash(f"{professor_id}|{source_url}|{raw_quote}")
@@ -130,12 +172,6 @@ def save_signal_to_db(
                     (professor_id,),
                 )
                 professor = cursor.fetchone()
-                position_type = {
-                    "PhD": "PhD",
-                    "Postdoc": "Postdoc",
-                    "Research Assistant": "Research Assistant",
-                    "Intern": "Internship",
-                }.get(roles[0] if roles else "", "PhD")
                 cursor.execute(
                     """
                     INSERT INTO opportunities (
@@ -199,6 +235,11 @@ def save_signal_to_db(
                 )
                 existing = cursor.fetchone()
                 opportunity_id = existing["opportunity_id"] if existing else None
+                if opportunity_id:
+                    cursor.execute(
+                        "UPDATE opportunities SET position_type = %s, updated_at = NOW() WHERE id = %s",
+                        (position_type, opportunity_id),
+                    )
             if radar_run_id and opportunity_id:
                 cursor.execute(
                     """
@@ -229,6 +270,11 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
         quote = clean_and_extract_hiring_quote(". ".join(sentences))
         if quote:
             return "homepage", professor["id"], quote, homepage
+        for linked_page in discover_linked_research_pages(homepage):
+            sentences = fetch_and_parse_homepage(linked_page)
+            quote = clean_and_extract_hiring_quote(". ".join(sentences))
+            if quote:
+                return "homepage", professor["id"], quote, linked_page
 
     social_text, social_url = check_social_hiring(professor["name"], professor["institution_name"])
     quote = clean_and_extract_hiring_quote(social_text or "")

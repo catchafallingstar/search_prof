@@ -1,10 +1,13 @@
 # ScholarRadar MVP
 
-ScholarRadar combines three result levels:
+ScholarRadar combines five evidence levels:
 
 1. Openings submitted by role-verified faculty or university staff and approved by a site administrator.
 2. Explicit public hiring statements found on official or attributable sources.
-3. Research-matched professor/researcher prospects, with grants and newer-lab signals shown as opportunity indicators rather than proof of hiring.
+3. Assistant professors with active public funding, then other assistant professors.
+4. Established faculty with active public funding.
+5. Other research-matched, officially verified faculty. Titles and grants are
+   opportunity indicators rather than proof of hiring.
 
 Public search is targeted, not a preload of every academic field. A visitor first
 searches active approved records. With **Include a live public-web radar** enabled,
@@ -31,6 +34,7 @@ Then open this project directory and edit `.env`:
 DEV_USER_EMAIL=your-real-email@example.com
 DEV_USER_NAME="Your Name"
 OPENALEX_EMAIL=your-real-email@example.com
+OPENALEX_API_KEY=paste-your-free-openalex-key-here
 ```
 
 The provided local password works for testing. If you change `POSTGRES_PASSWORD`, change the password inside `DATABASE_URL` to the same value. URL-encode special characters used inside the URL.
@@ -55,34 +59,71 @@ make db-down    # stop PostgreSQL without deleting data
 
 ## Radar search and ranking
 
-The live radar progresses through topic interpretation, recent-paper discovery,
-probable-professor identification, public grant checks, official lab-page discovery,
-web/social hiring-language checks, and moderation storage. Recent identical scans
-are cached, concurrent duplicate scans are collapsed, and an hourly global limit
-prevents a public deployment from repeatedly hitting external services.
+The live radar progresses through topic interpretation, expanded recent-paper
+discovery, a small hiring-first public-web search, broad researcher-candidate
+identification, progressive current faculty-role verification, public grant checks,
+official faculty/lab-page discovery, web/social hiring-language checks, and
+moderation storage. Recent identical scans are cached,
+concurrent duplicate scans are collapsed, and an hourly global limit prevents a
+public deployment from repeatedly hitting external services.
 
-Visitors can request 10, 25, 50, or 100 prospects. Research discovery may return
-that many candidates, but live NSF and web enrichment is bounded to the top 10,
-12, 15, or 20 respectively. Every card says whether each source class was checked.
+Visitors can choose a goal of 10, 25, 50, or 100 verified faculty results. A goal is
+not a promise: authors whose faculty identity cannot be verified are intentionally
+hidden. Discovery keeps a candidate pool up to six times larger (capped at 600), prioritizes explicit
+hiring leads, includes safely cached faculty decisions at any research rank, and
+verifies additional candidates in batches until the goal, candidate pool, or
+verification time budget is reached. Fewer results are valid when identities cannot
+be verified safely. Live NSF and detailed homepage enrichment remains bounded to
+the top 10, 12, 15, or 20 respectively. Every card says whether each source class was checked.
+The website opens recent results immediately by default. Select **Continue checking an
+incomplete cached search** and submit the same query to advance through unchecked
+candidates. The CLI continues when the same command is rerun, or can build a deep
+cache in several bounded passes with:
+
+```bash
+python -m scripts.run_radar "AI security" --professors 100 --passes 5
+```
+
+Current positive decisions
+are cached for 90 days and current negative decisions for 30 days, so continuation passes
+do not repeat completed identity checks.
+Grant and public-hiring timestamps are stored per professor, so later passes prioritize
+people whose enrichment sources have not yet been checked instead of repeatedly checking
+the same top 20.
 The cache identity includes the query, requested professor count, enrichment size,
 and algorithm version, so a previous 10-result scan cannot satisfy a 100-result
 request.
 
-Professor-prospect ranking is evidence-based and intentionally separated:
+Professor-prospect ranking keeps six evidence lanes internally:
 
 - confirmed opening: approved on-site post;
-- strong public signal: explicit current recruiting language, still moderated;
-- promising lab: research match plus an active grant or newer-lab evidence;
-- research match: relevant recent work without confirmed opportunity evidence.
+- current public signal: explicit recruiting language, still moderated;
+- assistant professor with active funding: early-career rank plus an active grant;
+- assistant professor: verified early-career rank, hiring unknown;
+- established faculty with active funding: funding indicator, hiring unknown;
+- other verified faculty match: relevant recent work, hiring and funding unknown.
 
-OpenAlex does not prove employment title. Until an official faculty page is
-validated, machine-discovered people should be read as probable senior or
-corresponding-author prospects.
+The public page combines those lanes into three understandable sections: **Hiring now —
+current evidence**, **Likely opportunities — hiring not confirmed**, and **Other verified
+faculty matches — hiring unknown**. The detailed card badge still explains whether the
+reason is a site opening, public statement, assistant-professor title, active relevant
+funding, or research fit.
+
+OpenAlex does not prove employment title. The discovery step deliberately gathers
+first, corresponding, last, and repeated matching authors, but a candidate is not
+put in a public result until an official current `.edu` page identifies that same
+person as faculty. This is why a last author who is actually a student or data
+scientist is hidden, while a new assistant professor can be found even when the
+paper still carries an older affiliation. Verification evidence is retained for
+auditing and periodically refreshed. Publication affiliations never overwrite a
+versioned, officially verified current appointment.
 
 For production reliability, create a Brave Search API key and store it as
 `BRAVE_SEARCH_API_KEY` in Streamlit Secrets. The code uses Brave's official Web
 Search API when that key exists and falls back to DDGS for local development.
-Never commit the key. `OPENALEX_EMAIL` should also contain a real contact email.
+Also create a free OpenAlex key and store it as `OPENALEX_API_KEY`; production API
+searches are rate-limited without it. Never commit either key.
+`OPENALEX_EMAIL` should contain a real contact email.
 
 Organic opportunity ranking is source-based:
 

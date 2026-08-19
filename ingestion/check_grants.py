@@ -7,6 +7,7 @@ from typing import Any
 import requests
 
 from db import get_db_connection
+from ingestion.taxonomy import phrase_covers_query
 
 NSF_API_URL = "https://api.nsf.gov/services/v1/awards.json"
 
@@ -39,6 +40,27 @@ def _institution_matches(expected: str, actual: str) -> bool:
     return bool(expected_tokens and len(expected_tokens & actual_tokens) >= min(2, len(expected_tokens)))
 
 
+def _grant_matches_domain(raw_query: str, award: dict[str, Any]) -> bool:
+    """Require topical grant evidence, not merely any award held by the professor."""
+    evidence = " ".join(
+        str(award.get(key) or "")
+        for key in ("title", "abstractText", "fundProgramName")
+    )
+    query_tokens = set(re.findall(r"[a-z0-9]+", raw_query.casefold()))
+    if "security" in query_tokens and (
+        "ai" in query_tokens
+        or {"artificial", "intelligence"}.issubset(query_tokens)
+    ):
+        return bool(
+            re.search(
+                r"\b(?:adversarial|attack|cybersecurity|privacy|robustness|secure|security|threat)\w*\b",
+                evidence,
+                re.IGNORECASE,
+            )
+        )
+    return phrase_covers_query(raw_query, evidence)
+
+
 def _parse_nsf_date(value: Any) -> date | None:
     if not value:
         return None
@@ -56,6 +78,7 @@ def check_and_save_grants(
 ) -> dict[str, int]:
     """Check active NSF awards for identified US professors in every field."""
     research_domain = str(tax_meta.get("topic_name") or "").strip()
+    raw_query = str(tax_meta.get("raw_query") or research_domain).strip()
     if not research_domain:
         return {"professors_checked": 0, "grants_added": 0}
 
@@ -125,6 +148,8 @@ def check_and_save_grants(
                     if expiration_date and expiration_date < date.today():
                         continue
                     title = str(award.get("title") or "Untitled NSF award")
+                    if not _grant_matches_domain(raw_query, award):
+                        continue
                     grant_id = str(award.get("id") or "")
                     try:
                         amount = float(
@@ -139,17 +164,26 @@ def check_and_save_grants(
                         """
                         INSERT INTO fundings (
                             professor_id, funding_hash, grant_title, grant_id, funder,
-                            amount, award_date, expiration_date, source_url
-                        ) VALUES (%s, %s, %s, %s, 'NSF', %s, %s, %s, %s)
-                        ON CONFLICT (funding_hash) DO NOTHING
+                            amount, award_date, expiration_date, source_url,
+                            research_domains
+                        ) VALUES (%s, %s, %s, %s, 'NSF', %s, %s, %s, %s, ARRAY[%s])
+                        ON CONFLICT (funding_hash) DO UPDATE
+                        SET research_domains = ARRAY(
+                            SELECT DISTINCT unnest(
+                                fundings.research_domains || EXCLUDED.research_domains
+                            )
+                        )
+                        RETURNING (xmax = 0) AS inserted
                         """,
                         (
                             professor["id"], funding_hash, title, grant_id, amount,
                             _parse_nsf_date(award.get("startDate")), expiration_date,
                             f"https://www.nsf.gov/awardsearch/showAward?AWD_ID={grant_id}" if grant_id else None,
+                            research_domain,
                         ),
                     )
-                    if cursor.rowcount:
+                    saved_funding = cursor.fetchone()
+                    if saved_funding and saved_funding["inserted"]:
                         grants_added += 1
                         upper_title = title.upper()
                         score_boost += 40 if "CRII" in upper_title else 30 if "CAREER" in upper_title else 15

@@ -134,7 +134,7 @@ def count_active_opportunities() -> int:
 
 def _radar_query_key(query: str, target_professors: int, web_check_limit: int) -> str:
     normalized = " ".join(re.findall(r"[a-z0-9]+", query.casefold()))
-    identity = f"{normalized}|professors={target_professors}|web={web_check_limit}|v=3"
+    identity = f"{normalized}|professors={target_professors}|web={web_check_limit}|v=7-deep-pool"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -143,6 +143,7 @@ def start_or_reuse_radar_run(
     target_professors: int,
     web_check_limit: int,
     requested_by: int | None = None,
+    force_new: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     """Return a cached/running scan, or atomically create a new targeted scan."""
     clean_query = " ".join(query.split())
@@ -180,7 +181,7 @@ def start_or_reuse_radar_run(
                 (query_key, cache_hours),
             )
             reusable = cursor.fetchone()
-            if reusable:
+            if reusable and not force_new:
                 return reusable, True
             cursor.execute(
                 "SELECT COUNT(*) AS count FROM radar_runs WHERE created_at > NOW() - INTERVAL '1 hour'"
@@ -260,11 +261,47 @@ def mark_radar_prospects_checked(
                 """,
                 (run_id, professor_ids),
             )
+            timestamp_column = {
+                "grants": "grant_checked_at",
+                "public": "public_hiring_checked_at",
+            }[source_kind]
+            cursor.execute(
+                f"""
+                UPDATE professors SET {timestamp_column} = NOW(), updated_at = NOW()
+                WHERE id = ANY(%s)
+                """,
+                (professor_ids,),
+            )
+
+
+def prioritize_professors_for_enrichment(professor_ids: list[int]) -> list[int]:
+    """Put never/stale-checked professors first while preserving research rank."""
+    if not professor_ids:
+        return []
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM professors
+                WHERE id = ANY(%s)
+                ORDER BY
+                    CASE
+                        WHEN public_hiring_checked_at IS NULL OR grant_checked_at IS NULL THEN 0
+                        ELSE 1
+                    END,
+                    LEAST(public_hiring_checked_at, grant_checked_at) NULLS FIRST,
+                    array_position(%s::bigint[], id)
+                """,
+                (professor_ids, professor_ids),
+            )
+            return [int(row["id"]) for row in cursor.fetchall()]
 
 
 def update_radar_run(run_id: int, stage: str, progress: int, **counters: int) -> None:
     allowed = {
-        "professors_found", "papers_found", "professors_checked",
+        "professors_found", "papers_found", "candidates_ranked",
+        "faculty_identities_checked", "professors_checked",
         "grants_added", "signals_added",
     }
     assignments = ["stage = %s", "progress = %s", "heartbeat_at = NOW()"]
@@ -294,6 +331,7 @@ def finish_radar_run(
                 UPDATE radar_runs
                 SET normalized_topic = %s, status = 'completed', stage = 'Complete',
                     progress = 100, professors_found = %s, papers_found = %s,
+                    candidates_ranked = %s, faculty_identities_checked = %s,
                     professors_checked = %s, grants_added = %s, signals_added = %s,
                     heartbeat_at = NOW(), completed_at = NOW(), error_message = NULL
                 WHERE id = %s
@@ -301,6 +339,8 @@ def finish_radar_run(
                 (
                     normalized_topic,
                     counters.get("professors_found", 0), counters.get("papers_found", 0),
+                    counters.get("candidates_ranked", 0),
+                    counters.get("faculty_identities_checked", 0),
                     counters.get("professors_checked", 0), counters.get("grants_added", 0),
                     counters.get("signals_added", 0), run_id,
                 ),
@@ -362,7 +402,7 @@ def fetch_radar_results(run_id: int, position_type: str = "All") -> list[dict[st
 
 
 def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
-    """Return all discovered professors with evidence-based confidence categories."""
+    """Return verified faculty in evidence-first, mutually exclusive categories."""
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -374,6 +414,8 @@ def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
                     rrp.grant_sources_checked, rrp.public_sources_checked,
                     p.name AS professor_name, p.institution_name,
                     p.research_domain, p.homepage_url, p.openalex_id, p.career_stage,
+                    p.faculty_status, p.faculty_title, p.faculty_source_url,
+                    p.faculty_verified_at, p.official_institution_domain,
                     COALESCE(f.active_grants, 0) AS active_grants,
                     f.grant_title, f.funder, f.amount AS grant_amount,
                     f.expiration_date AS grant_expiration, f.source_url AS grant_url,
@@ -381,20 +423,48 @@ def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
                     os.source_url AS hiring_source_url,
                     os.evidence_text AS hiring_evidence,
                     os.confidence AS hiring_confidence,
+                    o.status AS opportunity_status,
+                    o.source_kind AS opportunity_source_kind,
+                    COUNT(*) OVER (
+                        PARTITION BY rrp.radar_run_id, rrp.latest_paper_url
+                    ) AS shared_latest_paper_count,
                     CASE
-                        WHEN o.id IS NOT NULL THEN 'hiring_signal'
+                        WHEN o.id IS NOT NULL
+                             AND o.status = 'active'
+                             AND o.source_kind IN ('verified_post', 'university_post')
+                            THEN 'confirmed_opening'
+                        WHEN o.id IS NOT NULL THEN 'public_hiring_signal'
                         WHEN COALESCE(f.active_grants, 0) > 0
-                             OR p.career_stage = 'NEW_AP' THEN 'likely_hiring'
+                             AND (
+                                 p.career_stage = 'NEW_AP'
+                                 OR LOWER(COALESCE(p.faculty_title, '')) LIKE '%%assistant professor%%'
+                             ) THEN 'early_career_funded'
+                        WHEN p.career_stage = 'NEW_AP'
+                             OR LOWER(COALESCE(p.faculty_title, '')) LIKE '%%assistant professor%%'
+                            THEN 'early_career'
+                        WHEN COALESCE(f.active_grants, 0) > 0 THEN 'funded_lab'
                         ELSE 'research_match'
                     END AS result_category,
                     LEAST(
                         100,
                         rrp.research_score
-                        + CASE WHEN o.id IS NOT NULL THEN 35 ELSE 0 END
+                        + CASE
+                            WHEN o.id IS NOT NULL
+                                 AND o.status = 'active'
+                                 AND o.source_kind IN ('verified_post', 'university_post') THEN 50
+                            WHEN o.id IS NOT NULL THEN 35
+                            ELSE 0
+                          END
                         + CASE WHEN COALESCE(f.active_grants, 0) > 0 THEN 15 ELSE 0 END
-                        + CASE WHEN p.career_stage = 'NEW_AP' THEN 10 ELSE 0 END
+                        + CASE
+                            WHEN p.career_stage = 'NEW_AP'
+                                 OR LOWER(COALESCE(p.faculty_title, '')) LIKE '%%assistant professor%%'
+                                THEN 10
+                            ELSE 0
+                          END
                     ) AS opportunity_score
                 FROM radar_run_professors rrp
+                JOIN radar_runs radar ON radar.id = rrp.radar_run_id
                 JOIN professors p ON p.id = rrp.professor_id
                 LEFT JOIN LATERAL (
                     SELECT COUNT(*) OVER () AS active_grants, grant_title, funder,
@@ -402,6 +472,8 @@ def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
                     FROM fundings
                     WHERE professor_id = p.id
                       AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
+                      AND COALESCE(radar.normalized_topic, radar.requested_query)
+                          = ANY(research_domains)
                     ORDER BY expiration_date DESC NULLS LAST, created_at DESC
                     LIMIT 1
                 ) f ON TRUE
@@ -422,12 +494,26 @@ def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
                     ORDER BY observed_at DESC LIMIT 1
                 ) os ON TRUE
                 WHERE rrp.radar_run_id = %s
+                  AND p.faculty_status = 'VERIFIED'
+                  AND (
+                      p.faculty_verification_method = 'manual_review'
+                      OR p.faculty_verification_version >= 3
+                  )
                 ORDER BY
                     CASE
-                        WHEN o.id IS NOT NULL THEN 1
+                        WHEN o.id IS NOT NULL
+                             AND o.status = 'active'
+                             AND o.source_kind IN ('verified_post', 'university_post') THEN 1
+                        WHEN o.id IS NOT NULL THEN 2
                         WHEN COALESCE(f.active_grants, 0) > 0
-                             OR p.career_stage = 'NEW_AP' THEN 2
-                        ELSE 3
+                             AND (
+                                 p.career_stage = 'NEW_AP'
+                                 OR LOWER(COALESCE(p.faculty_title, '')) LIKE '%%assistant professor%%'
+                             ) THEN 3
+                        WHEN p.career_stage = 'NEW_AP'
+                             OR LOWER(COALESCE(p.faculty_title, '')) LIKE '%%assistant professor%%' THEN 4
+                        WHEN COALESCE(f.active_grants, 0) > 0 THEN 5
+                        ELSE 6
                     END,
                     opportunity_score DESC,
                     rrp.result_rank
@@ -856,7 +942,7 @@ def review_item(review_type: str, item_id: int, approve: bool, reviewer_id: int,
                     cursor.execute(
                         """
                         SELECT pp.owner_user_id, pp.institution_id, i.name AS institution_name,
-                               u.display_name
+                               u.display_name, pp.title, pp.official_profile_url
                         FROM professor_profiles pp
                         JOIN users u ON u.id = pp.owner_user_id
                         LEFT JOIN institutions i ON i.id = pp.institution_id
@@ -869,13 +955,34 @@ def review_item(review_type: str, item_id: int, approve: bool, reviewer_id: int,
                         raise ValueError("Professor profile was not found.")
                     cursor.execute(
                         """
-                        INSERT INTO professors (name, institution_id, institution_name)
-                        VALUES (%s, %s, %s)
+                        INSERT INTO professors (
+                            name, institution_id, institution_name, faculty_status,
+                            faculty_title, faculty_source_url,
+                            faculty_verification_method, faculty_verification_version,
+                            faculty_confidence,
+                            faculty_checked_at, faculty_verified_at, homepage_url
+                        )
+                        VALUES (%s, %s, %s, 'VERIFIED', %s, %s,
+                                'manual_review', 2, 1.0, NOW(), NOW(), %s)
                         ON CONFLICT (name, institution_name) DO UPDATE
-                        SET institution_id = EXCLUDED.institution_id, updated_at = NOW()
+                        SET institution_id = EXCLUDED.institution_id,
+                            faculty_status = 'VERIFIED',
+                            faculty_title = EXCLUDED.faculty_title,
+                            faculty_source_url = EXCLUDED.faculty_source_url,
+                            faculty_verification_method = 'manual_review',
+                            faculty_verification_version = 2,
+                            faculty_confidence = 1.0,
+                            faculty_checked_at = NOW(),
+                            faculty_verified_at = NOW(),
+                            homepage_url = EXCLUDED.homepage_url,
+                            updated_at = NOW()
                         RETURNING id
                         """,
-                        (profile["display_name"], profile["institution_id"], profile["institution_name"]),
+                        (
+                            profile["display_name"], profile["institution_id"],
+                            profile["institution_name"], profile["title"],
+                            profile["official_profile_url"], profile["official_profile_url"],
+                        ),
                     )
                     professor_id = cursor.fetchone()["id"]
                     cursor.execute(

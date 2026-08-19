@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 import re
+import math
+import time
 from typing import Any
 
 import requests
@@ -9,6 +11,29 @@ from ingestion.taxonomy import phrase_covers_query
 from settings import setting
 
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
+
+
+def _request_openalex_works(params: dict[str, object]) -> list[dict[str, Any]]:
+    """Fetch one OpenAlex page with a short, bounded rate-limit retry.
+
+    A radar query can fan out into several related research phrases.  OpenAlex
+    occasionally responds with 429 while those phrases are being checked.  A
+    single throttled phrase must not erase pages already collected from the
+    other phrases, so callers can skip this page after the bounded retries.
+    """
+    for attempt in range(3):
+        response = requests.get(OPENALEX_WORKS_URL, params=params, timeout=20)
+        if response.status_code != 429:
+            response.raise_for_status()
+            return list(response.json().get("results", []))
+        if attempt < 2:
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                wait_seconds = min(3.0, max(0.5, float(retry_after)))
+            except ValueError:
+                wait_seconds = 0.75 * (attempt + 1)
+            time.sleep(wait_seconds)
+    return []
 
 
 def _matches_ai_security_intent(phrase: str) -> bool:
@@ -63,12 +88,18 @@ def _work_matches_query(work: dict[str, Any], raw_query: str) -> bool:
     return any(phrase_covers_query(raw_query, phrase) for phrase in phrases)
 
 
-def _probable_pi_authorships(authorships: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return distinct corresponding and senior authors, not every paper author."""
+def _probable_pi_authorships(
+    authorships: list[dict[str, Any]],
+    matching_work_counts: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Return broad researcher candidates; faculty verification happens later."""
+    matching_work_counts = matching_work_counts or {}
     candidates = [
         item
         for item in authorships
-        if item.get("is_corresponding") or item.get("author_position") == "last"
+        if item.get("is_corresponding")
+        or item.get("author_position") in {"first", "last"}
+        or matching_work_counts.get(str((item.get("author") or {}).get("id") or ""), 0) >= 2
     ]
     distinct: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -96,40 +127,58 @@ def _fetch_works(tax_meta: dict[str, Any], target_professors: int) -> list[dict[
     domain_name = str(tax_meta.get("topic_name") or tax_meta["raw_query"])
     works: list[dict[str, Any]] = []
     seen_work_ids: set[str] = set()
-    work_budget = min(400, max(40, target_professors * 4))
-    page = 1
+    # A wider paper pool is necessary for new faculty whose relevant work is
+    # not ranked at the very top of a broad keyword search.  The result count
+    # still bounds how many verified faculty cards are returned.
+    work_budget = min(800, max(200, target_professors * 8))
+    search_queries = list(tax_meta.get("search_queries") or [domain_name])
+    sources: list[tuple[str, str]] = (
+        [("topic", topic_id)] if topic_id else [("search", query) for query in search_queries]
+    )
+    if len(sources) == 1:
+        source_budgets = [work_budget]
+    else:
+        primary_budget = min(100, math.ceil(work_budget / 2))
+        remaining = max(0, work_budget - primary_budget)
+        secondary_budget = max(10, math.ceil(remaining / (len(sources) - 1)))
+        source_budgets = [primary_budget, *([secondary_budget] * (len(sources) - 1))]
 
-    while len(works) < work_budget and page <= 10:
-        page_size = min(100, work_budget)
-        filters = [f"publication_year:{start_year}-{current_year}", "institutions.country_code:us"]
-        params: dict[str, object] = {"per_page": page_size, "page": page}
-        if topic_id:
-            filters.append(f"topics.id:{topic_id}")
-        else:
-            params["search"] = domain_name
-        params["filter"] = ",".join(filters)
-        contact_email = setting("OPENALEX_EMAIL").strip()
-        if contact_email:
-            params["mailto"] = contact_email
+    for (source_kind, source_value), source_budget in zip(sources, source_budgets):
+        page = 1
+        source_added = 0
+        while len(works) < work_budget and source_added < source_budget and page <= 5:
+            page_size = min(100, source_budget)
+            filters = [f"publication_year:{start_year}-{current_year}", "institutions.country_code:us"]
+            params: dict[str, object] = {"per_page": page_size, "page": page}
+            if source_kind == "topic":
+                filters.append(f"topics.id:{source_value}")
+            else:
+                params["search"] = source_value
+            params["filter"] = ",".join(filters)
+            contact_email = setting("OPENALEX_EMAIL").strip()
+            if contact_email:
+                params["mailto"] = contact_email
+            api_key = setting("OPENALEX_API_KEY").strip()
+            if api_key:
+                params["api_key"] = api_key
 
-        response = requests.get(OPENALEX_WORKS_URL, params=params, timeout=20)
-        response.raise_for_status()
-        raw_batch = response.json().get("results", [])
-        if not raw_batch:
-            break
-        batch = raw_batch if topic_id else [
-            work for work in raw_batch if _work_matches_query(work, domain_name)
-        ]
-        for work in batch:
-            work_id = str(work.get("id") or "")
-            if work_id and work_id not in seen_work_ids:
-                seen_work_ids.add(work_id)
-                works.append(work)
-                if len(works) >= work_budget:
-                    break
-        if len(raw_batch) < page_size:
-            break
-        page += 1
+            raw_batch = _request_openalex_works(params)
+            if not raw_batch:
+                break
+            batch = raw_batch if source_kind == "topic" else [
+                work for work in raw_batch if _work_matches_query(work, source_value)
+            ]
+            for work in batch:
+                work_id = str(work.get("id") or "")
+                if work_id and work_id not in seen_work_ids:
+                    seen_work_ids.add(work_id)
+                    works.append(work)
+                    source_added += 1
+                    if len(works) >= work_budget or source_added >= source_budget:
+                        break
+            if len(raw_batch) < page_size:
+                break
+            page += 1
     return works
 
 
@@ -144,15 +193,40 @@ def fetch_professors_by_keywords(
         works = _fetch_works(tax_meta, target_professors)
     except requests.RequestException as error:
         raise RuntimeError(f"OpenAlex works request failed: {error}") from error
+    if not works:
+        raise RuntimeError(
+            "OpenAlex returned no usable research results. Please wait a minute "
+            "and retry, or use a more specific research phrase."
+        )
+
+    matching_work_ids: dict[str, set[str]] = {}
+    for work in works:
+        work_id = str(work.get("id") or "")
+        for authorship in work.get("authorships") or []:
+            if not _us_education_institution(authorship):
+                continue
+            author_id = str((authorship.get("author") or {}).get("id") or "")
+            if author_id and work_id:
+                matching_work_ids.setdefault(author_id, set()).add(work_id)
+    matching_work_counts = {
+        author_id: len(work_ids) for author_id, work_ids in matching_work_ids.items()
+    }
 
     prospects: dict[int, dict[str, Any]] = {}
+    # Faculty verification rejects students, industry authors, stale
+    # affiliations, and ambiguous same-name people. A three-to-one pool could
+    # therefore never reliably satisfy a 100-person goal. Deep searches keep
+    # up to six candidates per requested verified faculty member.
+    candidate_budget = min(600, max(120, target_professors * 6))
     saved_paper_ids: set[str] = set()
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             for work in works:
                 probable_authors = [
                     (authorship, _us_education_institution(authorship))
-                    for authorship in _probable_pi_authorships(work.get("authorships") or [])
+                    for authorship in _probable_pi_authorships(
+                        work.get("authorships") or [], matching_work_counts
+                    )
                 ]
                 probable_authors = [item for item in probable_authors if item[1]]
                 if not probable_authors:
@@ -202,7 +276,7 @@ def fetch_professors_by_keywords(
                         (openalex_author_id, professor_name, institution_name, openalex_author_id),
                     )
                     existing = cursor.fetchone()
-                    if not existing and len(prospects) >= target_professors:
+                    if not existing and len(prospects) >= candidate_budget:
                         continue
                     cursor.execute(
                         """
@@ -217,17 +291,47 @@ def fetch_professors_by_keywords(
                     institution_id = cursor.fetchone()["id"]
                     if existing:
                         professor_id = existing["id"]
-                        if professor_id not in prospects and len(prospects) >= target_professors:
+                        if professor_id not in prospects and len(prospects) >= candidate_budget:
                             continue
                         cursor.execute(
                             """
                             UPDATE professors
                             SET openalex_id = COALESCE(openalex_id, %s),
-                                institution_id = %s, institution_name = %s,
+                                institution_id = CASE
+                                    WHEN faculty_status = 'VERIFIED'
+                                         AND faculty_verification_version >= 2
+                                        THEN institution_id
+                                    WHEN EXISTS (
+                                        SELECT 1 FROM professors other
+                                        WHERE other.id <> professors.id
+                                          AND other.name = professors.name
+                                          AND other.institution_name = %s
+                                    )
+                                        THEN institution_id
+                                    ELSE %s
+                                END,
+                                institution_name = CASE
+                                    WHEN faculty_status = 'VERIFIED'
+                                         AND faculty_verification_version >= 2
+                                        THEN institution_name
+                                    WHEN EXISTS (
+                                        SELECT 1 FROM professors other
+                                        WHERE other.id <> professors.id
+                                          AND other.name = professors.name
+                                          AND other.institution_name = %s
+                                    )
+                                        THEN institution_name
+                                    ELSE %s
+                                END,
                                 research_domain = %s, updated_at = NOW()
                             WHERE id = %s
                             """,
-                            (openalex_author_id, institution_id, institution_name, research_domain, professor_id),
+                            (
+                                openalex_author_id,
+                                institution_name, institution_id,
+                                institution_name, institution_name,
+                                research_domain, professor_id,
+                            ),
                         )
                     else:
                         cursor.execute(
@@ -269,7 +373,7 @@ def fetch_professors_by_keywords(
                         prospect["latest_paper_url"] = str(work.get("doi") or openalex_work_id)
                 if linked_to_professor:
                     saved_paper_ids.add(openalex_work_id)
-                if len(prospects) >= target_professors:
+                if len(prospects) >= candidate_budget:
                     break
 
     current_year = datetime.now(timezone.utc).year
@@ -288,8 +392,14 @@ def fetch_professors_by_keywords(
         key=lambda item: (item["research_score"], item["matching_papers"]),
         reverse=True,
     )
+    # Faculty verification is deliberately stricter than author discovery.
+    # Keep a deeper pool so the pipeline can continue beyond non-faculty and
+    # same-name candidates until it reaches the requested verified maximum.
+    candidate_pool_size = min(candidate_budget, max(60, target_professors * 6))
+    ranked_prospects = ranked_prospects[:candidate_pool_size]
     return {
-        "professors": len(ranked_prospects),
+        "professors": min(target_professors, len(ranked_prospects)),
+        "candidates_ranked": len(ranked_prospects),
         "papers": len(saved_paper_ids),
         "professor_ids": [item["professor_id"] for item in ranked_prospects],
         "prospects": ranked_prospects,

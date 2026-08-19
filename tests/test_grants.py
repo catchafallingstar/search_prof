@@ -1,7 +1,11 @@
 import unittest
 from pathlib import Path
 
-from ingestion.check_grants import _institution_matches, _person_matches
+from ingestion.check_grants import (
+    _grant_matches_domain,
+    _institution_matches,
+    _person_matches,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -23,6 +27,10 @@ class GrantMatchingTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("WHERE research_domain = %s", source)
+        schema = (PROJECT_DIR / "db.sql").read_text(encoding="utf-8")
+        database_source = (PROJECT_DIR / "db.py").read_text(encoding="utf-8")
+        self.assertIn("research_domains TEXT[]", schema)
+        self.assertIn("= ANY(research_domains)", database_source)
 
     def test_unknown_taxonomy_does_not_disable_nsf_checks(self) -> None:
         source = (PROJECT_DIR / "ingestion" / "check_grants.py").read_text(
@@ -30,6 +38,24 @@ class GrantMatchingTests(unittest.TestCase):
         )
         self.assertNotIn("primary_agency') != \"NSF\"", source)
         self.assertIn("ThreadPoolExecutor", source)
+
+    def test_ai_security_rejects_unrelated_ai_agriculture_grant(self) -> None:
+        self.assertFalse(
+            _grant_matches_domain(
+                "AI security",
+                {
+                    "title": "AI-driven agricultural intelligence for controlled-environment agriculture"
+                },
+            )
+        )
+
+    def test_ai_security_accepts_cybersecurity_grant(self) -> None:
+        self.assertTrue(
+            _grant_matches_domain(
+                "AI security",
+                {"title": "Cybersecurity education, scholarship and service"},
+            )
+        )
 
 
 if __name__ == "__main__":

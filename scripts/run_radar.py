@@ -14,7 +14,18 @@ def main() -> None:
         type=int,
         choices=[10, 25, 50, 100],
         default=25,
-        help="Maximum professor prospects to return.",
+        help="Verified-faculty goal for this search.",
+    )
+    parser.add_argument(
+        "--passes",
+        type=int,
+        choices=range(1, 21),
+        default=1,
+        metavar="1-20",
+        help=(
+            "Run multiple bounded continuation passes. Useful for building a "
+            "50- or 100-person cache without manually repeating the command."
+        ),
     )
     parser.add_argument("--max-papers", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -43,24 +54,44 @@ def main() -> None:
     target_professors = next(
         (count for count in allowed_counts if count >= requested_count), 100
     )
-    result = execute_radar(
-        args.research_area,
-        target_professors=target_professors,
-        progress_callback=show,
-    )
-    run = result["run"]
-    print(
-        {
+    previous_progress: tuple[int, int] | None = None
+    for pass_number in range(1, args.passes + 1):
+        if args.passes > 1:
+            print(f"\n=== bounded pass {pass_number}/{args.passes} ===")
+        result = execute_radar(
+            args.research_area,
+            target_professors=target_professors,
+            progress_callback=show,
+            continue_partial=True,
+        )
+        run = result["run"]
+        summary = {
             "run_id": run["id"],
             "status": run["status"],
             "cached": result["cached"],
+            "verified_goal": target_professors,
             "professors_found": run["professors_found"],
+            "candidates_ranked": run["candidates_ranked"],
+            "faculty_identities_checked": run["faculty_identities_checked"],
             "papers_found": run["papers_found"],
             "professors_checked": run["professors_checked"],
             "grants_added": run["grants_added"],
             "signals_added": run["signals_added"],
         }
-    )
+        print(summary)
+        progress_state = (
+            int(run["professors_found"] or 0),
+            int(run["faculty_identities_checked"] or 0),
+        )
+        if (
+            progress_state[0] >= target_professors
+            or progress_state[1] >= int(run["candidates_ranked"] or 0)
+        ):
+            break
+        if previous_progress == progress_state:
+            print("No additional candidates were checked; stopping continuation loop.")
+            break
+        previous_progress = progress_state
 
 
 if __name__ == "__main__":
