@@ -1,6 +1,7 @@
 import unittest
 
 from ingestion.homepagefinder import is_public_http_url
+from ui import is_official_institution_url
 
 
 class PublicUrlTests(unittest.TestCase):
@@ -18,6 +19,17 @@ class PublicUrlTests(unittest.TestCase):
             is_public_http_url("https://papers.ssrn.com/sol3/cf_dev/AbsByAuth.cfm?per_id=1")
         )
         self.assertFalse(is_public_http_url("https://example.edu/cv.pdf"))
+
+    def test_role_verification_rejects_social_profiles(self) -> None:
+        self.assertTrue(
+            is_official_institution_url("https://engineering.example.edu/faculty/person")
+        )
+        self.assertFalse(
+            is_official_institution_url("https://www.linkedin.com/in/person")
+        )
+        self.assertFalse(
+            is_official_institution_url("https://scholar.google.com/citations?id=123")
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ PAGES = [
     PROJECT_DIR / "pages" / "3_Admin_review.py",
     PROJECT_DIR / "pages" / "4_Admin_accounts.py",
     PROJECT_DIR / "pages" / "5_Radar_control.py",
+    PROJECT_DIR / "pages" / "6_Data_and_policies.py",
 ]
 
 

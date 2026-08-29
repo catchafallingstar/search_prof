@@ -62,12 +62,65 @@ def _with_effective_verification_status(row: dict[str, Any] | None) -> dict[str,
     return row
 
 
+def _required_text(value: Any, label: str, max_length: int) -> str:
+    """Validate text again at the database boundary, not only in Streamlit."""
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        raise ValueError(f"{label} is required.")
+    if len(cleaned) > max_length:
+        raise ValueError(f"{label} must be {max_length} characters or fewer.")
+    return cleaned
+
+
+def _enforce_submission_rate_limit(
+    cursor: Any,
+    *,
+    user_id: int,
+    action: str,
+) -> None:
+    """Apply per-account limits before creating moderation work."""
+    if action == "role_verification":
+        limit = setting_int("ROLE_VERIFICATION_HOURLY_LIMIT", 3, 1, 20)
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM role_verifications
+            WHERE user_id = %s AND created_at >= NOW() - INTERVAL '1 hour'
+            """,
+            (user_id,),
+        )
+        label = "role-verification requests"
+    elif action == "opportunity":
+        limit = setting_int("OPPORTUNITY_SUBMISSION_HOURLY_LIMIT", 5, 1, 50)
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM opportunities
+            WHERE submitted_by = %s AND created_at >= NOW() - INTERVAL '1 hour'
+            """,
+            (user_id,),
+        )
+        label = "opening submissions"
+    else:
+        raise ValueError(f"Unknown submission action: {action}")
+
+    row = cursor.fetchone() or {}
+    if int(row.get("total") or 0) >= limit:
+        raise RuntimeError(
+            f"Too many {label} were submitted from this account. Please try again in one hour."
+        )
+
+
 def fetch_active_opportunities(
     research_area: str = "",
     position_type: str = "All",
     gpa_policy: str = "All",
 ) -> list[dict[str, Any]]:
-    where = ["o.status = 'active'", "(o.expires_at IS NULL OR o.expires_at > NOW())"]
+    where = [
+        "o.status = 'active'",
+        "o.source_kind IN ('verified_post', 'university_post')",
+        "(o.expires_at IS NULL OR o.expires_at > NOW())",
+    ]
     params: list[Any] = []
 
     if research_area.strip():
@@ -126,6 +179,7 @@ def count_active_opportunities() -> int:
                 SELECT COUNT(*) AS count
                 FROM opportunities
                 WHERE status = 'active'
+                  AND source_kind IN ('verified_post', 'university_post')
                   AND (expires_at IS NULL OR expires_at > NOW())
                 """
             )
@@ -497,7 +551,7 @@ def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
                   AND p.faculty_status = 'VERIFIED'
                   AND (
                       p.faculty_verification_method = 'manual_review'
-                      OR p.faculty_verification_version >= 3
+                      OR p.faculty_verification_version >= 8
                   )
                 ORDER BY
                     CASE
@@ -719,8 +773,15 @@ def submit_professor_profile(
     department: str,
     official_profile_url: str,
 ) -> int:
+    institution_name = _required_text(institution_name, "Institution", 200)
+    title = _required_text(title, "Official title", 160)
+    department = _required_text(department, "Department", 200)
+    official_profile_url = _required_text(official_profile_url, "University profile URL", 1000)
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
+            _enforce_submission_rate_limit(
+                cursor, user_id=user_id, action="role_verification"
+            )
             cursor.execute(
                 """
                 INSERT INTO institutions (name)
@@ -728,7 +789,7 @@ def submit_professor_profile(
                 ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
                 RETURNING id
                 """,
-                (institution_name.strip(),),
+                (institution_name,),
             )
             institution_id = cursor.fetchone()["id"]
             cursor.execute(
@@ -746,7 +807,7 @@ def submit_professor_profile(
                     updated_at = NOW()
                 RETURNING id
                 """,
-                (user_id, institution_id, title.strip(), department.strip(), official_profile_url.strip()),
+                (user_id, institution_id, title, department, official_profile_url),
             )
             profile_id = cursor.fetchone()["id"]
             cursor.execute(
@@ -755,7 +816,7 @@ def submit_professor_profile(
                     user_id, professor_profile_id, method, evidence_url, status
                 ) VALUES (%s, %s, 'official_directory', %s, 'pending')
                 """,
-                (user_id, profile_id, official_profile_url.strip()),
+                (user_id, profile_id, official_profile_url),
             )
             return profile_id
 
@@ -782,8 +843,15 @@ def submit_institution_membership(
     department: str,
     official_profile_url: str,
 ) -> int:
+    institution_name = _required_text(institution_name, "Institution", 200)
+    title = _required_text(title, "Official title", 160)
+    department = _required_text(department, "Department", 200)
+    official_profile_url = _required_text(official_profile_url, "University profile URL", 1000)
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
+            _enforce_submission_rate_limit(
+                cursor, user_id=user_id, action="role_verification"
+            )
             cursor.execute(
                 """
                 INSERT INTO institutions (name)
@@ -791,7 +859,7 @@ def submit_institution_membership(
                 ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
                 RETURNING id
                 """,
-                (institution_name.strip(),),
+                (institution_name,),
             )
             institution_id = cursor.fetchone()["id"]
             cursor.execute(
@@ -809,7 +877,7 @@ def submit_institution_membership(
                     updated_at = NOW()
                 RETURNING id
                 """,
-                (user_id, institution_id, title.strip(), department.strip(), official_profile_url.strip()),
+                (user_id, institution_id, title, department, official_profile_url),
             )
             membership_id = cursor.fetchone()["id"]
             cursor.execute(
@@ -818,7 +886,7 @@ def submit_institution_membership(
                     user_id, institution_membership_id, method, evidence_url, status
                 ) VALUES (%s, %s, 'institution_admin', %s, 'pending')
                 """,
-                (user_id, membership_id, official_profile_url.strip()),
+                (user_id, membership_id, official_profile_url),
             )
             return membership_id
 
@@ -850,8 +918,16 @@ def submit_opportunity(user_id: int, values: dict[str, Any]) -> int:
     source_kind = "verified_post" if verified_profile else "university_post"
     source_type = "professor_attestation" if verified_profile else "university_attestation"
 
+    title = _required_text(values.get("title"), "Opportunity title", 200)
+    professor_name = _required_text(values.get("professor_name"), "Professor or laboratory name", 200)
+    research_area = _required_text(values.get("research_area"), "Research area", 240)
+    description = _required_text(values.get("description"), "Description", 6000)
+    start_term = _required_text(values.get("start_term"), "Start term", 100)
+    application_url = _required_text(values.get("application_url"), "Application URL", 1000)
+
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
+            _enforce_submission_rate_limit(cursor, user_id=user_id, action="opportunity")
             cursor.execute(
                 """
                 INSERT INTO opportunities (
@@ -868,13 +944,13 @@ def submit_opportunity(user_id: int, values: dict[str, Any]) -> int:
                 (
                     profile["professor_id"] if verified_profile else None,
                     user_id, owner["institution_id"],
-                    values["title"].strip(), owner["institution_name"],
-                    values["professor_name"].strip(), values["research_area"].strip(),
-                    values["position_type"], values["description"].strip(),
+                    title, owner["institution_name"],
+                    professor_name, research_area,
+                    values["position_type"], description,
                     values["funding_status"], values["gpa_policy"],
-                    values["international_eligible"], values["start_term"].strip(),
+                    values["international_eligible"], start_term,
                     values.get("application_deadline") or None,
-                    values["application_url"].strip(),
+                    application_url,
                     source_kind,
                     100 if verified_profile else 95,
                 ),
@@ -889,7 +965,7 @@ def submit_opportunity(user_id: int, values: dict[str, Any]) -> int:
                 (
                     opportunity_id,
                     source_type,
-                    values["application_url"].strip(),
+                    application_url,
                     "Submitted by a role-verified faculty or university account.",
                 ),
             )
@@ -925,6 +1001,7 @@ def fetch_pending_reviews(admin_user_id: int) -> list[dict[str, Any]]:
                 FROM opportunities o
                 LEFT JOIN users u ON u.id = o.submitted_by
                 WHERE o.status = 'pending'
+                  AND o.source_kind IN ('verified_post', 'university_post')
                 ORDER BY created_at ASC
                 """
             )
@@ -964,7 +1041,7 @@ def review_item(review_type: str, item_id: int, approve: bool, reviewer_id: int,
                             next_identity_check_at, homepage_url
                         )
                         VALUES (%s, %s, %s, 'VERIFIED', %s, %s,
-                                'manual_review', 3, 1.0, NOW(), NOW(),
+                                'manual_review', 5, 1.0, NOW(), NOW(),
                                 NOW() + INTERVAL '1 year', %s)
                         ON CONFLICT (name, institution_name) DO UPDATE
                         SET institution_id = EXCLUDED.institution_id,
@@ -972,7 +1049,7 @@ def review_item(review_type: str, item_id: int, approve: bool, reviewer_id: int,
                             faculty_title = EXCLUDED.faculty_title,
                             faculty_source_url = EXCLUDED.faculty_source_url,
                             faculty_verification_method = 'manual_review',
-                            faculty_verification_version = 3,
+                            faculty_verification_version = 5,
                             faculty_confidence = 1.0,
                             faculty_checked_at = NOW(),
                             faculty_verified_at = NOW(),

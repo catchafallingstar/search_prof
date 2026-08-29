@@ -4,21 +4,24 @@ from auth import account_controls, require_site_admin
 from db import database_is_ready, fetch_pending_reviews, review_item
 from ui import configure_page, is_http_url, navigation
 
-configure_page("Admin review")
+configure_page("Account and opening review")
 navigation()
 account_controls()
 
-st.title("Moderation queue")
+st.title("Account and opening review")
+st.caption(
+    "Review role requests and openings submitted on ScholarRadar."
+)
 if not database_is_ready():
     st.error("The database is not ready.")
     st.stop()
 
 user, admin = require_site_admin()
-st.caption(f"Signed in with {admin['admin_role']} authority")
+st.caption(f"{admin['admin_role'].title()} access")
 if admin["admin_role"] == "owner":
-    if st.button("Radar operations"):
+    if st.button("Professor database"):
         st.switch_page("pages/5_Radar_control.py")
-    if st.button("Manage moderator accounts"):
+    if st.button("Staff access"):
         st.switch_page("pages/4_Admin_accounts.py")
 
 items = fetch_pending_reviews(user["id"])
@@ -26,9 +29,23 @@ if not items:
     st.success("Nothing is waiting for review.")
     st.stop()
 
+review_labels = {
+    "profile": "Faculty role",
+    "membership": "University staff role",
+    "opportunity": "Opening",
+}
+role_count = sum(item["review_type"] in {"profile", "membership"} for item in items)
+opening_count = sum(item["review_type"] == "opportunity" for item in items)
+role_metric, opening_metric = st.columns(2)
+role_metric.metric("Role requests", role_count)
+opening_metric.metric("Submitted openings", opening_count)
+
 for item in items:
     with st.container(border=True):
-        st.caption(f"{item['review_type'].title()} · Submitted {item['created_at']:%Y-%m-%d}")
+        st.caption(
+            f"{review_labels.get(item['review_type'], 'Review')} · "
+            f"Submitted {item['created_at']:%Y-%m-%d}"
+        )
         st.subheader(item["subject"])
         submitter = item.get("display_name") or "ScholarRadar discovery"
         submitter_email = item.get("email") or "automated public-evidence scan"

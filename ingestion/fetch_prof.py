@@ -1,39 +1,53 @@
 from datetime import datetime, timezone
 import re
 import math
-import time
 from typing import Any
 
-import requests
-
 from db import get_db_connection
+from ingestion.openalex_client import openalex_get_json
 from ingestion.taxonomy import phrase_covers_query
 from settings import setting
 
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 
 
-def _request_openalex_works(params: dict[str, object]) -> list[dict[str, Any]]:
-    """Fetch one OpenAlex page with a short, bounded rate-limit retry.
+def _work_pdf_url(work: dict[str, Any]) -> str:
+    """Return an OpenAlex-provided open PDF URL without guessing publisher paths."""
+    locations = [
+        work.get("best_oa_location") or {},
+        work.get("primary_location") or {},
+        *(work.get("locations") or []),
+    ]
+    for location in locations:
+        pdf_url = str((location or {}).get("pdf_url") or "").strip()
+        if pdf_url:
+            return pdf_url
+    return ""
 
-    A radar query can fan out into several related research phrases.  OpenAlex
-    occasionally responds with 429 while those phrases are being checked.  A
-    single throttled phrase must not erase pages already collected from the
-    other phrases, so callers can skip this page after the bounded retries.
+
+def _raw_affiliation_text(authorship: dict[str, Any]) -> str:
+    values = [
+        " ".join(str(value or "").split())
+        for value in authorship.get("raw_affiliation_strings") or []
+        if str(value or "").strip()
+    ]
+    return " | ".join(dict.fromkeys(values))
+
+
+def _request_openalex_works(params: dict[str, object]) -> list[dict[str, Any]]:
+    """Fetch one globally paced OpenAlex page.
+
+    A 429 pauses every discovery job through the durable provider-health row.
+    The next queued topic therefore waits instead of repeating the same failed
+    request and making the rate limit worse.
     """
-    for attempt in range(3):
-        response = requests.get(OPENALEX_WORKS_URL, params=params, timeout=20)
-        if response.status_code != 429:
-            response.raise_for_status()
-            return list(response.json().get("results", []))
-        if attempt < 2:
-            retry_after = response.headers.get("Retry-After", "")
-            try:
-                wait_seconds = min(3.0, max(0.5, float(retry_after)))
-            except ValueError:
-                wait_seconds = 0.75 * (attempt + 1)
-            time.sleep(wait_seconds)
-    return []
+    return list(
+        openalex_get_json(
+            OPENALEX_WORKS_URL,
+            params=params,
+            timeout=20,
+        ).get("results", [])
+    )
 
 
 def _matches_ai_security_intent(phrase: str) -> bool:
@@ -69,23 +83,80 @@ def _matches_ai_security_intent(phrase: str) -> bool:
     )
 
 
-def _work_matches_query(work: dict[str, Any], raw_query: str) -> bool:
-    """Keep direct-search works only when one descriptive phrase covers the query."""
-    phrases = [str(work.get("title") or "")]
-    for key in ("topics", "keywords"):
-        for value in work.get(key) or []:
-            phrases.append(
-                str(value.get("display_name") or value.get("keyword") or "")
-                if isinstance(value, dict)
-                else str(value)
-            )
+def _abstract_text(work: dict[str, Any]) -> str:
+    """Rebuild the OpenAlex abstract without depending on dictionary order."""
+    inverted = work.get("abstract_inverted_index") or {}
+    if not isinstance(inverted, dict):
+        return ""
+    positioned: list[tuple[int, str]] = []
+    for word, positions in inverted.items():
+        if not isinstance(positions, list):
+            continue
+        for position in positions:
+            try:
+                positioned.append((int(position), str(word)))
+            except (TypeError, ValueError):
+                continue
+    return " ".join(word for _, word in sorted(positioned))
+
+
+def _work_relevance_score(work: dict[str, Any], raw_query: str) -> float:
+    """Score direct textual evidence, not a broad OpenAlex field label.
+
+    OpenAlex topics are valuable for retrieving a candidate pool, but a broad
+    topic such as ``Law and Political Science`` must not by itself make an LLM
+    security paper a political-science result. A retained work therefore needs
+    evidence in its title, abstract, or author/editor keywords.
+    """
+    weighted_phrases: list[tuple[float, str]] = [
+        (8.0, str(work.get("title") or "")),
+        (6.0, _abstract_text(work)),
+    ]
+    for value in work.get("keywords") or []:
+        phrase = (
+            str(value.get("display_name") or value.get("keyword") or "")
+            if isinstance(value, dict)
+            else str(value)
+        )
+        weighted_phrases.append((5.0, phrase))
+
     query_tokens = set(re.findall(r"[a-z0-9]+", raw_query.casefold()))
     is_ai_security_query = "security" in query_tokens and (
         "ai" in query_tokens or {"artificial", "intelligence"}.issubset(query_tokens)
     )
-    if is_ai_security_query:
-        return any(_matches_ai_security_intent(phrase) for phrase in phrases)
-    return any(phrase_covers_query(raw_query, phrase) for phrase in phrases)
+    matches: list[float] = []
+    for weight, phrase in weighted_phrases:
+        if not phrase:
+            continue
+        covered = (
+            _matches_ai_security_intent(phrase)
+            if is_ai_security_query
+            else phrase_covers_query(raw_query, phrase)
+        )
+        if covered:
+            matches.append(weight)
+    if not matches:
+        return 0.0
+    return max(matches) + min(2.0, max(0, len(matches) - 1) * 0.75)
+
+
+def _work_matches_query(work: dict[str, Any], raw_query: str) -> bool:
+    """Keep a work only when its descriptive metadata supports the query."""
+    return _work_relevance_score(work, raw_query) >= 5.0
+
+
+def _best_work_match(
+    work: dict[str, Any], search_queries: list[str]
+) -> tuple[float, str]:
+    """Return the strongest direct paper match and the query that produced it."""
+    scored = [
+        (_work_relevance_score(work, query), query)
+        for query in search_queries
+        if query
+    ]
+    if not scored:
+        return 0.0, ""
+    return max(scored, key=lambda item: item[0])
 
 
 def _probable_pi_authorships(
@@ -111,11 +182,15 @@ def _probable_pi_authorships(
     return distinct
 
 
-def _us_education_institution(authorship: dict[str, Any]) -> dict[str, Any] | None:
+def _education_institution(authorship: dict[str, Any]) -> dict[str, Any] | None:
+    """Prefer an educational affiliation in any country.
+
+    Faculty verification later establishes the person's current role. This
+    stage should not silently remove international researchers.
+    """
     for institution in authorship.get("institutions") or []:
-        country = str(institution.get("country_code") or "").upper()
         institution_type = str(institution.get("type") or "").casefold()
-        if country == "US" and institution_type in {"", "education"}:
+        if institution_type in {"", "education"}:
             return institution
     return None
 
@@ -132,9 +207,13 @@ def _fetch_works(tax_meta: dict[str, Any], target_professors: int) -> list[dict[
     # still bounds how many verified faculty cards are returned.
     work_budget = min(800, max(200, target_professors * 8))
     search_queries = list(tax_meta.get("search_queries") or [domain_name])
-    sources: list[tuple[str, str]] = (
-        [("topic", topic_id)] if topic_id else [("search", query) for query in search_queries]
-    )
+    # A single OpenAlex topic is useful for precision, but it is not sufficient
+    # coverage for broad fields or common shorthand such as "biomed". Keep the
+    # matched topic and the expanded text searches, then deduplicate works.
+    sources: list[tuple[str, str]] = []
+    if topic_id:
+        sources.append(("topic", topic_id))
+    sources.extend(("search", query) for query in search_queries)
     if len(sources) == 1:
         source_budgets = [work_budget]
     else:
@@ -148,7 +227,7 @@ def _fetch_works(tax_meta: dict[str, Any], target_professors: int) -> list[dict[
         source_added = 0
         while len(works) < work_budget and source_added < source_budget and page <= 5:
             page_size = min(100, source_budget)
-            filters = [f"publication_year:{start_year}-{current_year}", "institutions.country_code:us"]
+            filters = [f"publication_year:{start_year}-{current_year}"]
             params: dict[str, object] = {"per_page": page_size, "page": page}
             if source_kind == "topic":
                 filters.append(f"topics.id:{source_value}")
@@ -165,9 +244,16 @@ def _fetch_works(tax_meta: dict[str, Any], target_professors: int) -> list[dict[
             raw_batch = _request_openalex_works(params)
             if not raw_batch:
                 break
-            batch = raw_batch if source_kind == "topic" else [
-                work for work in raw_batch if _work_matches_query(work, source_value)
-            ]
+            # Topic retrieval and text retrieval now use the same evidence
+            # gate. Previously, broad topic labels bypassed paper relevance.
+            batch: list[dict[str, Any]] = []
+            for work in raw_batch:
+                relevance, matched_query = _best_work_match(work, search_queries)
+                if relevance < 5.0:
+                    continue
+                work["_scholarradar_relevance"] = relevance
+                work["_scholarradar_matched_query"] = matched_query
+                batch.append(work)
             for work in batch:
                 work_id = str(work.get("id") or "")
                 if work_id and work_id not in seen_work_ids:
@@ -188,11 +274,9 @@ def fetch_professors_by_keywords(
 ) -> dict[str, Any]:
     """Discover and rank probable PIs from recent, relevant OpenAlex works."""
     target_professors = max(1, min(100, int(target_professors)))
+    target_country = setting("TARGET_COUNTRY_CODE").strip().upper() or "US"
     research_domain = str(tax_meta.get("topic_name") or tax_meta["raw_query"]).strip()
-    try:
-        works = _fetch_works(tax_meta, target_professors)
-    except requests.RequestException as error:
-        raise RuntimeError(f"OpenAlex works request failed: {error}") from error
+    works = _fetch_works(tax_meta, target_professors)
     if not works:
         raise RuntimeError(
             "OpenAlex returned no usable research results. Please wait a minute "
@@ -203,7 +287,8 @@ def fetch_professors_by_keywords(
     for work in works:
         work_id = str(work.get("id") or "")
         for authorship in work.get("authorships") or []:
-            if not _us_education_institution(authorship):
+            institution = _education_institution(authorship)
+            if not institution or str(institution.get("country_code") or "").upper() != target_country:
                 continue
             author_id = str((authorship.get("author") or {}).get("id") or "")
             if author_id and work_id:
@@ -223,12 +308,18 @@ def fetch_professors_by_keywords(
         with connection.cursor() as cursor:
             for work in works:
                 probable_authors = [
-                    (authorship, _us_education_institution(authorship))
+                    (authorship, _education_institution(authorship))
                     for authorship in _probable_pi_authorships(
                         work.get("authorships") or [], matching_work_counts
                     )
                 ]
                 probable_authors = [item for item in probable_authors if item[1]]
+                probable_authors = [
+                    item
+                    for item in probable_authors
+                    if str(item[1].get("country_code") or "").upper()
+                    == target_country
+                ]
                 if not probable_authors:
                     continue
                 openalex_work_id = str(work.get("id") or "").strip()
@@ -239,13 +330,15 @@ def fetch_professors_by_keywords(
                 cursor.execute(
                     """
                     INSERT INTO papers (
-                        openalex_id, title, publication_year, venue, citation_count, doi
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                        openalex_id, title, publication_year, venue,
+                        citation_count, doi, pdf_url
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (openalex_id) DO UPDATE
                     SET title = EXCLUDED.title,
                         venue = EXCLUDED.venue,
                         citation_count = EXCLUDED.citation_count,
-                        doi = EXCLUDED.doi
+                        doi = EXCLUDED.doi,
+                        pdf_url = COALESCE(EXCLUDED.pdf_url, papers.pdf_url)
                     RETURNING id
                     """,
                     (
@@ -255,6 +348,7 @@ def fetch_professors_by_keywords(
                         str(source.get("display_name") or ""),
                         int(work.get("cited_by_count") or 0),
                         work.get("doi"),
+                        _work_pdf_url(work) or None,
                     ),
                 )
                 paper_id = cursor.fetchone()["id"]
@@ -281,12 +375,17 @@ def fetch_professors_by_keywords(
                     cursor.execute(
                         """
                         INSERT INTO institutions (name, country_code)
-                        VALUES (%s, 'US')
+                        VALUES (%s, %s)
                         ON CONFLICT (name) DO UPDATE
-                        SET country_code = COALESCE(institutions.country_code, 'US')
+                        SET country_code = COALESCE(
+                            EXCLUDED.country_code, institutions.country_code
+                        )
                         RETURNING id
                         """,
-                        (institution_name,),
+                        (
+                            institution_name,
+                            str(institution.get("country_code") or "").upper() or None,
+                        ),
                     )
                     institution_id = cursor.fetchone()["id"]
                     if existing:
@@ -346,11 +445,23 @@ def fetch_professors_by_keywords(
 
                     cursor.execute(
                         """
-                        INSERT INTO professor_papers (professor_id, paper_id, author_position)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (professor_id, paper_id) DO NOTHING
+                        INSERT INTO professor_papers (
+                            professor_id, paper_id, author_position,
+                            raw_affiliation_text
+                        ) VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (professor_id, paper_id) DO UPDATE
+                        SET author_position = EXCLUDED.author_position,
+                            raw_affiliation_text = COALESCE(
+                                NULLIF(EXCLUDED.raw_affiliation_text, ''),
+                                professor_papers.raw_affiliation_text
+                            )
                         """,
-                        (professor_id, paper_id, authorship.get("author_position")),
+                        (
+                            professor_id,
+                            paper_id,
+                            authorship.get("author_position"),
+                            _raw_affiliation_text(authorship),
+                        ),
                     )
                     linked_to_professor = True
                     prospect = prospects.setdefault(
@@ -359,13 +470,30 @@ def fetch_professors_by_keywords(
                             "professor_id": professor_id,
                             "matching_papers": 0,
                             "citation_count": 0,
+                            "relevance_total": 0.0,
                             "latest_paper_title": None,
                             "latest_paper_year": None,
                             "latest_paper_url": None,
+                            "supporting_papers": [],
                         },
                     )
                     prospect["matching_papers"] += 1
                     prospect["citation_count"] += int(work.get("cited_by_count") or 0)
+                    prospect["relevance_total"] += float(
+                        work.get("_scholarradar_relevance") or 0
+                    )
+                    prospect["supporting_papers"].append(
+                        {
+                            "paper_id": int(paper_id),
+                            "relevance_score": float(
+                                work.get("_scholarradar_relevance") or 0
+                            ),
+                            "matched_query": str(
+                                work.get("_scholarradar_matched_query")
+                                or tax_meta["raw_query"]
+                            ),
+                        }
+                    )
                     year = int(work.get("publication_year") or 0)
                     if year >= int(prospect["latest_paper_year"] or 0):
                         prospect["latest_paper_title"] = str(work.get("title") or "Untitled")
@@ -380,12 +508,16 @@ def fetch_professors_by_keywords(
     ranked_prospects = []
     for prospect in prospects.values():
         recency = 5 if prospect["latest_paper_year"] == current_year else 3
+        average_relevance = prospect["relevance_total"] / max(
+            1, prospect["matching_papers"]
+        )
         score = min(
             40.0,
-            18.0
+            12.0
             + min(12, prospect["matching_papers"] * 4)
             + min(5, prospect["citation_count"] / 20)
-            + recency,
+            + recency
+            + min(8, average_relevance),
         )
         ranked_prospects.append({**prospect, "research_score": round(score, 2)})
     ranked_prospects.sort(

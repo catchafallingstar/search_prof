@@ -1,0 +1,25 @@
+# Local-only ScholarRadar metasearch configuration. Production should run its
+# own private SearXNG service beside the background worker with a unique secret.
+use_default_settings: true
+
+general:
+  instance_name: "ScholarRadar local search"
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "local-development-only-not-for-a-public-instance"
+  limiter: false
+  image_proxy: false
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 10.0
+  pool_connections: 20
+  pool_maxsize: 20

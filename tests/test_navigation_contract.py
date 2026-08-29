@@ -13,6 +13,7 @@ class NavigationContractTests(unittest.TestCase):
             "/3_Admin_review",
             "/4_Admin_accounts",
             "/5_Radar_control",
+            "/6_Data_and_policies",
         )
         python_files = [PROJECT_DIR / "app.py", PROJECT_DIR / "ui.py"]
         python_files.extend((PROJECT_DIR / "pages").glob("*.py"))
@@ -28,7 +29,6 @@ class NavigationContractTests(unittest.TestCase):
         for route in (
             "/Post_an_opening",
             "/Verification",
-            "/Admin_review",
             "/Admin_accounts",
             "/Radar_control",
         ):
@@ -39,6 +39,8 @@ class NavigationContractTests(unittest.TestCase):
         source = (PROJECT_DIR / "ui.py").read_text(encoding="utf-8")
         self.assertIn('with st.container(key="sr_nav"):', source)
         self.assertEqual(source.count("st.switch_page("), 5)
+        self.assertIn('st.switch_page("pages/6_Data_and_policies.py")', source)
+        self.assertIn('href="/Admin_review"', source)
         self.assertNotIn('target="_self"', source)
         self.assertNotIn('target="_blank"', source)
 

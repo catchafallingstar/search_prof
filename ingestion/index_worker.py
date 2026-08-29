@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
+import queue
 import signal
 import socket
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +18,7 @@ from ingestion.fetch_prof import fetch_professors_by_keywords
 from ingestion.parse_hiring_signals import scan_hiring_signals
 from ingestion.taxonomy import normalize_taxonomy
 from ingestion.verify_faculty import verify_faculty_candidates
+from ingestion.websearch import search_provider_runtime_state
 from radar_store import (
     claim_next_radar_job,
     complete_radar_job,
@@ -30,9 +34,39 @@ from radar_store import (
     save_topic_candidates,
     stop_worker_heartbeat,
     update_topic_after_discovery,
+    update_radar_job_progress,
     update_worker_heartbeat,
 )
 from settings import setting, setting_int
+
+
+SEARCH_DEPENDENT_JOB_TYPES = (
+    "VERIFY_FACULTY",
+    "REFRESH_FACULTY",
+    "CHECK_HIRING",
+    "ENRICH_PROFESSORS",
+)
+
+
+class RetryableJobError(RuntimeError):
+    """External dependency failure with a caller-supplied retry delay."""
+
+    def __init__(self, message: str, retry_after_seconds: int) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = max(30, int(retry_after_seconds))
+
+
+def _publish_job_progress(
+    job: dict[str, Any],
+    stage: str,
+    professor_ids: list[int] | None = None,
+    detail: str = "",
+) -> None:
+    if job.get("id") is None:
+        return
+    update_radar_job_progress(
+        int(job["id"]), stage, professor_ids=professor_ids, detail=detail
+    )
 
 
 def log_event(event: str, **values: Any) -> None:
@@ -58,6 +92,11 @@ def _discover(job: dict[str, Any]) -> dict[str, Any]:
     if not setting("OPENALEX_API_KEY").strip():
         raise RuntimeError("OPENALEX_API_KEY is required by the indexing worker.")
     topic = _topic_for_job(job)
+    _publish_job_progress(
+        job,
+        "DISCOVER_CANDIDATES",
+        detail="Searching OpenAlex for relevant papers and extracting candidate authors.",
+    )
     taxonomy = normalize_taxonomy(str(topic["requested_query"]))
     normalized_topic = str(taxonomy.get("topic_name") or topic["normalized_query"])
     discovery = fetch_professors_by_keywords(taxonomy, target_professors=100)
@@ -84,34 +123,57 @@ def _discover(job: dict[str, Any]) -> dict[str, Any]:
 
 def _verify(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     topic = _topic_for_job(job)
-    batch_size = setting_int("INDEX_VERIFY_BATCH_SIZE", 30, 3, 30)
+    # Identity checks can involve several slow official pages. Keep each job
+    # small enough to finish comfortably before the worker's hard deadline.
+    # Each completed candidate is committed independently by the verifier, so
+    # the next rescheduled job continues with the first unfinished identity.
+    configured_batch_size = setting_int("INDEX_VERIFY_BATCH_SIZE", 3, 1, 6)
+    provider_state = search_provider_runtime_state()
+    available_providers = list(provider_state.get("available") or [])
+    if not available_providers:
+        raise RetryableJobError(
+            "Faculty verification is waiting for a configured search provider to recover.",
+            int(provider_state.get("retry_after_seconds") or 300),
+        )
+    # When only one provider is healthy, process one identity. This avoids
+    # fanning one upstream problem out across every candidate in a batch.
+    batch_size = 1 if len(available_providers) == 1 else configured_batch_size
     professor_ids = fetch_topic_candidate_ids(int(topic["id"]), batch_size)
     if professor_ids:
+        _publish_job_progress(
+            job,
+            "VERIFY_FACULTY",
+            professor_ids=professor_ids,
+            detail=(
+                "Checking the target university first, then using bounded paper "
+                "affiliation evidence for unresolved identities. "
+                f"Processing {len(professor_ids)} candidate(s) with "
+                f"{len(available_providers)} available search provider(s)."
+            ),
+        )
         verification = verify_faculty_candidates(professor_ids)
     else:
         verification = {
             "verified_ids": [], "checked": 0, "evaluated": 0, "verified": 0
         }
     coverage = refresh_topic_coverage(int(topic["id"]))
-    if int(coverage.get("verified_count") or 0) > 0:
-        enqueue_radar_job(
-            "CHECK_GRANTS",
-            radar_topic_id=int(topic["id"]),
-            priority=45,
-            max_attempts=20,
-        )
-        enqueue_radar_job(
-            "CHECK_HIRING",
-            radar_topic_id=int(topic["id"]),
-            priority=40,
-            max_attempts=20,
-        )
     more_due = bool(fetch_topic_candidate_ids(int(topic["id"]), 1))
     needs_more = (
         int(coverage.get("verified_count") or 0)
         < int(coverage.get("desired_results") or 100)
         and more_due
     )
+    # Do not start opportunity checks while the identity set is still moving.
+    # Once the requested number of professors is verified (or candidates are
+    # exhausted), grants and hiring pages can safely run in parallel.
+    if not needs_more and int(coverage.get("verified_count") or 0) > 0:
+        enqueue_radar_job(
+            "ENRICH_PROFESSORS",
+            radar_topic_id=int(topic["id"]),
+            requested_by=job.get("requested_by"),
+            priority=45,
+            max_attempts=20,
+        )
     return {
         "evaluated": int(verification.get("evaluated") or 0),
         "newly_verified": int(verification.get("verified") or 0),
@@ -126,6 +188,12 @@ def _check_grants(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     professor_ids = fetch_topic_enrichment_ids(int(topic["id"]), "grants", limit)
     if not professor_ids:
         return {"professors_checked": 0, "grants_added": 0}, False
+    _publish_job_progress(
+        job,
+        "CHECK_GRANTS",
+        professor_ids=professor_ids,
+        detail="Checking relevant public grant records for this professor batch.",
+    )
     taxonomy = normalize_taxonomy(str(topic["requested_query"]))
     result = check_and_save_grants(taxonomy, professor_ids=professor_ids)
     mark_professor_enrichment_checked(professor_ids, "grants")
@@ -138,10 +206,34 @@ def _check_grants(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 
 def _check_hiring(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     topic = _topic_for_job(job)
+    if job.get("professor_id") is not None:
+        professor_ids = [int(job["professor_id"])]
+        _publish_job_progress(
+            job,
+            "CHECK_HIRING",
+            professor_ids=professor_ids,
+            detail="Checking the professor or lab page for a public recruiting statement.",
+        )
+        result = scan_hiring_signals(
+            domain_name=str(topic.get("normalized_topic") or topic["normalized_query"]),
+            professor_ids=professor_ids,
+            radar_run_id=None,
+        )
+        return {
+            "professors_checked": int(result.get("professors_checked") or 0),
+            "signals_added": int(result.get("signals_added") or 0),
+            "timed_out": bool(result.get("timed_out")),
+        }, False
     limit = setting_int("INDEX_ENRICH_BATCH_SIZE", 10, 1, 25)
     professor_ids = fetch_topic_enrichment_ids(int(topic["id"]), "hiring", limit)
     if not professor_ids:
         return {"professors_checked": 0, "signals_added": 0}, False
+    _publish_job_progress(
+        job,
+        "CHECK_HIRING",
+        professor_ids=professor_ids,
+        detail="Checking professor and lab pages for public recruiting statements.",
+    )
     result = scan_hiring_signals(
         domain_name=str(topic.get("normalized_topic") or topic["normalized_query"]),
         professor_ids=professor_ids,
@@ -155,6 +247,19 @@ def _check_hiring(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         "signals_added": int(result.get("signals_added") or 0),
         "timed_out": bool(result.get("timed_out")),
     }, more
+
+
+def _enrich_professors(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Check grants and public hiring pages concurrently after verification."""
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        grants_future = executor.submit(_check_grants, job)
+        hiring_future = executor.submit(_check_hiring, job)
+        grants_result, grants_more = grants_future.result()
+        hiring_result, hiring_more = hiring_future.result()
+    return {
+        "grants": grants_result,
+        "hiring": hiring_result,
+    }, bool(grants_more or hiring_more)
 
 
 def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -173,7 +278,79 @@ def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         return _check_grants(job)
     if job_type == "CHECK_HIRING":
         return _check_hiring(job)
+    if job_type == "ENRICH_PROFESSORS":
+        return _enrich_professors(job)
     raise RuntimeError(f"Unknown radar job type: {job_type}")
+
+
+def _job_process_entry(
+    job: dict[str, Any], output: multiprocessing.queues.Queue
+) -> None:
+    """Run external-source work outside the durable worker process.
+
+    Search libraries and remote servers do not always honor socket timeouts.
+    Process isolation lets the parent enforce a real whole-job deadline rather
+    than leaving a database row in ``running`` forever.
+    """
+    try:
+        result, needs_more = process_job(job)
+        output.put({"ok": True, "result": result, "needs_more": needs_more})
+    except BaseException as error:
+        output.put(
+            {
+                "ok": False,
+                "error": f"{type(error).__name__}: {error}",
+                "retry_after_seconds": int(
+                    getattr(error, "retry_after_seconds", 0) or 0
+                ),
+            }
+        )
+
+
+def run_job_with_deadline(
+    job: dict[str, Any],
+    worker_id: str,
+    timeout_seconds: int,
+) -> tuple[dict[str, Any], bool]:
+    """Run one job with a hard deadline while maintaining worker health."""
+    context = multiprocessing.get_context("fork")
+    output = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_job_process_entry,
+        args=(dict(job), output),
+        daemon=False,
+    )
+    process.start()
+    deadline = time.monotonic() + max(1, int(timeout_seconds))
+    try:
+        while process.is_alive() and time.monotonic() < deadline:
+            process.join(timeout=2)
+            update_worker_heartbeat(worker_id, int(job["id"]))
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
+            raise TimeoutError(
+                f"Job exceeded its {int(timeout_seconds)}-second deadline."
+            )
+        try:
+            message = output.get(timeout=2)
+        except queue.Empty as error:
+            raise RuntimeError(
+                f"Job process exited with code {process.exitcode} without a result."
+            ) from error
+        if not message.get("ok"):
+            error_message = str(message.get("error") or "Background job failed.")
+            retry_after = int(message.get("retry_after_seconds") or 0)
+            if retry_after:
+                raise RetryableJobError(error_message, retry_after)
+            raise RuntimeError(error_message)
+        return dict(message.get("result") or {}), bool(message.get("needs_more"))
+    finally:
+        output.close()
+        output.join_thread()
 
 
 def run_worker(
@@ -192,6 +369,8 @@ def run_worker(
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     jobs_processed = 0
+    job_timeout = setting_int("INDEX_JOB_TIMEOUT_SECONDS", 300, 30, 1800)
+    search_jobs_paused_until = 0.0
     update_worker_heartbeat(worker_id)
     log_event("worker_started", worker_id=worker_id)
     try:
@@ -199,7 +378,17 @@ def run_worker(
             if max_jobs is not None and jobs_processed >= max_jobs:
                 break
             update_worker_heartbeat(worker_id)
-            job = claim_next_radar_job(worker_id)
+            provider_state = search_provider_runtime_state()
+            search_jobs_paused = (
+                time.monotonic() < search_jobs_paused_until
+                or not provider_state.get("available")
+            )
+            excluded_job_types = (
+                list(SEARCH_DEPENDENT_JOB_TYPES) if search_jobs_paused else []
+            )
+            job = claim_next_radar_job(
+                worker_id, excluded_job_types=excluded_job_types
+            )
             if not job:
                 enqueue_due_maintenance()
                 if once:
@@ -215,7 +404,9 @@ def run_worker(
                 attempt=int(job["attempts"]),
             )
             try:
-                result, needs_more = process_job(job)
+                result, needs_more = run_job_with_deadline(
+                    job, worker_id, job_timeout
+                )
                 if needs_more:
                     reschedule_radar_job(int(job["id"]), 2, result)
                     status = "rescheduled"
@@ -228,6 +419,20 @@ def run_worker(
                     job_id=int(job["id"]),
                     status=status,
                     result=result,
+                )
+            except RetryableJobError as error:
+                fail_radar_job(job, error)
+                if str(job.get("job_type")) in SEARCH_DEPENDENT_JOB_TYPES:
+                    search_jobs_paused_until = max(
+                        search_jobs_paused_until,
+                        time.monotonic() + error.retry_after_seconds,
+                    )
+                log_event(
+                    "job_deferred",
+                    worker_id=worker_id,
+                    job_id=int(job["id"]),
+                    reason=str(error),
+                    retry_after_seconds=error.retry_after_seconds,
                 )
             except Exception as error:
                 fail_radar_job(job, error)

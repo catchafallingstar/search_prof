@@ -3,7 +3,7 @@ import re
 import socket
 from urllib.parse import urlparse
 
-from ingestion.websearch import search_web
+from ingestion.websearch import SearchUnavailable, search_web
 
 EXCLUDED_DOMAINS = {
     "academia.edu",
@@ -107,6 +107,10 @@ def get_professor_homepage(
                     )
                 ):
                     return candidate
+        except SearchUnavailable:
+            # A provider outage is not evidence that the professor has no
+            # homepage. Let the durable worker reschedule this candidate.
+            raise
         except Exception as error:
             print(f"Homepage search failed for {prof_name}: {error}")
     return ""

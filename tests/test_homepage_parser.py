@@ -13,6 +13,23 @@ class HomepageParserTests(unittest.TestCase):
     @patch("ingestion.parse_hiring_signals.time.sleep")
     @patch("ingestion.parse_hiring_signals.is_public_http_url", return_value=True)
     @patch("ingestion.parse_hiring_signals._fetch_with_safe_redirects")
+    def test_non_html_source_is_accessible_without_parser_shape_error(
+        self, fetch, _public_url, _sleep
+    ) -> None:
+        response = Mock()
+        response.headers = {"content-type": "application/pdf"}
+        response.raise_for_status.return_value = None
+        fetch.return_value = response
+        from ingestion.parse_hiring_signals import _fetch_and_parse_homepage_status
+
+        self.assertEqual(
+            _fetch_and_parse_homepage_status("https://example.edu/cv.pdf"),
+            ([], True),
+        )
+
+    @patch("ingestion.parse_hiring_signals.time.sleep")
+    @patch("ingestion.parse_hiring_signals.is_public_http_url", return_value=True)
+    @patch("ingestion.parse_hiring_signals._fetch_with_safe_redirects")
     def test_preserves_unpunctuated_html_block_boundaries(
         self,
         fetch: Mock,

@@ -11,7 +11,25 @@ from db import (
     submit_opportunity,
     submit_professor_profile,
 )
-from ui import GPA_LABELS, configure_page, is_http_url, navigation
+from ui import (
+    GPA_LABELS,
+    configure_page,
+    is_http_url,
+    is_official_institution_url,
+    navigation,
+)
+
+
+OFFICIAL_TITLES = [
+    "Assistant Professor",
+    "Associate Professor",
+    "Professor",
+    "Research Professor",
+    "Lecturer",
+    "University Recruiter",
+    "Graduate Recruitment Director",
+    "Other",
+]
 
 configure_page("Post an opening")
 navigation()
@@ -49,33 +67,49 @@ if not credential or can_resubmit:
     )
     with st.form("role_verification"):
         institution = st.text_input(
-            "Institution", value=credential["institution_name"] if credential else ""
+            "Institution",
+            value=credential["institution_name"] if credential else "",
+            placeholder="University of Michigan",
         )
-        title = st.text_input(
+        saved_title = str(credential["title"] if credential else "")
+        title_choice = st.selectbox(
             "Official title",
-            value=credential["title"] if credential else "",
-            placeholder="Assistant Professor or Graduate Recruitment Director",
+            OFFICIAL_TITLES,
+            index=(
+                OFFICIAL_TITLES.index(saved_title)
+                if saved_title in OFFICIAL_TITLES
+                else (OFFICIAL_TITLES.index("Other") if saved_title else 0)
+            ),
         )
+        custom_title = ""
+        if title_choice == "Other":
+            custom_title = st.text_input("Title shown on the university page", value=saved_title)
+        title = custom_title if title_choice == "Other" else title_choice
         department = st.text_input(
             "Department", value=(credential.get("department") or "") if credential else ""
         )
         official_url = st.text_input(
-            "Official university directory or staff-profile URL",
+            "University profile URL",
             value=credential["official_profile_url"] if credential else "",
+            help="Use a university-controlled directory or staff page, not LinkedIn or ResearchGate.",
         )
         submitted = st.form_submit_button("Submit for review", type="primary")
     if submitted:
         if not all(value.strip() for value in (institution, title, department, official_url)):
             st.error("Complete every field.")
-        elif not is_http_url(official_url):
-            st.error("Enter a valid HTTP or HTTPS institutional profile URL.")
+        elif not is_official_institution_url(official_url):
+            st.error("Use a university-controlled profile page, not a social or publication profile.")
         else:
-            if account_type == "Faculty member":
-                submit_professor_profile(user["id"], institution, title, department, official_url)
+            try:
+                if account_type == "Faculty member":
+                    submit_professor_profile(user["id"], institution, title, department, official_url)
+                else:
+                    submit_institution_membership(user["id"], institution, title, department, official_url)
+            except (ValueError, RuntimeError) as error:
+                st.error(str(error))
             else:
-                submit_institution_membership(user["id"], institution, title, department, official_url)
-            st.success("Verification request submitted. A moderator must approve it before you can post.")
-            st.rerun()
+                st.success("Verification request submitted. A moderator must approve it before you can post.")
+                st.rerun()
     st.stop()
 
 status = credential["verification_status"]
@@ -116,20 +150,24 @@ if submitted:
     elif not attestation:
         st.error("Confirm the accuracy and authorization attestation.")
     else:
-        opportunity_id = submit_opportunity(
-            user["id"],
-            {
-                "title": title,
-                "professor_name": professor_name,
-                "research_area": research_area,
-                "position_type": position_type,
-                "description": description,
-                "funding_status": funding_status,
-                "gpa_policy": gpa_policy,
-                "international_eligible": international_eligible,
-                "start_term": start_term,
-                "application_deadline": deadline,
-                "application_url": application_url,
-            },
-        )
-        st.success(f"Opening #{opportunity_id} was submitted for moderation. It is not public yet.")
+        try:
+            opportunity_id = submit_opportunity(
+                user["id"],
+                {
+                    "title": title,
+                    "professor_name": professor_name,
+                    "research_area": research_area,
+                    "position_type": position_type,
+                    "description": description,
+                    "funding_status": funding_status,
+                    "gpa_policy": gpa_policy,
+                    "international_eligible": international_eligible,
+                    "start_term": start_term,
+                    "application_deadline": deadline,
+                    "application_url": application_url,
+                },
+            )
+        except (ValueError, RuntimeError) as error:
+            st.error(str(error))
+        else:
+            st.success(f"Opening #{opportunity_id} was submitted for moderation. It is not public yet.")

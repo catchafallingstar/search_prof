@@ -1,6 +1,6 @@
 import unittest
 
-from ingestion.taxonomy import _topic_relevance, phrase_covers_query
+from ingestion.taxonomy import _topic_relevance, build_search_queries, phrase_covers_query
 
 
 class TaxonomyRelevanceTests(unittest.TestCase):
@@ -28,6 +28,19 @@ class TaxonomyRelevanceTests(unittest.TestCase):
         self.assertTrue(
             phrase_covers_query("AI security", "Security of Artificial Intelligence Systems")
         )
+
+    def test_biomed_shorthand_expands_to_paper_vocabulary(self) -> None:
+        for query in ("biomed", "bio med", "biomedical"):
+            searches = build_search_queries(query)
+            self.assertIn("biomedical engineering", searches)
+            self.assertIn("biomedical sciences", searches)
+            self.assertIn("biomedicine", searches)
+
+    def test_political_science_expands_to_real_paper_vocabulary(self) -> None:
+        searches = build_search_queries("Political science")
+        self.assertIn("political behavior", searches)
+        self.assertIn("comparative politics", searches)
+        self.assertIn("public policy", searches)
 
 
 if __name__ == "__main__":

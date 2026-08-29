@@ -18,7 +18,7 @@ from db import (
 from ingestion.check_grants import check_and_save_grants
 from ingestion.fetch_prof import fetch_professors_by_keywords
 from ingestion.hiring_discovery import discover_hiring_first_leads
-from ingestion.parse_hiring_signals import save_signal_to_db, scan_hiring_signals
+from ingestion.parse_hiring_signals import scan_hiring_signals
 from ingestion.taxonomy import normalize_taxonomy
 from ingestion.verify_faculty import (
     get_cached_faculty_decisions,
@@ -177,19 +177,10 @@ def execute_radar(
             },
         )
 
+        # Search results help prioritize identity candidates, but they do not
+        # establish that a page belongs to the professor. Only the trusted-page
+        # scanner below may create a public hiring signal.
         lead_signals_added = 0
-        for professor_id in selected_ids:
-            lead = hiring_leads.get(int(professor_id))
-            if not lead:
-                continue
-            saved = save_signal_to_db(
-                int(professor_id),
-                str(lead["signal_type"]),
-                str(lead["quote"]),
-                str(lead["source_url"]),
-                radar_run_id=run_id,
-            )
-            lead_signals_added += int(bool(saved.get("inserted")))
 
         progress("Checking current public grants", 45)
         professor_ids = [int(value) for value in selected_ids]
@@ -225,7 +216,7 @@ def execute_radar(
         final_stage = (
             "Time budget reached; saving partial results"
             if signals.get("timed_out")
-            else "Saving evidence for moderation"
+            else "Saving attributed public evidence"
         )
         progress(
             final_stage,

@@ -10,11 +10,11 @@ from db import (
 )
 from ui import configure_page, navigation
 
-configure_page("Admin accounts")
+configure_page("Staff access")
 navigation()
 account_controls()
 
-st.title("Administrator accounts")
+st.title("Staff access")
 st.write("Only the single site owner can grant or revoke moderator access.")
 
 if not database_is_ready():
@@ -31,6 +31,8 @@ grant_candidates = [
     row for row in users
     if row["id"] != owner["id"]
     and not (row.get("admin_role") == "moderator" and row.get("revoked_at") is None)
+    and "replace_with" not in str(row.get("email") or "").casefold()
+    and not str(row.get("email") or "").casefold().endswith("@example.com")
 ]
 active_moderators = [
     row for row in users
@@ -47,7 +49,11 @@ else:
         format_func=lambda row: f"{row['display_name']} · {row['email']}",
         key="grant_moderator_user",
     )
-    if st.button("Grant moderator access", type="primary"):
+    confirm_grant = st.checkbox(
+        f"Grant review access to {selected_grant['email']}.",
+        key="confirm_grant_moderator",
+    )
+    if st.button("Grant moderator access", type="primary", disabled=not confirm_grant):
         grant_site_moderator(owner["id"], selected_grant["id"])
         st.success(f"Moderator access granted to {selected_grant['email']}.")
         st.rerun()
@@ -68,7 +74,7 @@ else:
         st.success(f"Moderator access revoked for {selected_revoke['email']}.")
         st.rerun()
 
-st.subheader("Recent administration activity")
+st.subheader("Recent staff-access changes")
 events = fetch_admin_audit_log(owner["id"], 50)
 if events:
     st.dataframe(events, width="stretch", hide_index=True)

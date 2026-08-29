@@ -5,7 +5,7 @@ import requests
 
 from ingestion.homepagefinder import is_public_http_url, result_matches_institution
 from ingestion.matchers import is_valid_signal_text
-from ingestion.websearch import search_web
+from ingestion.websearch import SearchUnavailable, search_web
 
 EXCLUDED_DOMAINS = {
     "glassdoor.com",
@@ -116,6 +116,9 @@ def check_social_hiring(
                     continue
                 if is_valid_signal_text(snippet):
                     return " ".join(snippet.split()), url
+        except SearchUnavailable:
+            # Do not turn a search-engine outage into "no hiring signal".
+            raise
         except Exception as error:
             print(f"Web hiring search failed for {prof_name}: {error}")
     return None, None

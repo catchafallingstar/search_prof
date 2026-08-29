@@ -69,7 +69,19 @@ CREATE TABLE IF NOT EXISTS professors (
     faculty_verified_at TIMESTAMPTZ,
     next_identity_check_at TIMESTAMPTZ,
     public_hiring_checked_at TIMESTAMPTZ,
+    public_hiring_check_status TEXT NOT NULL DEFAULT 'NOT_CHECKED'
+        CHECK (public_hiring_check_status IN ('NOT_CHECKED', 'PRESENT', 'NOT_FOUND', 'SOURCE_UNAVAILABLE')),
+    public_hiring_failure_count INTEGER NOT NULL DEFAULT 0,
+    public_hiring_next_check_at TIMESTAMPTZ,
     grant_checked_at TIMESTAMPTZ,
+    lab_gpa_policy TEXT NOT NULL DEFAULT 'not_stated'
+        CHECK (lab_gpa_policy IN ('not_stated', 'no_lab_cutoff', 'minimum', 'holistic_review', 'exceptions_considered')),
+    lab_gpa_evidence_text TEXT,
+    lab_gpa_source_url TEXT,
+    lab_gpa_minimum NUMERIC(3, 2),
+    program_gpa_minimum NUMERIC(3, 2),
+    program_gpa_source_url TEXT,
+    gpa_last_checked_at TIMESTAMPTZ,
     previous_institutions TEXT[] NOT NULL DEFAULT '{}',
     official_institution_domain TEXT,
     appointment_year INTEGER CHECK (appointment_year IS NULL OR appointment_year BETWEEN 1900 AND 2200),
@@ -93,7 +105,17 @@ ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verified_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS next_identity_check_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_checked_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_check_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_failure_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_next_check_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS grant_checked_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS lab_gpa_policy TEXT NOT NULL DEFAULT 'not_stated';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS lab_gpa_evidence_text TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS lab_gpa_source_url TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS lab_gpa_minimum NUMERIC(3, 2);
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS program_gpa_minimum NUMERIC(3, 2);
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS program_gpa_source_url TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS gpa_last_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS previous_institutions TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS official_institution_domain TEXT;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_year INTEGER;
@@ -141,12 +163,34 @@ CREATE TABLE IF NOT EXISTS faculty_verification_evidence (
         CHECK (verification_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'CONFLICT', 'MANUAL_REVIEW')),
     confidence NUMERIC(4, 3) NOT NULL DEFAULT 0
         CHECK (confidence BETWEEN 0 AND 1),
+    decision_method TEXT,
+    model_name TEXT,
+    prompt_version INTEGER,
     checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT faculty_verification_evidence_unique UNIQUE (professor_id, source_url)
 );
 
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS decision_method TEXT;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS model_name TEXT;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS prompt_version INTEGER;
+
 CREATE INDEX IF NOT EXISTS faculty_verification_evidence_professor_idx
     ON faculty_verification_evidence (professor_id, checked_at DESC);
+
+-- Gemini is an optional evidence extractor for cases that deterministic rules
+-- cannot resolve. This shared counter keeps every worker inside an application-
+-- controlled daily budget even after restarts.
+CREATE TABLE IF NOT EXISTS ai_usage_daily (
+    usage_date DATE NOT NULL,
+    provider TEXT NOT NULL,
+    feature TEXT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (usage_date, provider, feature)
+);
 
 -- Version 1 accepted same-name directory/listing pages too easily. Preserve its
 -- evidence for audit, but require those machine decisions to pass the stricter
@@ -167,6 +211,33 @@ WHERE fve.professor_id = p.id
   AND p.faculty_verification_method = 'official_directory'
   AND p.faculty_verification_version < 2
   AND fve.verification_status = 'VERIFIED';
+
+-- Version 3 incorrectly treated a missing research keyword on an otherwise
+-- valid official faculty profile as an identity conflict. Identity and topic
+-- relevance are now independent. Do not auto-approve these records: make
+-- them due for a safe recheck under the corrected verifier.
+UPDATE professors p
+SET faculty_status = 'UNVERIFIED',
+    faculty_confidence = 0,
+    faculty_verified_at = NULL,
+    faculty_verification_version = 2,
+    next_identity_check_at = NOW(),
+    updated_at = NOW()
+WHERE p.faculty_status = 'CONFLICT'
+  AND EXISTS (
+      SELECT 1
+      FROM faculty_verification_evidence fve
+      WHERE fve.professor_id = p.id
+        AND fve.verification_status = 'CONFLICT'
+        AND fve.evidence_text =
+            'Official faculty page is for an unrelated research discipline.'
+  );
+
+UPDATE faculty_verification_evidence
+SET verification_status = 'UNVERIFIED', confidence = 0, checked_at = NOW()
+WHERE verification_status = 'CONFLICT'
+  AND evidence_text =
+      'Official faculty page is for an unrelated research discipline.';
 
 CREATE TABLE IF NOT EXISTS professor_profiles (
     id BIGSERIAL PRIMARY KEY,
@@ -193,7 +264,7 @@ SET faculty_status = 'VERIFIED',
     faculty_title = pp.title,
     faculty_source_url = pp.official_profile_url,
     faculty_verification_method = 'manual_review',
-    faculty_verification_version = 3,
+    faculty_verification_version = 5,
     faculty_confidence = 1.0,
     faculty_checked_at = COALESCE(pp.verified_at, NOW()),
     faculty_verified_at = COALESCE(pp.verified_at, NOW()),
@@ -206,6 +277,76 @@ SET faculty_status = 'VERIFIED',
 FROM professor_profiles pp
 WHERE pp.professor_id = p.id
   AND pp.verification_status = 'verified';
+
+-- Version 4 verifies career moves using an official current faculty page plus
+-- corroborating OpenAlex affiliation fragments, an earlier institution named
+-- on that page, or matching publication evidence. Existing positive decisions
+-- remain valid; only unresolved automatic decisions need the new resolver.
+UPDATE professors
+SET faculty_verification_version = 4,
+    updated_at = NOW()
+WHERE faculty_verification_version = 3
+  AND faculty_status IN ('VERIFIED', 'NOT_FACULTY')
+  AND faculty_verification_method IS DISTINCT FROM 'manual_review';
+
+-- The earlier verifier escalated one different-university search result to
+-- CONFLICT. That is not a real ambiguity and should not consume staff time.
+-- Keep the evidence for audit, but let version 4 retry it as an ordinary
+-- unresolved identity. New conflicts require multiple plausible official
+-- faculty profiles.
+UPDATE professors p
+SET faculty_status = 'UNVERIFIED',
+    faculty_confidence = 0,
+    faculty_verification_method = 'automatic_search',
+    faculty_verified_at = NULL,
+    next_identity_check_at = NOW(),
+    updated_at = NOW()
+WHERE p.faculty_status = 'CONFLICT'
+  AND p.faculty_verification_version < 4
+  AND EXISTS (
+      SELECT 1
+      FROM faculty_verification_evidence fve
+      WHERE fve.professor_id = p.id
+        AND fve.evidence_text =
+            'The official faculty page does not match the candidate''s institution. This may be a different person with the same name.'
+  );
+
+UPDATE faculty_verification_evidence
+SET verification_status = 'UNVERIFIED',
+    confidence = 0,
+    decision_method = 'automatic_search',
+    evidence_text =
+        'A possible official page was found, but the current evidence does not safely connect it to this OpenAlex author.',
+    checked_at = NOW()
+WHERE verification_status = 'CONFLICT'
+  AND evidence_text =
+      'The official faculty page does not match the candidate''s institution. This may be a different person with the same name.';
+
+UPDATE professors
+SET faculty_verification_version = 4,
+    next_identity_check_at = NOW(),
+    updated_at = NOW()
+WHERE faculty_verification_version = 3
+  AND faculty_status IN ('UNVERIFIED', 'CONFLICT')
+  AND faculty_verification_method IS DISTINCT FROM 'manual_review';
+
+-- Version 5 links ambiguous identities to exact papers/DOIs before accepting
+-- a different current institution and recognizes common international
+-- academic domains. Existing positive automatic decisions remain usable;
+-- unresolved identities are scheduled for the stronger resolver.
+UPDATE professors
+SET faculty_verification_version = 5,
+    updated_at = NOW()
+WHERE faculty_verification_version = 4
+  AND faculty_status IN ('VERIFIED', 'NOT_FACULTY')
+  AND faculty_verification_method IS DISTINCT FROM 'manual_review';
+
+UPDATE professors
+SET next_identity_check_at = NOW(),
+    updated_at = NOW()
+WHERE faculty_verification_version < 5
+  AND faculty_status IN ('UNVERIFIED', 'CONFLICT', 'MANUAL_REVIEW')
+  AND faculty_verification_method IS DISTINCT FROM 'manual_review';
 
 CREATE TABLE IF NOT EXISTS institution_memberships (
     id BIGSERIAL PRIMARY KEY,
@@ -326,16 +467,47 @@ CREATE TABLE IF NOT EXISTS papers (
     venue TEXT,
     citation_count INTEGER NOT NULL DEFAULT 0,
     doi TEXT,
+    pdf_url TEXT,
+    pdf_checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS pdf_url TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS pdf_checked_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS professor_papers (
     professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
     paper_id BIGINT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
     author_position TEXT,
+    raw_affiliation_text TEXT,
+    affiliation_status TEXT NOT NULL DEFAULT 'NOT_CHECKED'
+        CHECK (affiliation_status IN ('NOT_CHECKED', 'MATCHED', 'NOT_FOUND', 'UNAVAILABLE')),
+    affiliation_text TEXT,
+    affiliation_source_url TEXT,
+    affiliation_institution TEXT,
+    affiliation_email TEXT,
+    affiliation_checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (professor_id, paper_id)
 );
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS raw_affiliation_text TEXT;
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_text TEXT;
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_source_url TEXT;
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_institution TEXT;
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_email TEXT;
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_checked_at TIMESTAMPTZ;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'professor_papers_affiliation_status_check'
+    ) THEN
+        ALTER TABLE professor_papers
+            ADD CONSTRAINT professor_papers_affiliation_status_check
+            CHECK (affiliation_status IN ('NOT_CHECKED', 'MATCHED', 'NOT_FOUND', 'UNAVAILABLE'));
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS fundings (
     id BIGSERIAL PRIMARY KEY,
@@ -362,11 +534,38 @@ CREATE TABLE IF NOT EXISTS hiring_signals (
     confidence TEXT NOT NULL CHECK (confidence IN ('low', 'medium', 'high')),
     raw_text TEXT NOT NULL,
     source_url TEXT NOT NULL,
+    position_type TEXT NOT NULL DEFAULT 'PhD'
+        CHECK (position_type IN ('PhD', 'Postdoc', 'Research Assistant', 'Internship')),
+    attribution_status TEXT NOT NULL DEFAULT 'UNVERIFIED'
+        CHECK (attribution_status IN ('VERIFIED', 'UNVERIFIED', 'CONFLICT')),
     observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_checked_at TIMESTAMPTZ,
+    check_status TEXT NOT NULL DEFAULT 'PRESENT'
+        CHECK (check_status IN ('PRESENT', 'NOT_FOUND', 'SOURCE_UNAVAILABLE')),
+    consecutive_check_failures INTEGER NOT NULL DEFAULT 0,
+    next_check_at TIMESTAMPTZ,
+    source_date_text TEXT,
     expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS position_type TEXT NOT NULL DEFAULT 'PhD';
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS attribution_status TEXT NOT NULL DEFAULT 'UNVERIFIED';
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS check_status TEXT NOT NULL DEFAULT 'PRESENT';
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS consecutive_check_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMPTZ;
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS source_date_text TEXT;
+
+-- Automated web discoveries used to create pending opportunity advertisements.
+-- They are evidence records, not submissions, so keep the evidence in
+-- hiring_signals and prevent those legacy rows from entering moderation/public ads.
+UPDATE opportunities
+SET status = 'closed', updated_at = NOW()
+WHERE source_kind = 'public_signal' AND status IN ('pending', 'active');
 
 -- Shared, user-independent research indexes. A normalized topic is discovered
 -- once and reused by every visitor; personal filters are applied at read time.
@@ -380,6 +579,7 @@ CREATE TABLE IF NOT EXISTS radar_topics (
         CHECK (status IN ('new', 'indexing', 'partial', 'ready', 'failed')),
     desired_results INTEGER NOT NULL DEFAULT 100
         CHECK (desired_results BETWEEN 1 AND 100),
+    discovery_version INTEGER NOT NULL DEFAULT 0,
     candidates_seen INTEGER NOT NULL DEFAULT 0,
     verified_count INTEGER NOT NULL DEFAULT 0,
     papers_found INTEGER NOT NULL DEFAULT 0,
@@ -392,6 +592,8 @@ CREATE TABLE IF NOT EXISTS radar_topics (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE radar_topics
+    ADD COLUMN IF NOT EXISTS discovery_version INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS radar_topic_professors (
     radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
@@ -402,9 +604,29 @@ CREATE TABLE IF NOT EXISTS radar_topic_professors (
     latest_paper_title TEXT,
     latest_paper_year INTEGER,
     latest_paper_url TEXT,
+    is_current_match BOOLEAN NOT NULL DEFAULT TRUE,
     first_matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (radar_topic_id, professor_id)
+);
+ALTER TABLE radar_topic_professors
+    ADD COLUMN IF NOT EXISTS is_current_match BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Exact paper evidence for each topic/professor match. professor_papers is the
+-- professor's global publication trail; this table records which paper made a
+-- particular professor match a particular radar topic.
+CREATE TABLE IF NOT EXISTS radar_topic_professor_papers (
+    radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    paper_id BIGINT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    relevance_score NUMERIC(5, 2) NOT NULL DEFAULT 0,
+    matched_query TEXT NOT NULL,
+    is_current_match BOOLEAN NOT NULL DEFAULT TRUE,
+    discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_topic_id, professor_id, paper_id),
+    FOREIGN KEY (professor_id, paper_id)
+        REFERENCES professor_papers(professor_id, paper_id) ON DELETE CASCADE
 );
 
 -- Durable work queue. The partial unique index prevents duplicate active work
@@ -416,7 +638,8 @@ CREATE TABLE IF NOT EXISTS radar_jobs (
     requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
     job_type TEXT NOT NULL CHECK (job_type IN (
         'DISCOVER_CANDIDATES', 'VERIFY_FACULTY', 'REFRESH_FACULTY',
-        'CHECK_HIRING', 'CHECK_GRANTS', 'REINDEX_RESEARCH'
+        'CHECK_HIRING', 'CHECK_GRANTS', 'ENRICH_PROFESSORS',
+        'REINDEX_RESEARCH'
     )),
     dedupe_key TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 50 CHECK (priority BETWEEN 0 AND 100),
@@ -444,6 +667,46 @@ CREATE TABLE IF NOT EXISTS radar_worker_heartbeats (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     stopped_at TIMESTAMPTZ
 );
+
+-- Successful web searches are shared by worker jobs and survive restarts.
+-- Empty/error responses are deliberately not cached.
+CREATE TABLE IF NOT EXISTS web_search_cache (
+    query_key CHAR(64) PRIMARY KEY,
+    normalized_query TEXT NOT NULL,
+    results_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    provider_names TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    searched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- Provider health is shared across isolated worker job processes. Without a
+-- durable circuit breaker, each new job would immediately retry an engine that
+-- the previous job had just discovered was blocked or unavailable.
+CREATE TABLE IF NOT EXISTS web_search_provider_health (
+    provider_name TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'healthy'
+        CHECK (status IN ('healthy', 'blocked')),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    blocked_until TIMESTAMPTZ,
+    next_request_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_failure_at TIMESTAMPTZ,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Migrations for databases created before the staged indexing pipeline and
+-- shared OpenAlex rate limiter were introduced.
+ALTER TABLE radar_jobs
+    DROP CONSTRAINT IF EXISTS radar_jobs_job_type_check;
+ALTER TABLE radar_jobs
+    ADD CONSTRAINT radar_jobs_job_type_check CHECK (job_type IN (
+        'DISCOVER_CANDIDATES', 'VERIFY_FACULTY', 'REFRESH_FACULTY',
+        'CHECK_HIRING', 'CHECK_GRANTS', 'ENRICH_PROFESSORS',
+        'REINDEX_RESEARCH'
+    ));
+ALTER TABLE web_search_provider_health
+    ADD COLUMN IF NOT EXISTS next_request_at TIMESTAMPTZ;
 
 -- A run is targeted to one user query. ScholarRadar never attempts to preload
 -- every professor or every field.
@@ -533,12 +796,38 @@ CREATE INDEX IF NOT EXISTS radar_topics_requested_idx
 CREATE INDEX IF NOT EXISTS radar_topics_refresh_idx
     ON radar_topics (next_refresh_at, status);
 CREATE INDEX IF NOT EXISTS radar_topic_professors_rank_idx
-    ON radar_topic_professors (radar_topic_id, result_rank);
+    ON radar_topic_professors (radar_topic_id, is_current_match, result_rank);
+CREATE INDEX IF NOT EXISTS radar_topic_professors_current_rank_idx
+    ON radar_topic_professors (radar_topic_id, result_rank)
+    WHERE is_current_match = TRUE;
+CREATE INDEX IF NOT EXISTS radar_topic_professor_papers_current_idx
+    ON radar_topic_professor_papers (
+        radar_topic_id, professor_id, relevance_score DESC
+    )
+    WHERE is_current_match = TRUE;
 CREATE INDEX IF NOT EXISTS radar_jobs_claim_idx
     ON radar_jobs (status, available_at, priority DESC, created_at)
     WHERE status = 'queued';
 CREATE UNIQUE INDEX IF NOT EXISTS radar_jobs_active_dedupe_idx
     ON radar_jobs (dedupe_key)
     WHERE status IN ('queued', 'running');
+
+-- Topics containing decisions reset by the identity/relevance migration are
+-- eligible for immediate background refresh instead of waiting 30 days.
+UPDATE radar_topics topic
+SET next_refresh_at = NOW(), updated_at = NOW()
+WHERE EXISTS (
+    SELECT 1
+    FROM radar_topic_professors rtp
+    JOIN professors p ON p.id = rtp.professor_id
+    WHERE rtp.radar_topic_id = topic.id
+      AND p.faculty_status = 'UNVERIFIED'
+      AND p.next_identity_check_at <= NOW()
+);
 CREATE INDEX IF NOT EXISTS radar_worker_last_seen_idx
     ON radar_worker_heartbeats (last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS web_search_cache_expiry_idx
+    ON web_search_cache (expires_at);
+CREATE INDEX IF NOT EXISTS web_search_provider_block_idx
+    ON web_search_provider_health (blocked_until)
+    WHERE status = 'blocked';

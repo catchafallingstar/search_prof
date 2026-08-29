@@ -27,10 +27,9 @@ class PublicRadarContractTests(unittest.TestCase):
         self.assertIn("AND o.status <> 'rejected'", source)
 
     def test_public_signals_never_claim_gpa_flexibility(self) -> None:
-        source = (PROJECT_DIR / "ingestion" / "parse_hiring_signals.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("'unknown', 'not_stated'", source)
+        ui_source = (PROJECT_DIR / "ui.py").read_text(encoding="utf-8")
+        self.assertIn("GPA policy:", ui_source)
+        self.assertIn("Not stated", ui_source)
 
     def test_public_app_is_database_only_and_hides_indexing_controls(self) -> None:
         source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")
@@ -41,17 +40,30 @@ class PublicRadarContractTests(unittest.TestCase):
         self.assertIn("Showing {visible_count} of", source)
         self.assertIn('key="load_more_top"', source)
         self.assertIn('key="load_more_bottom"', source)
-        self.assertIn("Refresh complete: no new verified profiles", source)
-        self.assertIn("Indexing in the background", source)
-        self.assertIn("research-matched candidates discovered", source)
-        self.assertIn("Faculty verification is waiting to start", source)
-        self.assertIn("safely queued and has not failed", source)
+        self.assertNotIn('st.button("Refresh results"', source)
+        self.assertIn("candidates ·", source)
+        self.assertIn("checked ·", source)
+        self.assertIn("verified", source)
+        self.assertIn("identity checks remaining", source)
+        self.assertIn("fetch_topic_verification_progress", source)
+        self.assertIn("Waiting to verify faculty identities", source)
+        self.assertIn("No indexing worker is connected", source)
+        self.assertIn("Indexing status updates automatically", source)
         self.assertIn("Showing the first 100 verified faculty matches.", source)
         self.assertNotIn("execute_radar", source)
         self.assertNotIn("Include a live public-web radar", source)
         self.assertNotIn("Continue checking an incomplete cached search", source)
         self.assertNotIn("candidate pool", source)
         self.assertNotIn("bounded pass", source)
+        self.assertNotIn('selectbox(\n        "GPA policy"', source)
+        self.assertIn("request_visible_hiring_refreshes", source)
+        self.assertIn('run_every="4s"', source)
+        self.assertIn('st.session_state["sr_pending_search"] = new_search', source)
+        self.assertIn("def render_radar_panel(", source)
+        self.assertIn('st.rerun(scope="fragment")', source)
+        self.assertNotIn("Match score", (PROJECT_DIR / "ui.py").read_text(encoding="utf-8"))
+        self.assertNotIn("def poll_topic_index(", source)
+        self.assertNotIn("def poll_hiring_refreshes(", source)
 
     def test_professor_categories_follow_evidence_strength(self) -> None:
         database_source = (PROJECT_DIR / "radar_store.py").read_text(encoding="utf-8")
@@ -72,11 +84,34 @@ class PublicRadarContractTests(unittest.TestCase):
             app_source.index("early_career_funded"),
         )
         self.assertIn("o.source_kind IN ('verified_post', 'university_post')", database_source)
-        self.assertIn("WHEN o.id IS NOT NULL THEN 'public_hiring_signal'", database_source)
+        self.assertIn("WHEN hs.id IS NOT NULL THEN 'public_hiring_signal'", database_source)
         self.assertIn("rtp.research_score", database_source)
-        self.assertIn("Hiring now — current evidence", app_source)
-        self.assertIn("Likely opportunities — hiring not confirmed", app_source)
+        self.assertIn("Posted on ScholarRadar", app_source)
+        self.assertIn("Hiring signals found online", app_source)
+        self.assertIn("Possible opportunities — hiring not confirmed", app_source)
         self.assertIn("Other verified faculty matches — hiring unknown", app_source)
+
+    def test_schema_separates_signal_freshness_and_gpa_evidence(self) -> None:
+        schema = (PROJECT_DIR / "db.sql").read_text(encoding="utf-8")
+        for column in (
+            "first_seen_at",
+            "last_seen_at",
+            "last_checked_at",
+            "public_hiring_check_status",
+            "public_hiring_failure_count",
+            "lab_gpa_policy",
+            "lab_gpa_evidence_text",
+            "program_gpa_minimum",
+        ):
+            self.assertIn(column, schema)
+
+    def test_stale_hiring_claims_are_suppressed_while_refreshing(self) -> None:
+        database_source = (PROJECT_DIR / "radar_store.py").read_text(encoding="utf-8")
+        ui_source = (PROJECT_DIR / "ui.py").read_text(encoding="utf-8")
+        self.assertIn("p.public_hiring_checked_at > NOW() - INTERVAL '24 hours'", database_source)
+        self.assertIn("Hiring: checking public pages", ui_source)
+        self.assertIn("Hiring: no public statement found", ui_source)
+        self.assertIn("could not be checked", ui_source)
 
     def test_shared_index_and_durable_queue_are_in_the_schema(self) -> None:
         schema = (PROJECT_DIR / "db.sql").read_text(encoding="utf-8")
@@ -101,6 +136,7 @@ class PublicRadarContractTests(unittest.TestCase):
             "REFRESH_FACULTY",
             "CHECK_HIRING",
             "CHECK_GRANTS",
+            "ENRICH_PROFESSORS",
             "REINDEX_RESEARCH",
         ):
             self.assertIn(job_type, worker)

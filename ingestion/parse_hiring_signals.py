@@ -9,9 +9,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from db import get_db_connection
-from ingestion.homepagefinder import get_professor_homepage, is_public_http_url
+from ingestion.homepagefinder import is_public_http_url
 from ingestion.matchers import clean_and_extract_hiring_quote, extract_roles_and_funding, get_text_hash, is_valid_signal_text
-from ingestion.socialradar import check_social_hiring
 from settings import setting_int
 
 NEW_AP_PATTERN = re.compile(
@@ -21,6 +20,16 @@ NEW_AP_PATTERN = re.compile(
 RELATED_ACADEMIC_LINK_PATTERN = re.compile(
     r"(?:\blab\b|laborator|research\s+group|opening|prospective|join\s+us|"
     r"personal\s+(?:site|website|homepage)|\bwebsite\b|\bhomepage\b)",
+    re.IGNORECASE,
+)
+NO_GPA_CUTOFF_PATTERN = re.compile(
+    r"(?:no\s+(?:minimum|required)\s+gpa|no\s+(?:hard\s+)?gpa\s+cutoff|"
+    r"do\s+not\s+(?:use|have|require)\s+(?:a\s+)?(?:minimum\s+)?gpa)",
+    re.IGNORECASE,
+)
+HOLISTIC_GPA_PATTERN = re.compile(r"(?:holistic(?:ally)?|whole\s+application).{0,80}\bgpa\b|\bgpa\b.{0,80}holistic", re.IGNORECASE)
+GPA_MINIMUM_PATTERN = re.compile(
+    r"(?:minimum|required|at\s+least)\s+(?:cumulative\s+)?gpa(?:\s+of)?\s*[:=]?\s*([234](?:\.\d{1,2})?)",
     re.IGNORECASE,
 )
 
@@ -48,15 +57,15 @@ def _fetch_with_safe_redirects(url: str, max_redirects: int = 5) -> requests.Res
     raise requests.TooManyRedirects(f"More than {max_redirects} redirects")
 
 
-def fetch_and_parse_homepage(homepage_url: str) -> list[str]:
+def _fetch_and_parse_homepage_status(homepage_url: str) -> tuple[list[str], bool]:
     if not is_public_http_url(homepage_url, resolve_dns=True):
-        return []
+        return [], False
     try:
         time.sleep(random.uniform(0.2, 0.5))
         response = _fetch_with_safe_redirects(homepage_url)
         response.raise_for_status()
         if "text/html" not in response.headers.get("content-type", "").casefold():
-            return []
+            return [], True
         soup = BeautifulSoup(response.text, "html.parser")
         for element in soup(["script", "style", "nav", "footer", "noscript"]):
             element.decompose()
@@ -81,10 +90,42 @@ def fetch_and_parse_homepage(homepage_url: str) -> list[str]:
                 ):
                     seen.add(cleaned)
                     matches.append(cleaned)
-        return matches[:5]
+        return matches[:5], True
     except (OSError, requests.RequestException) as error:
         print(f"Homepage fetch failed for {homepage_url}: {error}")
-        return []
+        return [], False
+
+
+def fetch_and_parse_homepage(homepage_url: str) -> list[str]:
+    """Compatibility wrapper used by tests and the standalone parser."""
+    matches, _accessible = _fetch_and_parse_homepage_status(homepage_url)
+    return matches
+
+
+def extract_gpa_evidence(sentences: list[str], source_url: str) -> dict[str, Any] | None:
+    """Keep GPA extraction conservative and tied to quoted source text."""
+    for sentence in sentences:
+        if not re.search(r"\bgpa\b", sentence, re.IGNORECASE):
+            continue
+        if NO_GPA_CUTOFF_PATTERN.search(sentence):
+            return {"policy": "no_lab_cutoff", "evidence": sentence, "source_url": source_url}
+        if HOLISTIC_GPA_PATTERN.search(sentence):
+            return {"policy": "holistic_review", "evidence": sentence, "source_url": source_url}
+        minimum = GPA_MINIMUM_PATTERN.search(sentence)
+        if minimum:
+            scope = (
+                "program"
+                if re.search(r"\b(?:program|department|graduate\s+school|admission)\b", sentence, re.IGNORECASE)
+                else "lab"
+            )
+            return {
+                "policy": "minimum",
+                "evidence": sentence,
+                "source_url": source_url,
+                "minimum": float(minimum.group(1)),
+                "scope": scope,
+            }
+    return None
 
 
 def discover_linked_research_pages(homepage_url: str, max_links: int = 3) -> list[str]:
@@ -135,22 +176,38 @@ def save_signal_to_db(
     is_new_ap = bool(NEW_AP_PATTERN.search(raw_quote))
     score_boost = 40 + (20 if has_funding else 0) + (30 if is_new_ap else 0)
     quote_hash = get_text_hash(f"{professor_id}|{source_url}|{raw_quote}")
-    confidence = "high" if signal_type == "homepage" else "medium"
+    confidence = "high" if signal_type in {"homepage", "official_profile"} else "medium"
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO hiring_signals (
                     professor_id, raw_text_hash, signal_type, confidence, raw_text,
-                    source_url, last_checked_at, expires_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW() + INTERVAL '120 days')
-                ON CONFLICT (raw_text_hash) DO NOTHING
-                RETURNING id
+                    source_url, position_type, attribution_status,
+                    first_seen_at, last_seen_at, last_checked_at,
+                    check_status, consecutive_check_failures, next_check_at, expires_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, 'VERIFIED',
+                    NOW(), NOW(), NOW(), 'PRESENT', 0,
+                    NOW() + INTERVAL '24 hours', NOW() + INTERVAL '120 days'
+                )
+                ON CONFLICT (raw_text_hash) DO UPDATE
+                SET position_type = EXCLUDED.position_type,
+                    attribution_status = 'VERIFIED',
+                    last_seen_at = NOW(), last_checked_at = NOW(),
+                    check_status = 'PRESENT', consecutive_check_failures = 0,
+                    next_check_at = NOW() + INTERVAL '24 hours',
+                    expires_at = NOW() + INTERVAL '120 days'
+                RETURNING id, (xmax = 0) AS inserted
                 """,
-                (professor_id, quote_hash, signal_type, confidence, raw_quote, source_url),
+                (
+                    professor_id, quote_hash, signal_type, confidence, raw_quote,
+                    source_url, position_type,
+                ),
             )
             signal_row = cursor.fetchone()
-            inserted = signal_row is not None
+            inserted = bool(signal_row and signal_row.get("inserted"))
+            opportunity_id = None
             if inserted:
                 role_text = ", ".join(roles) if roles else "unspecified role"
                 cursor.execute(
@@ -164,91 +221,6 @@ def save_signal_to_db(
                     """,
                     (score_boost, is_new_ap, f" +{score_boost} ({signal_type}; {role_text})", professor_id),
                 )
-                cursor.execute(
-                    """
-                    SELECT name, institution_id, institution_name, research_domain
-                    FROM professors WHERE id = %s
-                    """,
-                    (professor_id,),
-                )
-                professor = cursor.fetchone()
-                cursor.execute(
-                    """
-                    INSERT INTO opportunities (
-                        professor_id, institution_id, title, institution_name,
-                        professor_name, research_area, position_type, description,
-                        funding_status, gpa_policy, international_eligible,
-                        application_url, source_kind, organic_score, status,
-                        published_at, expires_at
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s,
-                        'unknown', 'not_stated', NULL, %s, 'public_signal', %s,
-                        'pending', NULL, NOW() + INTERVAL '120 days'
-                    ) RETURNING id
-                    """,
-                    (
-                        professor_id,
-                        professor["institution_id"],
-                        f"{position_type} recruiting signal in {professor['research_domain'] or 'the lab'}",
-                        professor["institution_name"],
-                        professor["name"],
-                        professor["research_domain"] or "Not classified",
-                        position_type,
-                        raw_quote,
-                        source_url,
-                        75 if signal_type == "homepage" else 60,
-                    ),
-                )
-                opportunity_id = cursor.fetchone()["id"]
-                cursor.execute(
-                    """
-                    INSERT INTO opportunity_sources (
-                        opportunity_id, source_external_id, source_type, source_url,
-                        evidence_text, last_checked_at, confidence
-                    ) VALUES (%s, %s, %s, %s, %s, NOW(), %s)
-                    """,
-                    (opportunity_id, quote_hash, signal_type, source_url, raw_quote, confidence),
-                )
-            else:
-                cursor.execute(
-                    """
-                    UPDATE hiring_signals
-                    SET last_checked_at = NOW(), expires_at = NOW() + INTERVAL '120 days'
-                    WHERE raw_text_hash = %s
-                    """,
-                    (quote_hash,),
-                )
-                cursor.execute(
-                    """
-                    UPDATE opportunity_sources
-                    SET last_checked_at = NOW()
-                    WHERE source_external_id = %s
-                    """,
-                    (quote_hash,),
-                )
-                cursor.execute(
-                    """
-                    SELECT opportunity_id FROM opportunity_sources
-                    WHERE source_external_id = %s
-                    """,
-                    (quote_hash,),
-                )
-                existing = cursor.fetchone()
-                opportunity_id = existing["opportunity_id"] if existing else None
-                if opportunity_id:
-                    cursor.execute(
-                        "UPDATE opportunities SET position_type = %s, updated_at = NOW() WHERE id = %s",
-                        (position_type, opportunity_id),
-                    )
-            if radar_run_id and opportunity_id:
-                cursor.execute(
-                    """
-                    INSERT INTO radar_run_results (radar_run_id, opportunity_id)
-                    VALUES (%s, %s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (radar_run_id, opportunity_id),
-                )
             return {
                 "inserted": inserted,
                 "opportunity_id": opportunity_id,
@@ -259,28 +231,128 @@ def save_signal_to_db(
             }
 
 
-def process_single_professor(professor: dict[str, Any], domain_name: str | None = None) -> tuple[str, int, str, str] | None:
-    homepage = get_professor_homepage(
-        professor["name"],
-        professor["institution_name"],
-        openalex_homepage=professor.get("homepage_url"),
-    )
-    if homepage:
-        sentences = fetch_and_parse_homepage(homepage)
+def process_single_professor(professor: dict[str, Any], domain_name: str | None = None) -> dict[str, Any]:
+    # Only pages already anchored to the verified faculty identity are eligible
+    # for automatic public display. Search-engine guesses and social results can
+    # belong to a namesake and therefore must not create a public signal.
+    trusted_pages: list[tuple[str, str]] = []
+    # The verified faculty source is the trust root. Personal/lab pages become
+    # eligible only when that official page links to them.
+    for signal_type, candidate in (
+        ("official_profile", professor.get("faculty_source_url")),
+    ):
+        page = str(candidate or "").strip()
+        if page and page not in {url for _, url in trusted_pages}:
+            trusted_pages.append((signal_type, page))
+
+    any_accessible = False
+    gpa_evidence: dict[str, Any] | None = None
+    for signal_type, homepage in trusted_pages:
+        sentences, accessible = _fetch_and_parse_homepage_status(homepage)
+        any_accessible = any_accessible or accessible
+        if accessible and gpa_evidence is None:
+            gpa_evidence = extract_gpa_evidence(sentences, homepage)
         quote = clean_and_extract_hiring_quote(". ".join(sentences))
         if quote:
-            return "homepage", professor["id"], quote, homepage
+            return {
+                "signal": (signal_type, professor["id"], quote, homepage),
+                "check_status": "PRESENT",
+                "gpa": gpa_evidence,
+            }
         for linked_page in discover_linked_research_pages(homepage):
-            sentences = fetch_and_parse_homepage(linked_page)
-            quote = clean_and_extract_hiring_quote(". ".join(sentences))
+            linked_sentences, linked_accessible = _fetch_and_parse_homepage_status(linked_page)
+            any_accessible = any_accessible or linked_accessible
+            if linked_accessible and gpa_evidence is None:
+                gpa_evidence = extract_gpa_evidence(linked_sentences, linked_page)
+            quote = clean_and_extract_hiring_quote(". ".join(linked_sentences))
             if quote:
-                return "homepage", professor["id"], quote, linked_page
+                return {
+                    "signal": ("homepage", professor["id"], quote, linked_page),
+                    "check_status": "PRESENT",
+                    "gpa": gpa_evidence,
+                }
+    return {
+        "signal": None,
+        "check_status": "NOT_FOUND" if any_accessible else "SOURCE_UNAVAILABLE",
+        "gpa": gpa_evidence,
+    }
 
-    social_text, social_url = check_social_hiring(professor["name"], professor["institution_name"])
-    quote = clean_and_extract_hiring_quote(social_text or "")
-    if quote and social_url:
-        return "social", professor["id"], quote, social_url
-    return None
+
+def record_professor_hiring_check(
+    professor_id: int,
+    check_status: str,
+    gpa_evidence: dict[str, Any] | None,
+) -> None:
+    """Record the inspection separately from whether recruiting text was seen."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            if check_status == "SOURCE_UNAVAILABLE":
+                cursor.execute(
+                    """
+                    UPDATE professors
+                    SET public_hiring_checked_at = NOW(),
+                        public_hiring_check_status = 'SOURCE_UNAVAILABLE',
+                        public_hiring_failure_count = public_hiring_failure_count + 1,
+                        public_hiring_next_check_at = NOW() + INTERVAL '6 hours',
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (professor_id,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE hiring_signals
+                    SET last_checked_at = NOW(), check_status = 'SOURCE_UNAVAILABLE',
+                        consecutive_check_failures = consecutive_check_failures + 1,
+                        next_check_at = NOW() + INTERVAL '6 hours'
+                    WHERE professor_id = %s AND attribution_status = 'VERIFIED'
+                    """,
+                    (professor_id,),
+                )
+                return
+
+            cursor.execute(
+                """
+                UPDATE professors
+                SET public_hiring_checked_at = NOW(),
+                    public_hiring_check_status = %s,
+                    public_hiring_failure_count = 0,
+                    public_hiring_next_check_at = NOW() + INTERVAL '24 hours',
+                    lab_gpa_policy = %s,
+                    lab_gpa_evidence_text = %s,
+                    lab_gpa_source_url = %s,
+                    lab_gpa_minimum = %s,
+                    program_gpa_minimum = %s,
+                    program_gpa_source_url = %s,
+                    gpa_last_checked_at = NOW(), updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    check_status,
+                    (
+                        (gpa_evidence or {}).get("policy", "not_stated")
+                        if (gpa_evidence or {}).get("scope", "lab") == "lab"
+                        else "not_stated"
+                    ),
+                    (gpa_evidence or {}).get("evidence"),
+                    (gpa_evidence or {}).get("source_url"),
+                    (gpa_evidence or {}).get("minimum") if (gpa_evidence or {}).get("scope", "lab") == "lab" else None,
+                    (gpa_evidence or {}).get("minimum") if (gpa_evidence or {}).get("scope") == "program" else None,
+                    (gpa_evidence or {}).get("source_url") if (gpa_evidence or {}).get("scope") == "program" else None,
+                    professor_id,
+                ),
+            )
+            if check_status == "NOT_FOUND":
+                cursor.execute(
+                    """
+                    UPDATE hiring_signals
+                    SET last_checked_at = NOW(), check_status = 'NOT_FOUND',
+                        consecutive_check_failures = 0,
+                        next_check_at = NOW() + INTERVAL '24 hours'
+                    WHERE professor_id = %s AND attribution_status = 'VERIFIED'
+                    """,
+                    (professor_id,),
+                )
 
 
 def scan_hiring_signals(
@@ -303,18 +375,20 @@ def scan_hiring_signals(
                     }
                 cursor.execute(
                     """
-                    SELECT id, name, institution_name, homepage_url
-                    FROM professors WHERE id = ANY(%s) ORDER BY id
+                    SELECT id, name, institution_name, homepage_url, faculty_source_url
+                    FROM professors
+                    WHERE id = ANY(%s) AND faculty_status = 'VERIFIED'
+                    ORDER BY id
                     """,
                     (professor_ids,),
                 )
             elif domain_name:
                 cursor.execute(
-                    "SELECT id, name, institution_name, homepage_url FROM professors WHERE research_domain = %s",
+                    "SELECT id, name, institution_name, homepage_url, faculty_source_url FROM professors WHERE research_domain = %s AND faculty_status = 'VERIFIED'",
                     (domain_name,),
                 )
             else:
-                cursor.execute("SELECT id, name, institution_name, homepage_url FROM professors")
+                cursor.execute("SELECT id, name, institution_name, homepage_url, faculty_source_url FROM professors WHERE faculty_status = 'VERIFIED'")
             professors = list(cursor.fetchall())
 
     max_workers = setting_int("RADAR_MAX_WORKERS", 2, 1, 8)
@@ -357,11 +431,12 @@ def scan_hiring_signals(
                     pending.clear()
                     break
                 try:
-                    result = future.result()
+                    outcome = future.result()
                     checked += 1
                     checked_professor_ids.append(int(professor["id"]))
-                    if result:
-                        signal_type, professor_id, quote, source_url = result
+                    signal = outcome.get("signal")
+                    if signal:
+                        signal_type, professor_id, quote, source_url = signal
                         saved = save_signal_to_db(
                             professor_id, signal_type, quote, source_url, radar_run_id
                         )
@@ -369,6 +444,11 @@ def scan_hiring_signals(
                         if saved["inserted"]:
                             hits += 1
                             print(f"Hiring evidence found for {professor['name']}: {source_url}")
+                    record_professor_hiring_check(
+                        int(professor["id"]),
+                        str(outcome.get("check_status") or "SOURCE_UNAVAILABLE"),
+                        outcome.get("gpa"),
+                    )
                     if progress_callback:
                         total = max(1, len(professors))
                         progress_callback(

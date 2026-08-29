@@ -57,6 +57,25 @@ def configure_page(title: str) -> None:
           transition: border-color .15s ease, background-color .15s ease,
                       transform .15s ease;
         }
+        .st-key-sr_nav .sr-nav-link {
+          display: flex;
+          min-height: 2.5rem;
+          align-items: center;
+          justify-content: center;
+          border: 1px solid rgba(49, 51, 63, .22);
+          border-radius: .55rem;
+          background: #ffffff;
+          color: #253129;
+          font-weight: 600;
+          text-decoration: none;
+          box-shadow: 0 1px 2px rgba(20, 40, 28, .04);
+        }
+        .st-key-sr_nav .sr-nav-link:hover,
+        .st-key-sr_nav .sr-nav-link:focus-visible {
+          border-color: #2f6d4b;
+          background: #edf7f0;
+          color: #17482e;
+        }
         .st-key-sr_nav button:hover,
         .st-key-sr_nav button:focus-visible {
           border-color: #2f6d4b;
@@ -96,8 +115,15 @@ def configure_page(title: str) -> None:
             background: #19221c;
             color: #e4eee7;
           }
+          .st-key-sr_nav .sr-nav-link {
+            border-color: rgba(230, 239, 232, .24);
+            background: #19221c;
+            color: #e4eee7;
+          }
           .st-key-sr_nav button:hover,
-          .st-key-sr_nav button:focus-visible {
+          .st-key-sr_nav button:focus-visible,
+          .st-key-sr_nav .sr-nav-link:hover,
+          .st-key-sr_nav .sr-nav-link:focus-visible {
             border-color: #91cba4;
             background: #223129;
             color: #ffffff;
@@ -131,8 +157,8 @@ def configure_page(title: str) -> None:
 
 def navigation() -> None:
     with st.container(key="sr_nav"):
-        brand, browse, post, verify, staff = st.columns(
-            [2.7, 1.3, 1.7, 1.5, 1.2], vertical_alignment="center"
+        brand, browse, post, verify, policies, staff = st.columns(
+            [2.5, 1.2, 1.6, 1.4, 1.4, 1.1], vertical_alignment="center"
         )
         if brand.button("◉ ScholarRadar", key="nav_home", width="stretch"):
             st.switch_page("app.py")
@@ -142,8 +168,12 @@ def navigation() -> None:
             st.switch_page("pages/1_Post_an_opening.py")
         if verify.button("Verification", key="nav_verify", width="stretch"):
             st.switch_page("pages/2_Verification.py")
-        if staff.button("Staff", key="nav_staff", width="stretch"):
-            st.switch_page("pages/3_Admin_review.py")
+        if policies.button("About data", key="nav_policies", width="stretch"):
+            st.switch_page("pages/6_Data_and_policies.py")
+        staff.markdown(
+            '<a class="sr-nav-link" href="/Admin_review">Staff</a>',
+            unsafe_allow_html=True,
+        )
 
 
 def demo_opportunities() -> list[dict[str, Any]]:
@@ -222,6 +252,32 @@ def is_http_url(value: str) -> bool:
         return False
 
 
+_NON_INSTITUTIONAL_PROFILE_HOSTS = {
+    "academia.edu",
+    "facebook.com",
+    "github.com",
+    "google.com",
+    "linkedin.com",
+    "medium.com",
+    "orcid.org",
+    "researchgate.net",
+    "scholar.google.com",
+    "twitter.com",
+    "x.com",
+}
+
+
+def is_official_institution_url(value: str) -> bool:
+    """Reject social, publication, and personal-profile substitutes."""
+    if not is_http_url(value):
+        return False
+    hostname = (urlparse(value.strip()).hostname or "").casefold().removeprefix("www.")
+    return not any(
+        hostname == blocked or hostname.endswith(f".{blocked}")
+        for blocked in _NON_INSTITUTIONAL_PROFILE_HOSTS
+    )
+
+
 def filter_demo(rows: list[dict[str, Any]], area: str, position: str, gpa_policy: str) -> list[dict[str, Any]]:
     term = area.strip().casefold()
     filtered = []
@@ -292,13 +348,13 @@ def render_radar_candidate(row: dict[str, Any]) -> None:
 
 
 def render_professor_prospect(row: dict[str, Any]) -> None:
-    """Render a research match without turning probabilistic signals into claims."""
+    """Render the evidence needed to evaluate one verified faculty match."""
     category = row.get("result_category")
     with st.container(border=True):
         if category == "confirmed_opening":
-            st.caption("Confirmed opening · Posted through a role-verified ScholarRadar account")
+            st.caption("Posted on ScholarRadar")
         elif category == "public_hiring_signal":
-            st.caption("Current public hiring evidence · Not yet moderator-confirmed")
+            st.caption("Hiring signal found online")
         elif category == "early_career_funded":
             st.caption("Assistant professor · Active public funding · Hiring unknown")
         elif category == "early_career":
@@ -311,45 +367,55 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
         st.subheader(row["professor_name"])
         verified_title = str(row.get("faculty_title") or "Faculty").strip()
         st.caption(
-            f"✅ Faculty role verified · {verified_title} · {row['institution_name']} · "
-            f"Match score {float(row['research_score']):.0f}/40"
-        )
-        st.caption(
-            "The faculty identity is backed by an official university page. "
-            "Hiring and GPA claims are verified separately."
+            f"✅ Faculty role verified · {verified_title} · {row['institution_name']}"
         )
         if row.get("latest_paper_title"):
             year = f" ({row['latest_paper_year']})" if row.get("latest_paper_year") else ""
             st.write(f"**Recent matching paper:** {row['latest_paper_title']}{year}")
-            st.caption(f"Matching recent papers found: {row.get('matching_papers') or 0}")
-            shared_count = int(row.get("shared_latest_paper_count") or 0)
-            if shared_count > 1:
-                st.caption(
-                    f"This paper is shared by {shared_count} displayed coauthors. Each person's "
-                    "faculty identity is verified separately."
-                )
+            st.caption(f"Matching papers: {row.get('matching_papers') or 0}")
         if row.get("grant_title"):
             st.write(f"**Active grant:** {row['grant_title']} — {row.get('funder') or 'public funder'}")
         elif row.get("grant_sources_checked"):
-            st.caption("NSF checked: no active matching award found.")
+            st.caption("Funding: no active matching NSF award found")
         else:
-            st.caption("NSF not checked in this bounded pass.")
+            st.caption("Funding: not checked yet")
         if row.get("hiring_evidence"):
-            st.write(f"**Hiring evidence:** {row['hiring_evidence']}")
+            label = "Opening details" if category == "confirmed_opening" else "Hiring text"
+            st.write(f"**{label}:**")
+            st.write(f"“{row['hiring_evidence']}”")
+            if category == "public_hiring_signal":
+                st.caption("Check the linked source before contacting the professor.")
+        elif row.get("hiring_refresh_needed") or row.get("hiring_check_pending"):
+            st.caption("Hiring: checking public pages…")
+        elif row.get("public_hiring_check_status") == "SOURCE_UNAVAILABLE":
+            st.caption("Hiring: source page could not be checked")
         elif row.get("public_sources_checked"):
-            st.caption("Public hiring sources checked: no explicit current statement found.")
+            st.caption("Hiring: no public statement found")
         else:
-            st.caption("Public hiring sources not yet checked in this bounded pass.")
+            st.caption("Hiring: not checked yet")
 
-        st.write("**GPA policy:** Not stated. Check both the lab and graduate-program requirements.")
-        if category not in {"confirmed_opening", "public_hiring_signal"}:
-            st.info(
-                "This person is shown because of research fit and opportunity indicators. "
-                "ScholarRadar did not confirm that the lab is currently recruiting."
-            )
-
+        gpa_policy = str(row.get("lab_gpa_policy") or "not_stated")
+        if row.get("hiring_refresh_needed") or row.get("hiring_check_pending"):
+            st.write("**Lab GPA:** Checking public pages…")
+        elif gpa_policy == "no_lab_cutoff":
+            st.write("**Lab GPA:** No lab minimum stated by the source")
+        elif gpa_policy == "holistic_review":
+            st.write("**Lab GPA:** Holistic review stated by the source")
+        elif gpa_policy == "minimum" and row.get("lab_gpa_minimum") is not None:
+            st.write(f"**Lab GPA:** Minimum {float(row['lab_gpa_minimum']):.2f}")
+        elif gpa_policy == "exceptions_considered":
+            st.write("**Lab GPA:** Exceptions may be considered")
+        elif row.get("gpa_last_checked_at"):
+            st.write("**Lab GPA:** Not stated on the pages checked")
+        else:
+            st.write("**Lab GPA:** Not checked yet")
+        if row.get("lab_gpa_evidence_text"):
+            st.caption(f"GPA evidence: {row['lab_gpa_evidence_text']}")
+        if row.get("program_gpa_minimum") is not None:
+            st.write(f"**Graduate-program minimum found:** {float(row['program_gpa_minimum']):.2f}.")
         links = [
-            ("Check hiring evidence", row.get("hiring_source_url")),
+            ("Open source page", row.get("hiring_source_url")),
+            ("Check GPA source", row.get("lab_gpa_source_url")),
             ("Official faculty page", row.get("faculty_source_url")),
             ("View active grant", row.get("grant_url")),
             ("Professor/lab page", row.get("homepage_url")),

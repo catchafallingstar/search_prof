@@ -4,6 +4,17 @@ set -Eeuo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
+# One local launch owns one Streamlit process and one indexing worker. Starting
+# this script twice makes old code and new code compete for the same durable
+# queue, and both processes also corrupt the shared local log file.
+LOCAL_START_LOCK="/tmp/scholarradar-local-start.lock"
+exec 9>"$LOCAL_START_LOCK"
+if ! flock -n 9; then
+  echo "ScholarRadar is already running in another terminal." >&2
+  echo "Stop that terminal with Ctrl+C before running make start again." >&2
+  exit 1
+fi
+
 if [[ ! -x .venv/bin/python ]]; then
   echo "The virtual environment is missing. Run: make setup" >&2
   exit 1
@@ -13,7 +24,7 @@ set -a
 source .env
 set +a
 
-docker compose up -d postgres
+docker compose up -d postgres searxng
 
 # Do not rely on whichever environment happened to be active in the caller's
 # shell.  Calling the project interpreter explicitly prevents a different
@@ -31,6 +42,11 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
+
+if [[ -n "${SEARXNG_URL:-}" ]]; then
+  echo "ScholarRadar metasearch started at ${SEARXNG_URL}."
+  echo "Search outages are paused and retried without creating identity decisions."
+fi
 
 .venv/bin/python -m scripts.run_worker \
   --poll-seconds "${RADAR_WORKER_POLL_SECONDS:-3}" \

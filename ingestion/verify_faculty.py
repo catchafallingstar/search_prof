@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -12,11 +13,18 @@ from bs4 import BeautifulSoup
 
 from db import get_db_connection
 from ingestion.homepagefinder import is_public_http_url
-from ingestion.websearch import search_web
-from settings import setting, setting_int
+from ingestion.identity_ai import assess_identity_with_gemini
+from ingestion.openalex_client import OpenAlexUnavailable, openalex_get_json
+from ingestion.paper_affiliations import (
+    enrich_candidate_metadata_affiliations,
+    enrich_candidate_paper_affiliations,
+)
+from ingestion.websearch import SearchUnavailable, search_web
+from settings import setting, setting_bool, setting_int
 
 OPENALEX_INSTITUTIONS_URL = "https://api.openalex.org/institutions"
-FACULTY_VERIFICATION_VERSION = 3
+OPENALEX_AUTHORS_URL = "https://api.openalex.org/authors"
+FACULTY_VERIFICATION_VERSION = 8
 FACULTY_TITLE_PATTERN = re.compile(
     r"\b(?:tenure[- ]track\s+)?(?:assistant|associate|full|research|clinical|teaching|adjunct|visiting)?\s*"
     r"professor(?:\s+of\s+practice)?\b|\bmember\s+of\s+the\s+(?:graduate\s+)?faculty\b",
@@ -26,6 +34,11 @@ NON_FACULTY_PATTERN = re.compile(
     r"\b(?:ph\.?d\.?|doctoral|graduate|undergraduate)\s+(?:student|candidate|researcher)\b|"
     r"\bpostdoctoral\s+(?:fellow|researcher|associate)\b|\bdata\s+scientist\b|"
     r"\bresearch\s+assistant\b|\balumn(?:us|a|i)\b",
+    re.IGNORECASE,
+)
+NON_APPOINTMENT_ROLE_PATTERN = re.compile(
+    r"\b(?:guest|invited|event|seminar|keynote)\s+(?:speaker|lecturer)\b|"
+    r"\b(?:panelist|conference\s+speaker)\b",
     re.IGNORECASE,
 )
 NEW_FACULTY_PATTERN = re.compile(
@@ -38,6 +51,19 @@ NON_PROFILE_URL_PATTERN = re.compile(
     r"alumni|commencement|dissertation|theses",
     re.IGNORECASE,
 )
+HISTORICAL_APPOINTMENT_URL_PATTERN = re.compile(
+    r"(?:^|/)(?:news|events?|press|stories|announcements?)(?:/|$)|"
+    r"new[-_/ ]*faculty|faculty[-_/ ]*hires?",
+    re.IGNORECASE,
+)
+CURRENT_FACULTY_LISTING_PATTERN = re.compile(
+    r"faculty|directory|people|profile|biograph|academic",
+    re.IGNORECASE,
+)
+PROFILE_RESULT_PATTERN = re.compile(
+    r"faculty|directory|people|person|profile|staff|academic|/~|/users?/",
+    re.IGNORECASE,
+)
 TITLE_AFTER_NAME_TOKENS = {
     "at", "directory", "faculty", "homepage", "md", "phd", "profile",
     "professional", "s", "website",
@@ -45,19 +71,82 @@ TITLE_AFTER_NAME_TOKENS = {
 INSTITUTION_STOPWORDS = {
     "and", "at", "college", "of", "school", "system", "the", "university",
 }
-RESEARCH_STOPWORDS = {
-    "and", "applications", "for", "in", "of", "research", "science", "systems", "the",
+INSTITUTION_HINT_PATTERN = re.compile(
+    r"\b(?:"
+    r"University\s+of\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*"
+    r"(?:\s+(?:[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*|of|the|at|and)){0,5}"
+    r"|(?:[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*\s+){1,5}(?:University|College)"
+    r"|(?:[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*\s+){1,5}Institute\s+of\s+Technology"
+    r")\b"
+)
+INSTITUTION_NAME_PATTERN = re.compile(
+    r"\b(?:university|universite|universitat|universiteit|universidade|universita|"
+    r"universidad|universitet|universitas|"
+    r"college|institute\s+of\s+technology|polytechnic)\b",
+    re.IGNORECASE,
+)
+VERIFIED_EMAIL_DOMAIN_PATTERN = re.compile(
+    r"\bverified\s+email\s+at\s+([a-z0-9.-]+\.[a-z]{2,})\b",
+    re.IGNORECASE,
+)
+PAPER_LINKED_PROFILE_BLOCKED_DOMAINS = {
+    "academia.edu", "facebook.com", "github.com", "google.com",
+    "linkedin.com", "ratemyprofessors.com", "researchgate.net",
+    "scholar.google.com", "wikipedia.org",
 }
 
 
+def _ascii_fold(value: str) -> str:
+    compact = value.translate(str.maketrans("", "", "'’ʻ`"))
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", compact)
+        if not unicodedata.combining(character)
+    )
+
+
 def _name_tokens(name: str) -> list[str]:
-    return [token for token in re.findall(r"[a-z0-9]+", name.casefold()) if len(token) > 1]
+    folded = _ascii_fold(name).casefold()
+    return [token for token in re.findall(r"[a-z0-9]+", folded) if len(token) > 1]
 
 
 def _identity_matches(name: str, text: str) -> bool:
-    tokens = _name_tokens(name)
-    normalized = " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
-    return bool(tokens and re.search(rf"\b{re.escape(' '.join(tokens))}\b", normalized))
+    expected = _name_tokens(name)
+    observed = _name_tokens(text)
+    if not expected or not observed:
+        return False
+    minimum = len(expected)
+    maximum = min(len(observed), len(expected) + 2)
+    for start in range(len(observed)):
+        for width in range(minimum, maximum + 1):
+            window = observed[start:start + width]
+            if len(window) < width:
+                continue
+            if _name_tokens_compatible(expected, window):
+                return True
+    return False
+
+
+def _name_tokens_compatible(expected: list[str], observed: list[str]) -> bool:
+    """Allow middle names/initials while preserving the first and last names."""
+    if expected == observed:
+        return True
+    if len(observed) == len(expected) + 1 and observed[1:] == expected:
+        return True
+    if len(expected) < 2 or len(observed) < 2:
+        return False
+    if expected[0] != observed[0] or expected[-1] != observed[-1]:
+        return False
+    if len(expected) == 2:
+        return len(observed) <= 4
+    observed_middle = observed[1:-1]
+    for token in expected[1:-1]:
+        if not any(
+            token == value or token[:1] == value[:1] and min(len(token), len(value)) == 1
+            for value in observed_middle
+        ):
+            return False
+    return True
 
 
 def _profile_title_matches(name: str, page_title: str) -> bool:
@@ -66,23 +155,64 @@ def _profile_title_matches(name: str, page_title: str) -> bool:
     if not expected:
         return False
     for segment in re.split(r"\s*(?:\||·|—|–)\s*", page_title):
-        tokens = _name_tokens(segment)
+        tokens = _name_tokens(re.sub(r"['’]s\b", "", segment, flags=re.IGNORECASE))
         while tokens and tokens[0] in {"dr", "prof", "professor"}:
             tokens.pop(0)
-        if tokens[: len(expected)] != expected:
-            continue
-        remainder = tokens[len(expected):]
-        if not remainder or all(token in TITLE_AFTER_NAME_TOKENS for token in remainder[:3]):
-            return True
+        for start in (0, 1):
+            if start >= len(tokens):
+                continue
+            for width in range(len(expected), min(len(tokens) - start, len(expected) + 2) + 1):
+                observed = tokens[start:start + width]
+                if not _name_tokens_compatible(expected, observed):
+                    continue
+                remainder = tokens[start + width:]
+                if not remainder or all(
+                    token in TITLE_AFTER_NAME_TOKENS for token in remainder[:3]
+                ):
+                    return True
     return False
 
 
 def _institution_tokens(value: str) -> set[str]:
+    folded = _ascii_fold(value).casefold()
     return {
         token
-        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        for token in re.findall(r"[a-z0-9]+", folded)
         if len(token) > 2 and token not in INSTITUTION_STOPWORDS
     }
+
+
+def _institution_similarity(left: str, right: str) -> float:
+    left_tokens = _institution_tokens(left)
+    right_tokens = _institution_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / min(len(left_tokens), len(right_tokens))
+
+
+def _institution_search_aliases(institution: str) -> list[str]:
+    """Create a few familiar search forms such as NUS, UAlberta, and PolyU."""
+    words = [
+        token
+        for token in re.findall(r"[A-Za-z0-9]+", _ascii_fold(institution))
+        if token.casefold() not in {"of", "the", "at", "and"}
+    ]
+    if not words:
+        return []
+    aliases: list[str] = []
+    lowered = [word.casefold() for word in words]
+    if "polytechnic" in lowered and "university" in lowered:
+        aliases.append("PolyU")
+    if lowered[0] in {"university", "universite", "universitat", "universiteit"}:
+        distinctive = next(
+            (word for word in reversed(words[1:]) if len(word) >= 4), ""
+        )
+        if distinctive:
+            aliases.append(f"U{distinctive}")
+    acronym = "".join(word[0] for word in words).upper()
+    if 2 <= len(acronym) <= 6:
+        aliases.append(acronym)
+    return list(dict.fromkeys(aliases))
 
 
 def _institution_continuity(
@@ -93,31 +223,15 @@ def _institution_continuity(
     """Link an old publication affiliation to a current official appointment."""
     claimed = _institution_tokens(claimed_institution)
     current = _institution_tokens(current_institution)
-    if claimed and current and (len(claimed & current) / min(len(claimed), len(current))) >= 0.5:
+    if claimed and current and _institution_similarity(
+        claimed_institution, current_institution
+    ) >= 0.5:
         return True
-    page_tokens = set(re.findall(r"[a-z0-9]+", page_text.casefold()))
+    page_tokens = set(
+        re.findall(r"[a-z0-9]+", _ascii_fold(page_text).casefold())
+    )
     required = 2 if len(claimed) >= 2 else 1
     return bool(claimed and len(claimed & page_tokens) >= required)
-
-
-def _research_continuity(research_domain: str, page_text: str) -> bool:
-    """Reject an exact-name faculty page from an unrelated discipline."""
-    domain_tokens = {
-        token
-        for token in re.findall(r"[a-z0-9]+", research_domain.casefold())
-        if len(token) > 2 and token not in RESEARCH_STOPWORDS
-    }
-    if not domain_tokens:
-        return True
-    page_tokens = set(re.findall(r"[a-z0-9]+", page_text.casefold()))
-    if domain_tokens & page_tokens:
-        return True
-    # Common academic compounds should match their query roots without making
-    # an unrelated same-name professor sufficient evidence.
-    return any(
-        len(token) >= 5 and any(token in page_token for page_token in page_tokens)
-        for token in domain_tokens
-    )
 
 
 def _identity_context(name: str, text: str, window: int = 350) -> str:
@@ -144,17 +258,95 @@ def _identity_context(name: str, text: str, window: int = 350) -> str:
 
 
 def _edu_domain(url: str) -> str:
+    """Return a conventional academic registrable domain.
+
+    The old verifier recognized only ``university.edu``. That silently
+    excluded common international forms such as ``sdu.edu.cn`` and
+    ``cam.ac.uk``.
+    """
     host = (urlparse(url).hostname or "").casefold().rstrip(".")
     labels = host.split(".")
     if len(labels) >= 2 and labels[-1] == "edu":
         return ".".join(labels[-2:])
+    if len(labels) >= 3 and labels[-2] in {"ac", "edu"}:
+        return ".".join(labels[-3:])
     return ""
 
 
+def _host_domain(url: str) -> str:
+    host = (urlparse(url).hostname or "").casefold().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _domain_matches_institution(url: str, institution: str) -> bool:
+    """Recognize an institution-owned host without trusting every country domain."""
+    host = re.sub(r"[^a-z0-9]", "", _ascii_fold(_host_domain(url)).casefold())
+    if not host:
+        return False
+    words = [
+        token
+        for token in re.findall(r"[a-z0-9]+", _ascii_fold(institution).casefold())
+        if len(token) > 1 and token not in {"of", "the", "at", "and"}
+    ]
+    if any(len(token) >= 4 and token in host for token in words):
+        return True
+    acronym = "".join(token[0] for token in words)
+    first_label = re.sub(r"[^a-z0-9]", "", _host_domain(url).split(".")[0])
+    return bool(
+        len(first_label) >= 2
+        and acronym
+        and (
+            acronym.startswith(first_label)
+            or first_label.startswith(acronym)
+            or (
+                len(first_label) == len(acronym)
+                and sorted(first_label) == sorted(acronym)
+            )
+        )
+    )
+
+
+def _possible_official_domain(
+    url: str, candidate_institution: str, result_summary: str
+) -> str:
+    conventional = _edu_domain(url)
+    if conventional:
+        return conventional
+    host = _host_domain(url)
+    if _domain_matches_institution(url, candidate_institution):
+        return host
+    for match in INSTITUTION_HINT_PATTERN.finditer(result_summary):
+        if _domain_matches_institution(url, match.group(0)):
+            return host
+    return ""
+
+
+def _country_code_for_domain(domain: str) -> str | None:
+    if domain.endswith(".edu"):
+        return "US"
+    suffix = domain.rsplit(".", 1)[-1].upper() if "." in domain else ""
+    return {
+        "AU": "AU",
+        "BR": "BR",
+        "CA": "CA",
+        "CN": "CN",
+        "HK": "HK",
+        "IN": "IN",
+        "JP": "JP",
+        "KR": "KR",
+        "NZ": "NZ",
+        "SG": "SG",
+        "TW": "TW",
+        "UK": "GB",
+        "ZA": "ZA",
+    }.get(suffix)
+
+
 def _fetch_official_page(url: str, max_redirects: int = 4) -> tuple[str, str]:
+    """Fetch a public candidate page; callers decide if its host is official."""
     current_url = url
     for _ in range(max_redirects + 1):
-        if not _edu_domain(current_url) or not is_public_http_url(current_url, resolve_dns=True):
+        if not is_public_http_url(current_url, resolve_dns=True):
             return "", ""
         response = requests.get(
             current_url,
@@ -180,13 +372,53 @@ def _fetch_official_page(url: str, max_redirects: int = 4) -> tuple[str, str]:
     return "", ""
 
 
+def _fetch_related_publication_text(url: str, max_links: int = 2) -> str:
+    """Read a bounded number of same-site Papers/Publications/CV links."""
+    if not is_public_http_url(url, resolve_dns=True):
+        return ""
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": "ScholarRadar/1.0 (faculty verification indexer)"},
+            timeout=8,
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+        if "text/html" not in response.headers.get("content-type", "").casefold():
+            return ""
+        soup = BeautifulSoup(response.text, "html.parser")
+    except (OSError, requests.RequestException):
+        return ""
+    source_host = _host_domain(url)
+    links: list[str] = []
+    for anchor in soup.find_all("a", href=True):
+        label = f"{anchor.get_text(' ', strip=True)} {anchor.get('href') or ''}"
+        if not re.search(r"\b(?:cv|papers?|publications?)\b", label, re.IGNORECASE):
+            continue
+        candidate_url = urljoin(url, str(anchor.get("href") or ""))
+        if _host_domain(candidate_url) != source_host or candidate_url in links:
+            continue
+        links.append(candidate_url)
+        if len(links) >= max_links:
+            break
+    texts: list[str] = []
+    for linked_url in links:
+        try:
+            text, _title = _fetch_official_page(linked_url)
+        except (OSError, requests.RequestException):
+            continue
+        if text:
+            texts.append(text)
+    return " ".join(texts)
+
+
 def _institution_name_from_title(title: str) -> str:
     """Extract a conservative institution name from an official root title."""
     for part in re.split(r"\s*(?:\||·|—|–)\s*", title):
         clean = " ".join(part.split()).strip(" -")
         if (
             4 <= len(clean) <= 100
-            and re.search(r"\b(?:university|college|institute of technology)\b", clean, re.I)
+            and INSTITUTION_NAME_PATTERN.search(_ascii_fold(clean))
             and not re.search(r"\b(?:department|school|faculty|admissions|home)\b", clean, re.I)
         ):
             return clean
@@ -197,27 +429,29 @@ def _institution_name_from_title(title: str) -> str:
 def _institution_for_domain(domain: str) -> str:
     if not domain:
         return ""
-    term = domain.split(".")[0].replace("-", " ")
-    try:
-        params: dict[str, object] = {"search": term, "per_page": 10}
-        email = setting("OPENALEX_EMAIL").strip()
-        if email:
-            params["mailto"] = email
-        api_key = setting("OPENALEX_API_KEY").strip()
-        if api_key:
-            params["api_key"] = api_key
-        response = requests.get(OPENALEX_INSTITUTIONS_URL, params=params, timeout=8)
-        response.raise_for_status()
-        for institution in response.json().get("results", []):
-            homepage_domain = _edu_domain(str(institution.get("homepage_url") or ""))
-            if (
-                homepage_domain == domain
-                and str(institution.get("type") or "").casefold() == "education"
-                and str(institution.get("country_code") or "").upper() == "US"
-            ):
-                return str(institution.get("display_name") or "").strip()
-    except (OSError, ValueError, requests.RequestException):
-        pass
+    if setting_bool("FACULTY_VERIFY_OPENALEX_SUPPORT_ENABLED", False):
+        term = domain.split(".")[0].replace("-", " ")
+        try:
+            params: dict[str, object] = {"search": term, "per_page": 10}
+            email = setting("OPENALEX_EMAIL").strip()
+            if email:
+                params["mailto"] = email
+            api_key = setting("OPENALEX_API_KEY").strip()
+            if api_key:
+                params["api_key"] = api_key
+            for institution in openalex_get_json(
+                OPENALEX_INSTITUTIONS_URL,
+                params=params,
+                timeout=8,
+            ).get("results", []):
+                homepage_domain = _edu_domain(str(institution.get("homepage_url") or ""))
+                if (
+                    homepage_domain == domain
+                    and str(institution.get("type") or "").casefold() == "education"
+                ):
+                    return str(institution.get("display_name") or "").strip()
+        except (OSError, ValueError, RuntimeError, OpenAlexUnavailable):
+            pass
     # OpenAlex and the works search share a public rate limit.  The official
     # university root page gives us a reliable fallback without maintaining a
     # fragile hand-written list of thousands of institutions.
@@ -238,19 +472,320 @@ def _extract_appointment_year(text: str) -> int | None:
     return None
 
 
+def _normalized_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _paper_identity_link(candidate: dict[str, Any], page_text: str, quote: str) -> bool:
+    """Require a DOI or a distinctive recent title to connect a moved scholar."""
+    searchable = _normalized_text(f"{page_text} {quote}")
+    for paper in list(candidate.get("recent_papers") or []):
+        doi = str(paper.get("doi") or "").strip().casefold()
+        if doi and doi in searchable:
+            return True
+        title_tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", str(paper.get("title") or "").casefold())
+            if len(token) > 3
+        ]
+        if len(title_tokens) < 4:
+            continue
+        present = sum(1 for token in set(title_tokens) if token in searchable)
+        if present / len(set(title_tokens)) >= 0.8:
+            return True
+    return False
+
+
+def _openalex_author_id(value: str) -> str:
+    return str(value or "").rstrip("/").rsplit("/", 1)[-1].upper()
+
+
+def _same_normalized_name(left: str, right: str) -> bool:
+    left_tokens = _name_tokens(left)
+    right_tokens = _name_tokens(right)
+    return bool(
+        left_tokens
+        and right_tokens
+        and (left_tokens == right_tokens or left_tokens == list(reversed(right_tokens)))
+    )
+
+
+@lru_cache(maxsize=1024)
+def _openalex_exact_name_profiles(
+    name: str,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return exact-name OpenAlex fragments and their known institutions.
+
+    OpenAlex sometimes splits one scholar into several author IDs as their
+    affiliation changes. These fragments are supporting evidence only; an
+    official university page is still required for a positive faculty decision.
+    """
+    if not setting_bool("FACULTY_VERIFY_OPENALEX_SUPPORT_ENABLED", False):
+        return ()
+    try:
+        params: dict[str, object] = {"search": name, "per_page": 25}
+        email = setting("OPENALEX_EMAIL").strip()
+        if email:
+            params["mailto"] = email
+        api_key = setting("OPENALEX_API_KEY").strip()
+        if api_key:
+            params["api_key"] = api_key
+        profiles: list[tuple[str, tuple[str, ...]]] = []
+        for author in openalex_get_json(
+            OPENALEX_AUTHORS_URL,
+            params=params,
+            timeout=8,
+        ).get("results", []):
+            if not _same_normalized_name(
+                name, str(author.get("display_name") or "")
+            ):
+                continue
+            institutions: list[str] = []
+            for institution in author.get("last_known_institutions") or []:
+                if str(institution.get("type") or "").casefold() != "education":
+                    continue
+                display_name = str(institution.get("display_name") or "").strip()
+                if display_name:
+                    institutions.append(display_name)
+            profiles.append(
+                (
+                    _openalex_author_id(str(author.get("id") or "")),
+                    tuple(dict.fromkeys(institutions)),
+                )
+            )
+        return tuple(profiles)
+    except (OSError, TypeError, ValueError, RuntimeError, OpenAlexUnavailable):
+        return ()
+
+
+def _openalex_move_corroborates(
+    candidate: dict[str, Any], observed_institution: str
+) -> bool:
+    """Link a rare-name OpenAlex fragment to a new official appointment."""
+    name = str(candidate.get("name") or "")
+    name_tokens = _name_tokens(name)
+    if len(name_tokens) < 2 or sum(map(len, name_tokens)) < 10:
+        return False
+    profiles = _openalex_exact_name_profiles(name)
+    maximum = setting_int("FACULTY_MOVE_MAX_EXACT_NAME_RECORDS", 8, 1, 25)
+    if not profiles or len(profiles) > maximum:
+        return False
+    candidate_id = _openalex_author_id(str(candidate.get("openalex_id") or ""))
+    if not candidate_id or candidate_id not in {row[0] for row in profiles}:
+        return False
+    institutions = [institution for _, values in profiles for institution in values]
+    claimed = str(candidate.get("institution_name") or "")
+    claimed_supported = any(
+        _institution_similarity(claimed, institution) >= 0.5
+        for institution in institutions
+    )
+    observed_supported = any(
+        _institution_similarity(observed_institution, institution) >= 0.5
+        for institution in institutions
+    )
+    return claimed_supported and observed_supported
+
+
+def _directory_role_after_name(name: str, context: str) -> re.Match[str] | None:
+    """Accept a tight `Name … Professor` row on an official directory page."""
+    tokens = _name_tokens(name)
+    if not tokens:
+        return None
+    name_pattern = re.compile(
+        r"\b" + r"[\W_]+".join(map(re.escape, tokens)) + r"\b",
+        re.IGNORECASE,
+    )
+    for name_match in name_pattern.finditer(_ascii_fold(context)):
+        after = context[name_match.end(): name_match.end() + 140]
+        role_match = FACULTY_TITLE_PATTERN.search(after)
+        if not role_match or role_match.start() > 90:
+            continue
+        bridge = after[: role_match.start()]
+        if re.search(
+            r"\b[A-Z][A-Za-z'’.-]{2,}\s+[A-Z][A-Za-z'’.-]{2,}\b",
+            bridge,
+        ):
+            continue
+        return role_match
+    return None
+
+
+def _is_current_faculty_listing(url: str, page_title: str) -> bool:
+    path = urlparse(url).path
+    if HISTORICAL_APPOINTMENT_URL_PATTERN.search(f"{path} {page_title}"):
+        return False
+    return bool(CURRENT_FACULTY_LISTING_PATTERN.search(f"{path} {page_title}"))
+
+
+def _institution_hints(name: str, results: list[dict[str, Any]]) -> list[str]:
+    """Extract employer clues from snippets without treating them as evidence."""
+    hints: list[str] = []
+    for result in results:
+        summary = " ".join(
+            str(result.get(key) or "") for key in ("title", "body")
+        )
+        if not _identity_matches(name, summary):
+            continue
+        for match in INSTITUTION_HINT_PATTERN.finditer(summary):
+            hint = " ".join(match.group(0).split()).strip(" ,.-")
+            if hint and hint not in hints:
+                hints.append(hint)
+    return hints
+
+
+def _verified_email_domain_hints(
+    name: str, results: list[dict[str, Any]]
+) -> list[str]:
+    """Use Google Scholar's verified-email label only to locate an official page."""
+    domains: list[str] = []
+    for result in results:
+        if _host_domain(str(result.get("href") or "")) != "scholar.google.com":
+            continue
+        summary = " ".join(
+            str(result.get(key) or "") for key in ("title", "body")
+        )
+        if not _identity_matches(name, summary):
+            continue
+        for match in VERIFIED_EMAIL_DOMAIN_PATTERN.finditer(summary):
+            domain = match.group(1).casefold().rstrip(".")
+            if domain not in domains:
+                domains.append(domain)
+    return domains
+
+
+def _profile_root_result(
+    name: str, result: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Turn an academic PDF below `/~person/` into the person's homepage lead."""
+    url = str(result.get("href") or "")
+    parsed = urlparse(url)
+    match = re.match(r"(?P<root>.*/~[^/]+/)", parsed.path)
+    if not match:
+        return None
+    root_url = f"{parsed.scheme}://{parsed.netloc}{match.group('root')}"
+    if root_url.rstrip("/") == url.rstrip("/"):
+        return None
+    return {
+        "title": name,
+        "body": str(result.get("body") or ""),
+        "href": root_url,
+    }
+
+
+def validate_ai_identity_assessment(
+    candidate: dict[str, Any],
+    pages: list[dict[str, Any]],
+    assessment: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Convert an AI extraction into a decision only after deterministic checks."""
+    if not assessment:
+        return None
+    decision = str(assessment.get("decision") or "").strip().upper()
+    if decision not in {"VERIFIED", "NOT_FACULTY", "CONFLICT", "UNVERIFIED"}:
+        return None
+    try:
+        confidence = float(assessment.get("confidence") or 0)
+    except (TypeError, ValueError):
+        return None
+    minimum = setting_int("GEMINI_IDENTITY_MIN_CONFIDENCE_PERCENT", 85, 50, 99) / 100
+    if confidence < minimum:
+        return None
+
+    selected_url = str(assessment.get("selected_source_url") or "").strip()
+    page = next(
+        (item for item in pages if str(item.get("source_url") or "") == selected_url),
+        None,
+    )
+    if not page or not _edu_domain(selected_url):
+        return None
+    page_text = str(page.get("_page_text") or "")
+    identity_quote = " ".join(
+        str(assessment.get("identity_evidence_quote") or "").split()
+    )
+    link_quote = " ".join(str(assessment.get("identity_link_quote") or "").split())
+    normalized_page = _normalized_text(page_text)
+    if (
+        not identity_quote
+        or _normalized_text(identity_quote) not in normalized_page
+        or not _identity_matches(str(candidate.get("name") or ""), identity_quote)
+    ):
+        return None
+    if link_quote and _normalized_text(link_quote) not in normalized_page:
+        return None
+
+    title = " ".join(str(assessment.get("observed_title") or "").split())
+    institution = " ".join(
+        str(assessment.get("observed_institution") or "").split()
+    ) or str(page.get("institution_name") or candidate.get("institution_name") or "")
+    common = {
+        "status": decision,
+        "title": title or None,
+        "source_url": selected_url,
+        "source_domain": _edu_domain(selected_url),
+        "institution_name": institution,
+        "evidence_text": (
+            f"AI-assisted evidence extraction: {str(assessment.get('reason') or '').strip()} "
+            f'Evidence: "{identity_quote}"'
+        )[:700],
+        "confidence": min(0.94, confidence),
+        "method": "gemini_assisted",
+        "model_name": str(assessment.get("model_name") or ""),
+        "prompt_version": int(assessment.get("prompt_version") or 0),
+        "page_title": str(page.get("page_title") or ""),
+        "_page_text": page_text,
+    }
+
+    if decision == "VERIFIED":
+        if (
+            not title
+            or _normalized_text(title) not in normalized_page
+            or _normalized_text(title) not in _normalized_text(identity_quote)
+            or not FACULTY_TITLE_PATTERN.search(title)
+            or NON_FACULTY_PATTERN.search(f"{title} {identity_quote}")
+        ):
+            return None
+        same_institution = _institution_continuity(
+            str(candidate.get("institution_name") or ""), institution, page_text
+        )
+        if not same_institution and not _paper_identity_link(candidate, page_text, link_quote):
+            # The model may suspect a career move, but an exact publication or
+            # DOI connection is required before making that decision public.
+            common["status"] = "CONFLICT"
+            common["evidence_text"] = (
+                "AI found a plausible faculty page, but ScholarRadar could not "
+                "connect it to the candidate using an institution, paper title, or DOI."
+            )
+            return common
+        appointment_year = _extract_appointment_year(page_text)
+        common["appointment_year"] = appointment_year
+        common["career_stage"] = "NEW_AP" if (
+            "assistant professor" in title.casefold()
+            and (appointment_year or NEW_FACULTY_PATTERN.search(page_text))
+        ) else None
+        return common
+
+    if decision == "NOT_FACULTY":
+        if not NON_FACULTY_PATTERN.search(f"{title} {identity_quote}"):
+            return None
+        return common
+    return common
+
+
 def inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     """Classify an exact-name individual profile on an official university page."""
     url = str(result.get("href") or "").strip()
-    domain = _edu_domain(url)
+    summary = " ".join(
+        str(result.get(key) or "") for key in ("title", "body", "href")
+    )
+    domain = _possible_official_domain(
+        url, str(candidate.get("institution_name") or ""), summary
+    )
     if (
         not domain
         or not is_public_http_url(url)
         or NON_PROFILE_URL_PATTERN.search(urlparse(url).path)
     ):
         return {"status": "UNVERIFIED"}
-    summary = " ".join(
-        str(result.get(key) or "") for key in ("title", "body", "href")
-    )
     if not _identity_matches(str(candidate["name"]), summary):
         return {"status": "UNVERIFIED"}
 
@@ -258,53 +793,214 @@ def inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) ->
         page_text, page_title = _fetch_official_page(url)
     except (OSError, requests.RequestException):
         page_text, page_title = "", ""
-    if not page_text or not _profile_title_matches(str(candidate["name"]), page_title):
+    if not page_text:
         return {"status": "UNVERIFIED"}
     context = _identity_context(str(candidate["name"]), f"{page_title} {page_text}")
     if not context or not _identity_matches(str(candidate["name"]), context):
         return {"status": "UNVERIFIED"}
     title_match = FACULTY_TITLE_PATTERN.search(context)
+    directory_title_match = (
+        _directory_role_after_name(str(candidate["name"]), context)
+        if _is_current_faculty_listing(url, page_title)
+        else None
+    )
+    if directory_title_match is not None:
+        title_match = directory_title_match
     negative_match = NON_FACULTY_PATTERN.search(context)
     institution = _institution_for_domain(domain)
+    # Non-standard international domains such as `ualberta.ca` are accepted
+    # only when the institution's root page confirms an academic organization
+    # whose name matches that host. A name-looking arbitrary domain is not
+    # sufficient evidence.
+    if not _edu_domain(url) and (
+        not institution or not _domain_matches_institution(url, institution)
+    ):
+        return {"status": "UNVERIFIED"}
     continuity = _institution_continuity(
         str(candidate.get("institution_name") or ""), institution, page_text
     )
-    research_continuity = _research_continuity(
-        str(candidate.get("research_domain") or ""), page_text
+    evidence_context = " ".join(context.split())[:700]
+    page_evidence = {
+        "source_url": url,
+        "source_domain": domain,
+        "institution_name": institution or str(candidate.get("institution_name") or ""),
+        "evidence_text": evidence_context,
+        "page_title": page_title,
+        "_page_text": page_text,
+    }
+    if NON_APPOINTMENT_ROLE_PATTERN.search(context):
+        return {
+            **page_evidence,
+            "status": "CONFLICT",
+            "title": " ".join(title_match.group(0).split()).title()
+                if title_match else None,
+            "confidence": 0.95,
+            "method": "official_non_appointment_page",
+            "evidence_text": (
+                "The university page identifies this person as a guest, event, "
+                "or invited speaker. A faculty title elsewhere in that biography "
+                "does not establish an appointment at the host university."
+            ),
+        }
+    # A person-specific profile title is required for the rule-only positive
+    # decision. The optional AI extractor may still inspect a supplied official
+    # directory page, but its output must pass stricter quotation/link checks.
+    profile_title_matches = _profile_title_matches(str(candidate["name"]), page_title)
+    role_is_person_specific = profile_title_matches or directory_title_match is not None
+    # Faculty identity and research relevance are deliberately independent.
+    # Sparse directory pages often omit research keywords, so absence of a
+    # query term must never turn a confirmed faculty identity into CONFLICT.
+    # Topic relevance is ranked from the candidate's matching publications.
+    move_corroborated = bool(
+        title_match
+        and not continuity
+        and role_is_person_specific
+        and _openalex_move_corroborates(candidate, page_evidence["institution_name"])
     )
-    if title_match and continuity and research_continuity:
+    paper_corroborated = bool(
+        title_match
+        and not continuity
+        and role_is_person_specific
+        and _paper_identity_link(candidate, page_text, "")
+    )
+    if title_match and role_is_person_specific and (
+        continuity or paper_corroborated or move_corroborated
+    ):
         appointment_year = _extract_appointment_year(context)
         return {
+            **page_evidence,
             "status": "VERIFIED",
             "title": " ".join(title_match.group(0).split()).title(),
-            "source_url": url,
-            "source_domain": domain,
-            "institution_name": institution or str(candidate.get("institution_name") or ""),
-            "evidence_text": " ".join(context.split())[:700],
-            "confidence": 0.97,
+            "confidence": 0.96 if paper_corroborated else (
+                0.94 if move_corroborated else 0.97
+            ),
+            "method": (
+                "official_directory_publication_link"
+                if paper_corroborated
+                else (
+                    "official_directory_openalex_history"
+                    if move_corroborated
+                    else "official_directory"
+                )
+            ),
+            "evidence_text": (
+                "A current official faculty listing contains a matching paper "
+                "title or DOI, linking this appointment to the OpenAlex author."
+                if paper_corroborated
+                else (
+                    "A current official faculty listing is corroborated by rare-name "
+                    "OpenAlex affiliation records at both the previous and current "
+                    "institutions."
+                    if move_corroborated
+                    else evidence_context
+                )
+            ),
             "appointment_year": appointment_year,
             "career_stage": "NEW_AP" if (
                 "assistant professor" in title_match.group(0).casefold()
                 and (appointment_year or NEW_FACULTY_PATTERN.search(context))
             ) else None,
         }
-    if title_match and continuity and not research_continuity:
+    if title_match and not role_is_person_specific:
         return {
-            "status": "CONFLICT",
-            "source_url": url,
-            "source_domain": domain,
-            "institution_name": institution or str(candidate.get("institution_name") or ""),
-            "evidence_text": "Official faculty page is for an unrelated research discipline.",
-            "confidence": 0.92,
+            **page_evidence,
+            "status": "UNVERIFIED",
+            "title": " ".join(title_match.group(0).split()).title(),
+            "confidence": 0.0,
+            "method": "automatic_search",
         }
-    if negative_match and not title_match:
+    if title_match and not continuity:
         return {
+            **page_evidence,
+            "status": "CONFLICT",
+            "title": " ".join(title_match.group(0).split()).title(),
+            "evidence_text": (
+                "The official faculty page does not match the candidate's "
+                "institution. This may be a different person with the same name."
+            ),
+            "confidence": 0.92,
+            "method": "official_directory",
+        }
+    if negative_match and not title_match and profile_title_matches and continuity:
+        return {
+            **page_evidence,
             "status": "NOT_FACULTY",
-            "source_url": url,
-            "source_domain": domain,
-            "institution_name": institution or str(candidate.get("institution_name") or ""),
-            "evidence_text": " ".join(context.split())[:700],
+            "title": " ".join(negative_match.group(0).split()).title(),
             "confidence": 0.90 if page_text else 0.78,
+            "method": "official_directory",
+        }
+    return {
+        **page_evidence,
+        "status": "UNVERIFIED",
+        "confidence": 0.0,
+        "method": "automatic_search",
+    }
+
+
+def inspect_researcher_profile_result(
+    candidate: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Use a discovered researcher page only when it contains a matching paper."""
+    url = str(result.get("href") or "").strip()
+    host = _host_domain(url)
+    if (
+        not host
+        or any(
+            host == blocked or host.endswith(f".{blocked}")
+            for blocked in PAPER_LINKED_PROFILE_BLOCKED_DOMAINS
+        )
+        or not is_public_http_url(url)
+    ):
+        return {"status": "UNVERIFIED"}
+    summary = " ".join(str(result.get(key) or "") for key in ("title", "body", "href"))
+    if not _identity_matches(str(candidate.get("name") or ""), summary):
+        return {"status": "UNVERIFIED"}
+    try:
+        page_text, page_title = _fetch_official_page(url)
+    except (OSError, requests.RequestException):
+        return {"status": "UNVERIFIED"}
+    name = str(candidate.get("name") or "")
+    if not page_text or not _profile_title_matches(name, page_title):
+        return {"status": "UNVERIFIED"}
+    context = _identity_context(name, f"{page_title} {page_text}")
+    title_match = FACULTY_TITLE_PATTERN.search(context)
+    negative_match = NON_FACULTY_PATTERN.search(context)
+    institution = str(candidate.get("institution_name") or "")
+    continuity = _institution_continuity(institution, "", page_text)
+    linked_text = _fetch_related_publication_text(url)
+    paper_linked = _paper_identity_link(candidate, f"{page_text} {linked_text}", "")
+    common = {
+        "source_url": url,
+        "source_domain": host,
+        "institution_name": institution,
+        "page_title": page_title,
+        "_page_text": page_text,
+    }
+    if title_match and continuity and paper_linked:
+        return {
+            **common,
+            "status": "VERIFIED",
+            "title": " ".join(title_match.group(0).split()).title(),
+            "confidence": 0.90,
+            "method": "researcher_profile_publication_link",
+            "evidence_text": (
+                "A researcher page found through the person's name and target university "
+                "states a current faculty role, and the page or its publications contains "
+                "a matching paper."
+            ),
+        }
+    if negative_match and not title_match and continuity and paper_linked:
+        return {
+            **common,
+            "status": "NOT_FACULTY",
+            "title": " ".join(negative_match.group(0).split()).title(),
+            "confidence": 0.85,
+            "method": "researcher_profile_publication_link",
+            "evidence_text": (
+                "A researcher page found through the person's name and target university "
+                "contains a matching paper but identifies the person as a student or "
+                "postdoctoral researcher."
+            ),
         }
     return {"status": "UNVERIFIED"}
 
@@ -312,52 +1008,270 @@ def inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) ->
 def verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     name = str(candidate["name"])
     institution = str(candidate.get("institution_name") or "").strip()
-    # Search the person's current role first. Publication affiliations can be
-    # several years old, so leading with the paper institution can hide a
-    # newly appointed professor at a different university.
-    queries = [
-        f'"{name}" faculty professor',
-        f'"{name}" "{institution}" professor faculty' if institution else "",
-    ]
+    # Use stored OpenAlex authorship metadata first. This makes no API request
+    # and downloads no paper.
+    candidate = enrich_candidate_metadata_affiliations(candidate, max_papers=3)
+    # Search the person's name with the target university. PDF extraction is a
+    # bounded fallback for unresolved or ambiguous identities.
+    institution_queries: list[str] = []
+    institution_domain = str(candidate.get("institution_domain") or "").strip()
+    if institution_domain:
+        institution_queries.append(f'site:{institution_domain} "{name}"')
+    if institution:
+        institution_queries.append(f'"{name}" "{institution}"')
+    institution_aliases = _institution_search_aliases(institution)
+    if institution_aliases:
+        institution_queries.append(f'"{name}" "{institution_aliases[0]}"')
+    institution_queries = list(dict.fromkeys(institution_queries))
     seen_urls: set[str] = set()
+    seen_queries: set[str] = set()
     negative: dict[str, Any] | None = None
-    for query in (value for value in queries if value):
+    ambiguous_pages: list[dict[str, Any]] = []
+    mismatch_pages: list[dict[str, Any]] = []
+    search_results: list[dict[str, Any]] = []
+    queries_checked = 0
+    pages_checked = 0
+    query_limit = setting_int("FACULTY_VERIFY_MAX_QUERIES", 5, 2, 6)
+    page_limit = setting_int("FACULTY_VERIFY_MAX_PAGES", 8, 3, 12)
+
+    def inspect_query(
+        query: str, *, allow_researcher_profile_with_paper: bool = False
+    ) -> dict[str, Any] | None:
+        nonlocal negative, queries_checked, pages_checked
+        if (
+            query in seen_queries
+            or queries_checked >= query_limit
+            or pages_checked >= page_limit
+        ):
+            return None
+        seen_queries.add(query)
+        queries_checked += 1
         try:
-            results = search_web(query, max_results=3)
+            results = search_web(
+                query,
+                max_results=setting_int(
+                    "FACULTY_VERIFY_RESULTS_PER_QUERY", 5, 3, 10
+                ),
+            )
+        except SearchUnavailable:
+            raise
         except Exception:
-            continue
+            return None
+        search_results.extend(results)
         for result in results:
             url = str(result.get("href") or "").strip()
-            if url in seen_urls:
+            if not url or url in seen_urls:
                 continue
+            if pages_checked >= page_limit:
+                break
             seen_urls.add(url)
+            result_title = str(result.get("title") or "")
+            result_summary = " ".join(
+                str(result.get(key) or "") for key in ("title", "body", "href")
+            )
+            # Name+paper searches are often dominated by publication records.
+            # They help identify the person, but are not current faculty pages
+            # and must not consume the entire profile-fetch budget.
+            if not _identity_matches(name, result_summary) or not (
+                _profile_title_matches(name, result_title)
+                or PROFILE_RESULT_PATTERN.search(urlparse(url).path)
+                or re.search(r"\bfaculty\b", result_summary, re.IGNORECASE)
+            ):
+                continue
+            pages_checked += 1
             inspected = inspect_faculty_result(candidate, result)
             if inspected.get("status") == "VERIFIED":
                 return inspected
-            if inspected.get("status") in {"NOT_FACULTY", "CONFLICT"} and negative is None:
+            if allow_researcher_profile_with_paper and not inspected.get("source_url"):
+                linked_profile = inspect_researcher_profile_result(candidate, result)
+                if linked_profile.get("status") in {"VERIFIED", "NOT_FACULTY"}:
+                    return linked_profile
+            if inspected.get("source_url") and inspected.get("_page_text"):
+                ambiguous_pages.append(inspected)
+            if inspected.get("status") == "CONFLICT":
+                mismatch_pages.append(inspected)
+            if inspected.get("status") == "NOT_FACULTY" and negative is None:
                 negative = inspected
-    return negative or {"status": "UNVERIFIED", "confidence": 0.0}
+        return None
+
+    for query in institution_queries:
+        verified = inspect_query(query)
+        if verified:
+            return verified
+
+    # The university lookup was insufficient. Inspect no more than three recent
+    # accessible papers to corroborate the stored affiliation, then retry with
+    # the name, target university, and exact supporting paper.
+    candidate = enrich_candidate_paper_affiliations(candidate, max_papers=3)
+    paper_evidence = list(candidate.get("paper_affiliations") or [])
+    paper_identity_confirmed = any(
+        str(evidence.get("status") or "") == "MATCHED"
+        for evidence in paper_evidence
+    )
+    paper_institutions = list(dict.fromkeys(
+        str(evidence.get("institution_name") or "").strip()
+        for evidence in paper_evidence
+        if str(evidence.get("status") or "") == "MATCHED"
+        and str(evidence.get("institution_name") or "").strip()
+    ))
+    if not institution and paper_institutions:
+        institution = paper_institutions[0]
+        candidate["institution_name"] = institution
+
+    paper_queries: list[str] = [
+        f'"{name}" "{paper_institution}"'
+        for paper_institution in paper_institutions
+    ]
+    for evidence in paper_evidence:
+        email = str(evidence.get("email") or "").strip()
+        if "@" in email:
+            domain = email.rsplit("@", 1)[-1].casefold()
+            if domain:
+                paper_queries.append(f'site:{domain} "{name}"')
+    for paper in list(candidate.get("recent_papers") or [])[:3]:
+        title = str(paper.get("title") or "").strip()
+        if title:
+            if institution:
+                paper_queries.append(f'"{name}" "{institution}" "{title[:180]}"')
+            else:
+                paper_queries.append(f'"{name}" "{title[:180]}"')
+            continue
+        doi = str(paper.get("doi") or "").strip()
+        if doi:
+            bare_doi = re.sub(
+                r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.I
+            )
+            if institution:
+                paper_queries.append(f'"{name}" "{institution}" "{bare_doi}"')
+            else:
+                paper_queries.append(f'"{name}" "{bare_doi}"')
+    for query in dict.fromkeys(paper_queries):
+        verified = inspect_query(query, allow_researcher_profile_with_paper=True)
+        if verified:
+            return verified
+
+
+    # Google Scholar can be stale and user-edited, so it never proves a role.
+    # Its verified-email domain is useful as a search locator: the resulting
+    # university page must still pass all deterministic title/identity checks.
+    for domain in _verified_email_domain_hints(name, search_results)[:1]:
+        verified = inspect_query(f'site:{domain} "{name}" professor')
+        if verified:
+            return verified
+
+    # An explicit official student/postdoc result is already a strong rule-based
+    # decision. Spend AI quota only on unresolved pages or identity conflicts.
+    if negative and negative.get("status") == "NOT_FACULTY":
+        return negative
+    assessment = assess_identity_with_gemini(candidate, ambiguous_pages)
+    validated = validate_ai_identity_assessment(candidate, ambiguous_pages, assessment)
+    if validated and validated.get("status") in {"VERIFIED", "NOT_FACULTY"}:
+        return validated
+
+    # A single different-university page is usually a search miss or a
+    # namesake, not a task for staff. Escalate only when multiple official
+    # domains contain plausible faculty profiles for the same person name.
+    conflict_domains = {
+        str(page.get("source_domain") or "")
+        for page in mismatch_pages
+        if page.get("source_domain")
+    }
+    if mismatch_pages and paper_identity_confirmed:
+        conflict = mismatch_pages[0]
+        conflict["status"] = "CONFLICT"
+        conflict["confidence"] = 0.0
+        conflict["method"] = "paper_affiliation_institution_conflict"
+        conflict["evidence_text"] = (
+            "A paper confirms the candidate's imported university affiliation, "
+            "but an exact-name official faculty page points to a different university. "
+            "This may be a recent move or a different person with the same name."
+        )
+        return conflict
+    if len(conflict_domains) >= 2:
+        conflict = mismatch_pages[0]
+        conflict["evidence_text"] = (
+            "Multiple official universities list a faculty member with this name, "
+            "and the available publication or affiliation evidence cannot select "
+            "one identity safely."
+        )
+        conflict["alternative_evidence"] = [
+            {
+                key: page.get(key)
+                for key in (
+                    "status",
+                    "title",
+                    "source_url",
+                    "source_domain",
+                    "institution_name",
+                    "evidence_text",
+                    "confidence",
+                    "method",
+                )
+            }
+            for page in mismatch_pages
+            if page.get("source_url")
+        ]
+        return conflict
+    unresolved = mismatch_pages or ambiguous_pages
+    if unresolved:
+        best = unresolved[0]
+        return {
+            **best,
+            "status": "UNVERIFIED",
+            "confidence": 0.0,
+            "method": "automatic_search",
+            "evidence_text": (
+                "A possible official page was found, but the current evidence does "
+                "not safely connect it to this OpenAlex author."
+            ),
+        }
+    return {
+        "status": "UNVERIFIED",
+        "confidence": 0.0,
+        "method": "automatic_search",
+    }
 
 
 def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
     professor_id = int(candidate["id"])
     status = str(result.get("status") or "UNVERIFIED")
+    if status == "SEARCH_UNAVAILABLE":
+        raise ValueError("A provider outage cannot be saved as an identity decision.")
+    method = str(result.get("method") or (
+        "official_directory" if result.get("source_url") else "automatic_search"
+    ))
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             institution_name = str(result.get("institution_name") or candidate["institution_name"])
+            country_code = (
+                str(result.get("country_code") or "").upper()
+                or _country_code_for_domain(str(result.get("source_domain") or ""))
+            )
             institution_id = candidate.get("institution_id")
             if status == "VERIFIED" and institution_name:
                 cursor.execute(
                     """
                     INSERT INTO institutions (name, country_code)
-                    VALUES (%s, 'US')
+                    VALUES (%s, %s)
                     ON CONFLICT (name) DO UPDATE
-                    SET country_code = COALESCE(institutions.country_code, 'US')
+                    SET country_code = COALESCE(
+                        EXCLUDED.country_code, institutions.country_code
+                    )
                     RETURNING id
                     """,
-                    (institution_name,),
+                    (institution_name, country_code),
                 )
                 institution_id = cursor.fetchone()["id"]
+                source_domain = str(result.get("source_domain") or "").strip()
+                if source_domain:
+                    cursor.execute(
+                        """
+                        UPDATE institutions
+                        SET primary_domain = COALESCE(primary_domain, %s)
+                        WHERE id = %s
+                        """,
+                        (source_domain, institution_id),
+                    )
             cursor.execute(
                 """
                 UPDATE professors
@@ -376,11 +1290,7 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                         WHEN faculty_verification_method = 'official_directory' THEN NULL
                         ELSE faculty_source_url
                     END,
-                    faculty_verification_method = CASE
-                        WHEN %s = 'VERIFIED' THEN 'official_directory'
-                        WHEN faculty_verification_method = 'official_directory' THEN NULL
-                        ELSE faculty_verification_method
-                    END,
+                    faculty_verification_method = %s,
                     faculty_verification_version = %s,
                     faculty_confidence = %s,
                     faculty_checked_at = NOW(),
@@ -415,7 +1325,7 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     status, status,
                     status, result.get("title"),
                     status, result.get("source_url"),
-                    status,
+                    method,
                     FACULTY_VERIFICATION_VERSION,
                     float(result.get("confidence") or 0),
                     status,
@@ -430,31 +1340,53 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     professor_id,
                 ),
             )
-            if result.get("source_url"):
+            evidence_results = [result, *list(result.get("alternative_evidence") or [])]
+            saved_urls: set[str] = set()
+            for evidence_result in evidence_results:
+                source_url = str(evidence_result.get("source_url") or "").strip()
+                if not source_url or source_url in saved_urls:
+                    continue
+                saved_urls.add(source_url)
+                evidence_status = str(evidence_result.get("status") or status)
+                evidence_method = str(
+                    evidence_result.get("method") or method
+                )
+                evidence_institution = str(
+                    evidence_result.get("institution_name") or institution_name
+                )
                 cursor.execute(
                     """
                     INSERT INTO faculty_verification_evidence (
                         professor_id, source_url, source_domain, observed_title,
                         observed_institution, evidence_text, verification_status,
-                        confidence, checked_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        confidence, decision_method, model_name, prompt_version,
+                        checked_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    )
                     ON CONFLICT (professor_id, source_url) DO UPDATE
                     SET observed_title = EXCLUDED.observed_title,
                         observed_institution = EXCLUDED.observed_institution,
                         evidence_text = EXCLUDED.evidence_text,
                         verification_status = EXCLUDED.verification_status,
                         confidence = EXCLUDED.confidence,
+                        decision_method = EXCLUDED.decision_method,
+                        model_name = EXCLUDED.model_name,
+                        prompt_version = EXCLUDED.prompt_version,
                         checked_at = NOW()
                     """,
                     (
                         professor_id,
-                        result["source_url"],
-                        result.get("source_domain") or "",
-                        result.get("title"),
-                        institution_name,
-                        result.get("evidence_text"),
-                        status,
-                        float(result.get("confidence") or 0),
+                        source_url,
+                        evidence_result.get("source_domain") or "",
+                        evidence_result.get("title"),
+                        evidence_institution,
+                        evidence_result.get("evidence_text"),
+                        evidence_status,
+                        float(evidence_result.get("confidence") or 0),
+                        evidence_method,
+                        evidence_result.get("model_name"),
+                        evidence_result.get("prompt_version"),
                     ),
                 )
 
@@ -473,16 +1405,58 @@ def verify_faculty_candidates(
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, name, institution_id, institution_name, homepage_url,
-                       research_domain, faculty_status, faculty_checked_at,
-                       next_identity_check_at,
-                       faculty_verification_method, faculty_verification_version
-                FROM professors
-                WHERE id = ANY(%s)
+                SELECT professor.id, professor.openalex_id, professor.name,
+                       professor.institution_id, professor.institution_name,
+                       professor.homepage_url, professor.research_domain,
+                       professor.faculty_status, professor.faculty_checked_at,
+                       professor.next_identity_check_at,
+                       professor.faculty_verification_method,
+                       professor.faculty_verification_version,
+                       institution.primary_domain AS institution_domain
+                FROM professors professor
+                LEFT JOIN institutions institution
+                  ON institution.id = professor.institution_id
+                WHERE professor.id = ANY(%s)
                 """,
                 (ordered_ids,),
             )
             by_id = {int(row["id"]): row for row in cursor.fetchall()}
+            cursor.execute(
+                """
+                SELECT ranked.professor_id, ranked.paper_id, ranked.openalex_id,
+                       ranked.title, ranked.publication_year, ranked.doi,
+                       ranked.pdf_url, ranked.author_position,
+                       ranked.raw_affiliation_text, ranked.affiliation_status,
+                       ranked.affiliation_text, ranked.affiliation_source_url,
+                       ranked.affiliation_institution, ranked.affiliation_email,
+                       ranked.affiliation_checked_at
+                FROM (
+                    SELECT pp.professor_id, paper.id AS paper_id,
+                           paper.openalex_id, paper.title, paper.publication_year,
+                           paper.doi, paper.pdf_url, pp.author_position,
+                           pp.raw_affiliation_text, pp.affiliation_status,
+                           pp.affiliation_text, pp.affiliation_source_url,
+                           pp.affiliation_institution, pp.affiliation_email,
+                           pp.affiliation_checked_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY pp.professor_id
+                               ORDER BY paper.publication_year DESC NULLS LAST,
+                                        paper.citation_count DESC
+                           ) AS position
+                    FROM professor_papers pp
+                    JOIN papers paper ON paper.id = pp.paper_id
+                    WHERE pp.professor_id = ANY(%s)
+                ) ranked
+                WHERE ranked.position <= 5
+                ORDER BY ranked.professor_id, ranked.position
+                """,
+                (ordered_ids,),
+            )
+            papers_by_professor: dict[int, list[dict[str, Any]]] = {}
+            for paper in cursor.fetchall():
+                papers_by_professor.setdefault(int(paper["professor_id"]), []).append(paper)
+            for professor_id, candidate in by_id.items():
+                candidate["recent_papers"] = papers_by_professor.get(professor_id, [])
 
     verified_ids: list[int] = []
     pending: list[dict[str, Any]] = []
@@ -531,6 +1505,7 @@ def verify_faculty_candidates(
 
     workers = setting_int("FACULTY_VERIFY_MAX_WORKERS", 3, 1, 6)
     checked = 0
+    failures: list[BaseException] = []
     with ThreadPoolExecutor(max_workers=min(workers, max(1, len(pending)))) as executor:
         futures = {executor.submit(verify_faculty_candidate, candidate): candidate for candidate in pending}
         for future in as_completed(futures):
@@ -538,11 +1513,31 @@ def verify_faculty_candidates(
             checked += 1
             try:
                 result = future.result()
-            except Exception:
-                result = {"status": "UNVERIFIED", "confidence": 0.0}
+            except Exception as error:
+                # A network outage or unexpected verifier error is not evidence
+                # about this person's identity. Leave the professor unchanged
+                # so the durable job can retry later.
+                failures.append(error)
+                continue
             _save_result(candidate, result)
             if result.get("status") == "VERIFIED":
                 verified_ids.append(int(candidate["id"]))
+
+    if failures:
+        retry_after = max(
+            int(getattr(error, "retry_after_seconds", 60))
+            for error in failures
+        )
+        if any(isinstance(error, SearchUnavailable) for error in failures):
+            raise SearchUnavailable(
+                f"Search providers were unavailable for {len(failures)} "
+                "faculty candidate(s); no identity decisions were saved for them.",
+                retry_after_seconds=retry_after,
+            )
+        raise RuntimeError(
+            f"Faculty verification failed for {len(failures)} candidate(s); "
+            "their identity decisions were left unchanged."
+        )
 
     verified_set = set(verified_ids)
     verified_ids = [value for value in ordered_ids if value in verified_set]

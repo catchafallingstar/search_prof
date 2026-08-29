@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from db import get_db_connection
 from ingestion.homepagefinder import is_public_http_url
 from ingestion.matchers import clean_and_extract_hiring_quote
-from ingestion.websearch import search_web
+from ingestion.websearch import SearchUnavailable, search_web
 from settings import setting_int
 
 
@@ -64,6 +64,10 @@ def discover_hiring_first_leads(
     for query in queries:
         try:
             results = search_web(query, max_results=per_query)
+        except SearchUnavailable:
+            # Missing providers must pause the indexing job. They must not be
+            # interpreted as an empty hiring search.
+            raise
         except Exception:
             continue
         for result in results:

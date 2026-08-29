@@ -19,5 +19,17 @@ services:
       timeout: 5s
       retries: 30
 
+  # Private local metasearch service used only by the background worker. The
+  # host binding keeps its JSON API inaccessible from other computers.
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-8080}:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8080}/
+
 volumes:
   scholarradar_postgres_data:

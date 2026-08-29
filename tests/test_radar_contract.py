@@ -1,7 +1,13 @@
 import unittest
 from pathlib import Path
 
-from ingestion.fetch_prof import _probable_pi_authorships, _work_matches_query
+from ingestion.fetch_prof import (
+    _best_work_match,
+    _education_institution,
+    _probable_pi_authorships,
+    _work_matches_query,
+    _work_relevance_score,
+)
 from ingestion.taxonomy import build_search_queries
 
 
@@ -33,12 +39,53 @@ class RadarContractTests(unittest.TestCase):
         work = {"title": "Red-Teaming for Generative AI"}
         self.assertTrue(_work_matches_query(work, "AI security"))
 
-    def test_discovered_signal_requires_moderation(self) -> None:
+    def test_broad_openalex_topic_alone_does_not_prove_paper_relevance(self) -> None:
+        work = {
+            "title": "A survey on large language model security and privacy",
+            "topics": [{"display_name": "Law and Political Science"}],
+        }
+        self.assertFalse(_work_matches_query(work, "Political science"))
+
+    def test_abstract_can_supply_direct_research_evidence(self) -> None:
+        work = {
+            "title": "Voter participation across regions",
+            "abstract_inverted_index": {
+                "This": [0],
+                "political": [1],
+                "science": [2],
+                "study": [3],
+            },
+        }
+        self.assertGreaterEqual(
+            _work_relevance_score(work, "Political science"), 5.0
+        )
+
+    def test_best_work_match_records_the_query_that_explains_the_match(self) -> None:
+        work = {"title": "Security of Artificial Intelligence Systems"}
+        score, matched_query = _best_work_match(
+            work, ["robotics", "AI security"]
+        )
+        self.assertGreaterEqual(score, 5.0)
+        self.assertEqual(matched_query, "AI security")
+
+    def test_international_educational_affiliation_is_a_candidate(self) -> None:
+        institution = _education_institution({
+            "institutions": [{
+                "display_name": "Shandong University",
+                "country_code": "CN",
+                "type": "education",
+            }]
+        })
+        self.assertIsNotNone(institution)
+        self.assertEqual(institution["country_code"], "CN")
+
+    def test_discovered_signal_is_not_turned_into_a_submitted_opportunity(self) -> None:
         source = (PROJECT_DIR / "ingestion" / "parse_hiring_signals.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("'pending', NULL, NOW() + INTERVAL '120 days'", source)
-        self.assertNotIn("'active', NOW(), NOW() + INTERVAL '120 days'", source)
+        self.assertIn("INSERT INTO hiring_signals", source)
+        self.assertNotIn("INSERT INTO opportunities", source)
+        self.assertIn("attribution_status", source)
 
     def test_discovery_keeps_first_corresponding_and_senior_authors(self) -> None:
         authorships = [
@@ -70,6 +117,14 @@ class RadarContractTests(unittest.TestCase):
         self.assertIn("target_professors * 6", source)
         self.assertIn("candidate_budget = min(600", source)
         self.assertIn('"candidates_ranked": len(ranked_prospects)', source)
+        self.assertNotIn("institutions.country_code:us", source)
+
+    def test_topic_and_text_sources_share_the_paper_relevance_gate(self) -> None:
+        source = (PROJECT_DIR / "ingestion" / "fetch_prof.py").read_text(encoding="utf-8")
+        self.assertIn("for query in search_queries", source)
+        self.assertIn('work["_scholarradar_relevance"]', source)
+        self.assertIn('work["_scholarradar_matched_query"]', source)
+        self.assertIn('"supporting_papers": []', source)
 
     def test_publication_affiliation_cannot_overwrite_safe_current_appointment(self) -> None:
         source = (PROJECT_DIR / "ingestion" / "fetch_prof.py").read_text(encoding="utf-8")

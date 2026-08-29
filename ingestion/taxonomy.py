@@ -2,7 +2,7 @@ import re
 from itertools import product
 from typing import Any
 
-import requests
+from ingestion.openalex_client import OpenAlexUnavailable, openalex_get_json
 from settings import setting
 
 AGENCY_MATRIX = {
@@ -59,6 +59,42 @@ COMPOUND_QUERY_EXPANSIONS: dict[frozenset[str], list[str]] = {
         "adversarial machine learning",
         "network intrusion detection",
         "privacy preserving machine learning",
+    ],
+    # Common degree/program shorthand is often absent from paper titles and
+    # OpenAlex topic names. Expand it into the vocabulary researchers use.
+    frozenset({"biomed"}): [
+        "biomedical engineering",
+        "biomedical sciences",
+        "biomedical research",
+        "biomedicine",
+    ],
+    frozenset({"bio", "med"}): [
+        "biomedical engineering",
+        "biomedical sciences",
+        "biomedical research",
+        "biomedicine",
+    ],
+    frozenset({"biomedical"}): [
+        "biomedical engineering",
+        "biomedical sciences",
+        "biomedical research",
+        "biomedicine",
+    ],
+    # Broad and interdisciplinary fields need the vocabulary that normally
+    # appears in paper titles and abstracts. The paper-level relevance gate
+    # still decides whether each returned work is kept.
+    frozenset({"political", "science"}): [
+        "political behavior",
+        "political institutions",
+        "comparative politics",
+        "international relations",
+        "public policy",
+    ],
+    frozenset({"asian", "studies"}): [
+        "East Asian studies",
+        "Asian history",
+        "Asian politics",
+        "Asian culture",
     ],
 }
 
@@ -201,9 +237,11 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
         params["api_key"] = api_key
 
     try:
-        response = requests.get(OPENALEX_TOPICS_URL, params=params, timeout=10)
-        response.raise_for_status()
-        results = response.json().get("results", [])
+        results = openalex_get_json(
+            OPENALEX_TOPICS_URL,
+            params=params,
+            timeout=10,
+        ).get("results", [])
         if not results:
             return fallback
         ranked = sorted(
@@ -233,6 +271,8 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
             "agency_category": category,
             "router_config": AGENCY_MATRIX[category],
         }
-    except requests.RequestException as error:
-        print(f"OpenAlex taxonomy lookup failed: {error}")
+    except OpenAlexUnavailable:
+        raise
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        print(f"OpenAlex taxonomy lookup failed: {type(error).__name__}")
         return fallback

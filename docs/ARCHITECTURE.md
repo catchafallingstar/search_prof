@@ -136,6 +136,7 @@ scripts/run_worker.py
        -> CHECK_GRANTS: NSF evidence, independently cached
        -> CHECK_HIRING: official/public evidence, independently cached
   -> radar_topic_professors shared topic index
+  -> radar_topic_professor_papers exact papers supporting each match
 ```
 
 Jobs survive worker restarts, retry with backoff, and release stale locks. Faculty
@@ -166,6 +167,9 @@ invents a GPA policy.
 - `hiring_signals`: time-bounded public web/social hiring text.
 - `radar_topics`: one shared normalized research-area index and its coverage.
 - `radar_topic_professors`: research evidence and rank linking a topic to professors.
+- `radar_topic_professor_papers`: exact papers and matched search phrases supporting
+  each current or historical topic/professor relationship. This is separate from
+  a professor's general publication history.
 - `radar_jobs`: durable, deduplicated discovery, verification, and enrichment work.
 - `radar_worker_heartbeats`: worker health and current-job diagnostics.
 
@@ -207,7 +211,9 @@ The numeric prefixes control Streamlit's page order. The custom navigation in `u
 
 - `ingestion/__init__.py`: marks the folder as an importable Python package.
 - `ingestion/taxonomy.py`: maps a research query to OpenAlex topic/field metadata.
-- `ingestion/fetch_prof.py`: downloads relevant OpenAlex works, selects probable principal investigators, and saves professor/paper relationships.
+- `ingestion/fetch_prof.py`: downloads relevant OpenAlex works, selects probable
+  principal investigators, and records both the general professor/paper link and
+  the exact search phrase that made each paper support a topic match.
 - `ingestion/check_grants.py`: checks NSF award data, matches researchers/institutions, de-duplicates grants, and saves funding evidence.
 - `ingestion/homepagefinder.py`: finds likely faculty homepages and blocks unsafe/private-network URLs before fetching them.
 - `ingestion/socialradar.py`: checks public social/search sources for possible hiring text, with throttling and identity matching.

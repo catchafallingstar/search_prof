@@ -12,6 +12,8 @@ class StartupContractTests(unittest.TestCase):
         self.assertIn(".venv/bin/python -m scripts.run_worker", launcher)
         self.assertIn(".venv/bin/python -m streamlit run app.py", launcher)
         self.assertIn("trap cleanup EXIT INT TERM", launcher)
+        self.assertIn("flock -n 9", launcher)
+        self.assertIn("ScholarRadar is already running", launcher)
         self.assertNotIn("exec streamlit run app.py", launcher)
 
 
