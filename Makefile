@@ -3,7 +3,7 @@
 help:
 	@echo "ScholarRadar local commands"
 	@echo "  make setup    Install Python packages, start PostgreSQL, apply schema, create owner, test"
-	@echo "  make start    Start PostgreSQL, SearXNG, the radar worker, and Streamlit"
+	@echo "  make start    Start PostgreSQL, the worker, Streamlit (SearXNG only when enabled)"
 	@echo "  make worker   Run a standalone worker (do not combine with make start locally)"
 	@echo "  make rebuild-topics  Queue outdated topics for exact-evidence rebuilding"
 	@echo "  make topic-status    Show version and exact-evidence rebuild progress"
@@ -15,7 +15,7 @@ help:
 	@echo "  make db-down  Stop local PostgreSQL without deleting its data"
 	@echo "  make search-up    Start the private local SearXNG service"
 	@echo "  make search-logs  Inspect SearXNG logs"
-	@echo "  make search-test  Test the local SearXNG JSON API"
+	@echo "  make search-test  Check the configured search provider (uses a search slot)"
 	@echo "  make schema   Reapply the idempotent database schema"
 	@echo "  make backup   Create a private timestamped local PostgreSQL backup"
 	@echo "  make owner    Make DEV_USER_EMAIL the one site owner"

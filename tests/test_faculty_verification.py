@@ -23,6 +23,12 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 
 
 class FacultyVerificationTests(unittest.TestCase):
+    def setUp(self):
+        # These unit tests exercise identity rules, never live DOI discovery.
+        locator = patch('ingestion.paper_affiliations._pdf_url_from_doi', return_value='')
+        locator.start()
+        self.addCleanup(locator.stop)
+
     @patch("ingestion.verify_faculty._fetch_official_page")
     @patch("ingestion.verify_faculty.openalex_get_json")
     @patch("ingestion.verify_faculty.setting_bool", return_value=False)
@@ -51,7 +57,7 @@ class FacultyVerificationTests(unittest.TestCase):
 
     @patch("ingestion.verify_faculty._institution_for_domain", return_value="University of Arizona")
     @patch("ingestion.verify_faculty._fetch_official_page")
-    def test_official_faculty_page_verifies_new_assistant_professor(
+    def test_new_assistant_professor_move_requires_review(
         self, fetch_page, _institution
     ) -> None:
         fetch_page.return_value = (
@@ -67,7 +73,7 @@ class FacultyVerificationTests(unittest.TestCase):
                 "href": "https://ece.engineering.arizona.edu/faculty-staff/faculty/jingdi-chen",
             },
         )
-        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(result["status"], "CONFLICT")
         self.assertEqual(result["institution_name"], "University of Arizona")
         self.assertIn("Assistant Professor", result["title"])
 
@@ -130,7 +136,7 @@ class FacultyVerificationTests(unittest.TestCase):
 
     @patch("ingestion.verify_faculty._institution_for_domain", return_value="Hong Kong Polytechnic University")
     @patch("ingestion.verify_faculty._fetch_official_page")
-    def test_one_leading_given_name_can_match_current_official_profile(
+    def test_unproven_leading_given_name_needs_identity_corroboration(
         self, fetch_page, _institution
     ) -> None:
         fetch_page.return_value = (
@@ -145,7 +151,9 @@ class FacultyVerificationTests(unittest.TestCase):
                 "href": "https://www4.comp.polyu.edu.hk/~csxluo/",
             },
         )
-        self.assertEqual(result["status"], "VERIFIED")
+        # An extra first name could be an alias, but name overlap alone does
+        # not establish that. Do not accept arbitrary longer names as matches.
+        self.assertEqual(result["status"], "UNVERIFIED")
 
     @patch("ingestion.verify_faculty._institution_for_domain", return_value="Rowan University")
     @patch("ingestion.verify_faculty._fetch_official_page")
@@ -246,8 +254,8 @@ class FacultyVerificationTests(unittest.TestCase):
                 "href": "https://faculty.sdu.edu.cn/yue-zhang",
             },
         )
-        self.assertEqual(result["status"], "VERIFIED")
-        self.assertEqual(result["method"], "official_directory_publication_link")
+        self.assertEqual(result["status"], "CONFLICT")
+        self.assertEqual(result["method"], "institution_mismatch_review")
 
     def test_common_international_academic_domains_are_recognized(self) -> None:
         self.assertEqual(_edu_domain("https://faculty.sdu.edu.cn/yue"), "sdu.edu.cn")
@@ -277,6 +285,7 @@ class FacultyVerificationTests(unittest.TestCase):
         self.assertNotIn("10.1016/j.hcc.2024.100211", " ".join(queries))
         self.assertNotIn('"Yue Zhang" faculty professor', queries)
 
+    @patch.dict('os.environ', {'FACULTY_IDENTITY_PASS_PAGES': '10', 'FACULTY_IDENTITY_PASS_QUERIES': '4'})
     @patch("ingestion.verify_faculty.assess_identity_with_gemini", return_value=None)
     @patch("ingestion.verify_faculty.inspect_faculty_result")
     @patch("ingestion.verify_faculty.search_web")
@@ -304,7 +313,7 @@ class FacultyVerificationTests(unittest.TestCase):
             }],
         })
         self.assertLessEqual(search_web.call_count, 4)
-        self.assertEqual(inspect_result.call_count, 8)
+        self.assertEqual(inspect_result.call_count, 10)
 
     def test_nonstandard_international_domain_matches_its_institution(self) -> None:
         self.assertTrue(
@@ -368,7 +377,7 @@ class FacultyVerificationTests(unittest.TestCase):
                     "body": "Professor at Hong Kong Polytechnic University",
                     "href": "https://www4.comp.polyu.edu.hk/~csxluo/",
                 }]
-            if "Systematic Literature Review" in query:
+            if query == '"Xiapu Luo" "Hong Kong Polytechnic University"':
                 return [{
                     "title": "Xiapu Luo - Google Scholar",
                     "body": "Xiapu Luo. The Hong Kong Polytechnic University. Verified email at comp.polyu.edu.hk",
@@ -521,7 +530,7 @@ class FacultyVerificationTests(unittest.TestCase):
     @patch("ingestion.verify_faculty.enrich_candidate_paper_affiliations")
     @patch("ingestion.verify_faculty.enrich_candidate_metadata_affiliations")
     @patch("ingestion.verify_faculty.search_web")
-    def test_metadata_and_university_search_precede_pdf_fallback(
+    def test_metadata_and_pdf_evidence_precede_search_fallback(
         self, search_web, metadata, pdf_fallback, _gemini
     ) -> None:
         events: list[str] = []
@@ -548,7 +557,7 @@ class FacultyVerificationTests(unittest.TestCase):
         })
         self.assertEqual(result["status"], "UNVERIFIED")
         self.assertEqual(events[0], "metadata")
-        self.assertLess(events.index("search"), events.index("pdf"))
+        self.assertLess(events.index("pdf"), events.index("search"))
 
     @patch("ingestion.verify_faculty.assess_identity_with_gemini", return_value=None)
     @patch("ingestion.verify_faculty.enrich_candidate_paper_affiliations")
@@ -586,14 +595,14 @@ class FacultyVerificationTests(unittest.TestCase):
         }
         result = verify_faculty_candidate(candidate)
         self.assertEqual(result["status"], "CONFLICT")
-        self.assertEqual(result["method"], "paper_affiliation_institution_conflict")
+        self.assertEqual(result["method"], "institution_mismatch_review")
 
     @patch("ingestion.verify_faculty.assess_identity_with_gemini", return_value=None)
     @patch("ingestion.verify_faculty._openalex_move_corroborates", return_value=False)
     @patch("ingestion.verify_faculty._institution_for_domain", return_value="Stanford University")
     @patch("ingestion.verify_faculty._fetch_official_page")
     @patch("ingestion.verify_faculty.search_web")
-    def test_one_unlinked_namesake_does_not_create_staff_conflict(
+    def test_one_different_university_profile_requires_review(
         self, search_web, fetch_page, _institution, _move, _gemini
     ) -> None:
         search_web.return_value = [{
@@ -611,15 +620,15 @@ class FacultyVerificationTests(unittest.TestCase):
             "institution_name": "University of Arizona",
             "recent_papers": [],
         })
-        self.assertEqual(result["status"], "UNVERIFIED")
-        self.assertIn("does not safely connect", result["evidence_text"])
+        self.assertEqual(result["status"], "CONFLICT")
+        self.assertIn("staff review is required", result["evidence_text"])
 
     @patch("ingestion.verify_faculty.assess_identity_with_gemini", return_value=None)
     @patch("ingestion.verify_faculty._openalex_move_corroborates", return_value=False)
     @patch("ingestion.verify_faculty._institution_for_domain")
     @patch("ingestion.verify_faculty._fetch_official_page")
     @patch("ingestion.verify_faculty.search_web")
-    def test_multiple_namesakes_are_returned_as_moderator_evidence(
+    def test_namesake_links_are_retained_but_stop_on_first_decisive_conflict(
         self, search_web, fetch_page, institution, _move, _gemini
     ) -> None:
         search_web.return_value = [
@@ -664,11 +673,13 @@ class FacultyVerificationTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "CONFLICT")
         alternatives = result["alternative_evidence"]
-        self.assertEqual(len(alternatives), 2)
-        self.assertEqual(
-            {row["institution_name"] for row in alternatives},
-            {"City University of New York", "Stanford University"},
-        )
+        self.assertEqual(len(alternatives), 1)
+        self.assertEqual(search_web.call_count, 1)
+        self.assertEqual(fetch_page.call_count, 1)
+        self.assertEqual(len(result['search_audit']['results']), 2)
+        uninspected = [r for r in result['search_audit']['results'] if r['inspection'] == 'Not inspected in this pass']
+        self.assertEqual(len(uninspected), 1)
+        self.assertNotIn(uninspected[0]['url'], {row['source_url'] for row in alternatives})
 
     def test_doctoral_graduate_page_cannot_verify_faculty(self) -> None:
         result = inspect_faculty_result(
@@ -751,8 +762,8 @@ class FacultyVerificationTests(unittest.TestCase):
         }
         result = validate_ai_identity_assessment(candidate, pages, assessment)
         self.assertIsNotNone(result)
-        self.assertEqual(result["status"], "VERIFIED")
-        self.assertEqual(result["method"], "gemini_assisted")
+        self.assertEqual(result["status"], "CONFLICT")
+        self.assertEqual(result["method"], "institution_mismatch_review")
 
     def test_ai_assistance_rejects_a_quote_not_present_on_the_page(self) -> None:
         candidate = {"name": "Alex Smith", "institution_name": "Stanford University"}

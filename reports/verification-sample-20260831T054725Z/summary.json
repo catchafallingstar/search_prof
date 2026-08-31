@@ -1,0 +1,20 @@
+{
+  "candidates": 10,
+  "outcomes": {
+    "UNVERIFIED": 7,
+    "VERIFIED": 3
+  },
+  "requested_field": "AI security",
+  "include_recently_checked": true,
+  "random_seed": 20260831,
+  "excluded_previous_candidates": 60,
+  "max_queries_per_candidate": 10,
+  "outbound_search_attempts": {
+    "langsearch": 49,
+    "searchapi": 0,
+    "ddgs": 0
+  },
+  "identities_saved": 0,
+  "report": "/home/mel/search_prof/reports/verification-sample-20260831T054725Z",
+  "completed_at": "2026-08-31T05:50:00.946211+00:00"
+}

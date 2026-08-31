@@ -1,0 +1,10 @@
+{
+  "candidates": 30,
+  "outcomes": {
+    "SAMPLE_LIMIT": 30
+  },
+  "outbound_ddgs_attempts": 25,
+  "identities_saved": 0,
+  "report": "/home/mel/search_prof/reports/verification-sample-20260830T181210Z",
+  "completed_at": "2026-08-30T19:02:41.835187+00:00"
+}

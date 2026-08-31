@@ -1,0 +1,130 @@
+"""Paced, non-publishing diagnostic: 30 due US candidates, one search each by default."""
+import argparse
+from collections import Counter
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import time
+from unittest.mock import patch
+
+from db import get_db_connection
+from identity_schedule import minimum_recheck_sql
+from ingestion import verify_faculty as verifier
+from ingestion.search_budget import provider_capacity
+from ingestion.websearch import search_web, SearchUnavailable
+
+
+def candidates(limit: int) -> list[dict]:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f"""
+                WITH due AS (
+                    SELECT p.*, i.primary_domain AS institution_domain,
+                        COALESCE((SELECT t.requested_query FROM radar_topic_professors rtp
+                            JOIN radar_topics t ON t.id = rtp.radar_topic_id
+                            WHERE rtp.professor_id = p.id AND rtp.is_current_match
+                            ORDER BY rtp.result_rank LIMIT 1), 'Unassigned') AS sample_field
+                    FROM professors p JOIN institutions i ON i.id = p.institution_id
+                    WHERE i.country_code = 'US' AND {minimum_recheck_sql()}
+                      AND p.faculty_verification_method IS DISTINCT FROM 'manual_review'
+                      AND (p.next_identity_check_at IS NULL OR p.next_identity_check_at <= NOW())
+                      AND EXISTS (SELECT 1 FROM professor_papers pp WHERE pp.professor_id = p.id)
+                      AND EXISTS (SELECT 1 FROM radar_topic_professors rtp WHERE rtp.professor_id = p.id AND rtp.is_current_match)
+                ) SELECT * FROM due
+                  ORDER BY ROW_NUMBER() OVER (PARTITION BY sample_field ORDER BY id), id LIMIT %s
+            """, (limit,))
+            rows = list(cursor.fetchall())
+            for row in rows:
+                cursor.execute("""SELECT paper.*, paper.id AS paper_id, pp.raw_affiliation_text,
+                        pp.affiliation_status, pp.affiliation_version, pp.affiliation_text,
+                        pp.affiliation_institution, pp.affiliation_email, pp.affiliation_source_url,
+                        pp.affiliation_checked_at,
+                        (SELECT e.matched_query FROM radar_topic_professor_papers e
+                         WHERE e.professor_id = pp.professor_id AND e.paper_id = paper.id AND e.is_current_match
+                         ORDER BY e.relevance_score DESC LIMIT 1) AS matched_query
+                    FROM professor_papers pp JOIN papers paper ON paper.id = pp.paper_id
+                    WHERE pp.professor_id = %s ORDER BY paper.publication_year DESC NULLS LAST, paper.id DESC LIMIT 3""", (row['id'],))
+                row['recent_papers'] = list(cursor.fetchall())
+            return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--limit', type=int, default=30)
+    parser.add_argument('--max-searches-per-candidate', type=int, default=1)
+    args = parser.parse_args()
+    selected = candidates(max(1, min(30, args.limit)))
+    now = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    output = Path(__file__).resolve().parents[1] / 'reports' / f'verification-sample-{now}'
+    output.mkdir(parents=True, exist_ok=False)
+    results, summary = [], Counter()
+    before = provider_capacity('ddgs').get('requests_total', 0)
+    print(json.dumps({'event': 'sample_started', 'candidates': len(selected), 'report': str(output),
+                      'max_queries_per_candidate': args.max_searches_per_candidate}), flush=True)
+    env = {'SEARCH_PROVIDERS': 'ddgs', 'SEARCH_PROVIDER_STRATEGY': 'fallback',
+           'ORCID_ENABLED': 'false', 'PAPER_AFFILIATION_OPENALEX_LOOKUP_ENABLED': 'false',
+           'FACULTY_VERIFY_OPENALEX_SUPPORT_ENABLED': 'false'}
+    with patch.dict(os.environ, env), patch.object(verifier, 'assess_identity_with_gemini', return_value=None), \
+         patch('ingestion.paper_affiliations._save_result'):
+        for index, candidate in enumerate(selected, 1):
+            queries, pages = [], []
+            original_inspect = verifier.inspect_faculty_result
+            def inspect(c, result):
+                decision = original_inspect(c, result)
+                pages.append({'url': result.get('href'), 'status': decision.get('status'),
+                              'institution': decision.get('institution_name'), 'title': decision.get('title')})
+                return decision
+            def bounded_search(query, max_results=5):
+                if len(queries) >= max(1, min(3, args.max_searches_per_candidate)):
+                    raise SearchUnavailable('Sample query budget reached; full verification needs more searches', 60)
+                capacity = provider_capacity('ddgs')
+                delay = capacity['retry_after_seconds']
+                if delay > 70:
+                    raise SearchUnavailable(f"Sample source waiting: {capacity.get('reason')}", delay)
+                deadline = time.monotonic() + delay + 0.2
+                if delay:
+                    print(json.dumps({'event': 'sample_wait', 'candidate': candidate['name'], 'seconds': delay}), flush=True)
+                while time.monotonic() < deadline:
+                    time.sleep(min(5, max(0, deadline - time.monotonic())))
+                queries.append({'query': query, 'started_at': datetime.now(timezone.utc).isoformat()})
+                answer = search_web(query, max_results)
+                queries[-1]['results'] = answer
+                return answer
+            started = time.monotonic()
+            print(json.dumps({'event': 'sample_candidate', 'index': index, 'name': candidate['name'], 'field': candidate['sample_field']}), flush=True)
+            try:
+                with patch.object(verifier, 'search_web', side_effect=bounded_search), \
+                     patch.object(verifier, 'inspect_faculty_result', side_effect=inspect):
+                    decision = verifier.verify_faculty_candidate(candidate)
+                status = decision.get('status', 'UNVERIFIED')
+                reason = decision.get('evidence_text') or 'No decisive faculty-role evidence from this bounded sample.'
+            except SearchUnavailable as error:
+                status = 'SAMPLE_LIMIT' if 'Sample query budget' in str(error) else 'SOURCE_WAIT'
+                reason, decision = str(error), {}
+            except Exception as error:
+                status, reason, decision = 'ERROR', f'{type(error).__name__}: {error}', {}
+            row = {'index': index, 'professor_id': candidate['id'], 'name': candidate['name'],
+                   'field': candidate['sample_field'], 'imported_university': candidate['institution_name'],
+                   'status': status, 'reason': reason, 'source': decision.get('source_url'),
+                   'papers': [{'title': p['title'], 'doi': p.get('doi'), 'pdf_url': p.get('pdf_url'), 'raw_affiliation': p.get('raw_affiliation_text')} for p in candidate['recent_papers']],
+                   'queries': queries, 'pages': pages, 'seconds': round(time.monotonic() - started, 2)}
+            results.append(row)
+            summary[status] += 1
+            with (output / 'results.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(row, default=str) + '\n')
+            print(json.dumps({'event': 'sample_result', 'index': index, 'name': candidate['name'], 'status': status, 'queries': len(queries)}), flush=True)
+    attempts = provider_capacity('ddgs').get('requests_total', before) - before
+    final = {'candidates': len(results), 'outcomes': dict(summary), 'outbound_ddgs_attempts': attempts,
+             'identities_saved': 0, 'report': str(output), 'completed_at': datetime.now(timezone.utc).isoformat()}
+    (output / 'summary.json').write_text(json.dumps(final, indent=2), encoding='utf-8')
+    lines = ['# Faculty verification diagnostic', '', f"Candidates: {len(results)} · DuckDuckGo outbound attempts: {attempts}",
+             '', 'One query per candidate by default. No identity decisions were published or saved.',
+             '', '| Candidate | Field | Outcome |', '|---|---|---|']
+    lines += [f"| {r['name'].replace('|', '/')} | {r['field'].replace('|', '/')} | {r['status']} |" for r in results]
+    (output / 'REPORT.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    print(json.dumps({'event': 'sample_complete', **final}), flush=True)
+
+
+if __name__ == '__main__':
+    main()

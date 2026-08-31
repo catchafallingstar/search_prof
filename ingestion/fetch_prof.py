@@ -31,6 +31,9 @@ def _raw_affiliation_text(authorship: dict[str, Any]) -> str:
         for value in authorship.get("raw_affiliation_strings") or []
         if str(value or "").strip()
     ]
+    if not values:
+        values = [str(item.get("display_name") or "").strip()
+                  for item in authorship.get("institutions") or [] if item.get("display_name")]
     return " | ".join(dict.fromkeys(values))
 
 
@@ -443,6 +446,11 @@ def fetch_professors_by_keywords(
                         )
                         professor_id = cursor.fetchone()["id"]
 
+                    if author.get("orcid"):
+                        cursor.execute(
+                            "UPDATE professors SET orcid_id = %s WHERE id = %s AND orcid_id IS NULL",
+                            (str(author["orcid"]), professor_id),
+                        )
                     cursor.execute(
                         """
                         INSERT INTO professor_papers (

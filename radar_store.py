@@ -9,10 +9,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from db import _require_active_admin, get_db_connection
+from identity_schedule import minimum_recheck_sql, direct_identity_sql
 from settings import setting, setting_int
+from ingestion.institution_domains import OFFSHORE_SOURCE_PATTERN
 
 
-FACULTY_VERIFICATION_VERSION = 8
+FACULTY_VERIFICATION_VERSION = 11
 MIN_PUBLIC_FACULTY_VERIFICATION_VERSION = 8
 RADAR_DISCOVERY_VERSION = 3
 
@@ -719,11 +721,13 @@ def update_topic_after_discovery(
 def fetch_topic_candidate_ids(
     radar_topic_id: int,
     limit: int = 24,
+    include_deferred: bool = False,
+    direct_only: bool = False,
 ) -> list[int]:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT rtp.professor_id
                 FROM radar_topic_professors rtp
                 JOIN professors p ON p.id = rtp.professor_id
@@ -732,6 +736,9 @@ def fetch_topic_candidate_ids(
                   AND rtp.is_current_match = TRUE
                   AND institution.country_code = %s
                   AND p.faculty_verification_method IS DISTINCT FROM 'manual_review'
+                  AND {minimum_recheck_sql()}
+                  AND (NOT %s OR {direct_identity_sql()})
+                  AND (%s OR p.identity_retry_at IS NULL OR p.identity_retry_at <= NOW())
                   AND (
                       p.faculty_verification_version < %s
                       OR p.next_identity_check_at IS NULL
@@ -743,11 +750,39 @@ def fetch_topic_candidate_ids(
                 (
                     radar_topic_id,
                     _target_country_code(),
+                    direct_only,
+                    include_deferred,
                     FACULTY_VERIFICATION_VERSION,
                     max(1, min(100, int(limit))),
                 ),
             )
             return [int(row["professor_id"]) for row in cursor.fetchall()]
+
+
+def fetch_identity_search_waits(owner_user_id: int) -> list[dict[str, Any]]:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """SELECT name, identity_retry_at, identity_retry_reason, COUNT(*) OVER () AS total_waiting
+                   FROM professors WHERE identity_retry_at > NOW()
+                   ORDER BY identity_retry_at LIMIT 5"""
+            )
+            return list(cursor.fetchall())
+
+
+def fetch_topic_identity_retry_delay(radar_topic_id: int) -> int:
+    """When only deferred identities remain, schedule once at the earliest retry."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT CEIL(EXTRACT(EPOCH FROM (MIN(p.identity_retry_at) - NOW()))) AS delay
+                   FROM professors p JOIN radar_topic_professors rtp ON rtp.professor_id = p.id
+                   WHERE rtp.radar_topic_id = %s AND rtp.is_current_match = TRUE
+                     AND p.identity_retry_at > NOW()""", (radar_topic_id,),
+            )
+            row = cursor.fetchone()
+            return max(2, int(row["delay"] or 60))
 
 
 def refresh_topic_coverage(radar_topic_id: int) -> dict[str, Any]:
@@ -984,6 +1019,11 @@ def fetch_indexed_professors(
         "institution_record.country_code = %s",
     ]
     professor_params: list[Any] = [int(topic["id"]), _target_country_code()]
+    if _target_country_code() == 'US':
+        # Filter before COUNT/LIMIT, including older records that still point
+        # at their US parent institution. No database deletion is necessary.
+        professor_filters.append("COALESCE(p.faculty_source_url, '') !~* %s")
+        professor_params.append(OFFSHORE_SOURCE_PATTERN)
     if institution.strip():
         professor_filters.append("p.institution_name ILIKE %s")
         professor_params.append(f"%{institution.strip()}%")
@@ -1156,6 +1196,7 @@ def fetch_indexed_professors(
 def claim_next_radar_job(
     worker_id: str,
     excluded_job_types: list[str] | None = None,
+    search_ready: bool = True,
 ) -> dict[str, Any] | None:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
@@ -1176,13 +1217,31 @@ def claim_next_radar_job(
                 """
             )
             cursor.execute(
-                """
+                f"""
                 WITH candidate AS (
                     SELECT id
                     FROM radar_jobs
                     WHERE status = 'queued' AND available_at <= NOW()
                       AND attempts < max_attempts
                       AND NOT (job_type = ANY(%s::TEXT[]))
+                      AND (%s OR job_type NOT IN ('VERIFY_FACULTY', 'REFRESH_FACULTY')
+                           OR EXISTS (
+                               SELECT 1 FROM professors p
+                               JOIN institutions i ON i.id = p.institution_id
+                               WHERE {direct_identity_sql()}
+                                 AND {minimum_recheck_sql()}
+                                 AND p.faculty_verification_method IS DISTINCT FROM 'manual_review'
+                                 AND (p.identity_retry_at IS NULL OR p.identity_retry_at <= NOW())
+                                 AND (p.faculty_verification_version < %s
+                                      OR p.next_identity_check_at IS NULL OR p.next_identity_check_at <= NOW())
+                                 AND i.country_code = %s
+                                 AND ((job_type = 'REFRESH_FACULTY' AND p.id = radar_jobs.professor_id)
+                                      OR (job_type = 'VERIFY_FACULTY' AND EXISTS (
+                                          SELECT 1 FROM radar_topic_professors rtp
+                                          WHERE rtp.professor_id = p.id AND rtp.radar_topic_id = radar_jobs.radar_topic_id
+                                            AND rtp.is_current_match = TRUE
+                                      )))
+                           ))
                     ORDER BY priority DESC, available_at, created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -1196,7 +1255,8 @@ def claim_next_radar_job(
                 WHERE job.id = candidate.id
                 RETURNING job.*
                 """,
-                (list(excluded_job_types or []), worker_id),
+                (list(excluded_job_types or []), search_ready, FACULTY_VERIFICATION_VERSION,
+                 _target_country_code(), worker_id),
             )
             return cursor.fetchone()
 
@@ -1394,6 +1454,10 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
         return
 
     professor_ids = list(rows_by_id)
+    cursor.execute('SELECT id, identity_search_audit FROM professors WHERE id = ANY(%s)', (professor_ids,))
+    for audit_row in cursor.fetchall():
+        for identity in rows_by_id[int(audit_row['id'])]:
+            identity['identity_search_audit'] = audit_row['identity_search_audit'] or {}
     cursor.execute(
         """
         WITH ranked_papers AS (
@@ -1626,7 +1690,14 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                        professor.name, professor.institution_name,
                        professor.faculty_checked_at AS activity_at,
                        professor.faculty_status AS result_status,
-                       professor.faculty_title AS result_detail,
+                       CASE WHEN professor.identity_search_audit->>'outcome' IN
+                            ('VERIFIED', 'NOT_FACULTY', 'UNVERIFIED', 'CONFLICT')
+                            THEN COALESCE(professor.identity_search_audit->>'reason', professor.faculty_title)
+                            ELSE professor.faculty_title END AS result_detail,
+                       CASE WHEN professor.identity_search_audit->>'outcome' IN
+                            ('UNVERIFIED', 'CONFLICT')
+                            THEN professor.identity_search_audit->>'failure_code'
+                            ELSE NULL END AS failure_code,
                        COALESCE(evidence.source_url, professor.faculty_source_url)
                            AS source_url,
                        evidence.observed_title, evidence.observed_institution,
@@ -1647,6 +1718,7 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                            evidence_text
                     FROM faculty_verification_evidence
                     WHERE professor_id = professor.id
+                      AND checked_at >= professor.faculty_checked_at - INTERVAL '1 second'
                     ORDER BY checked_at DESC
                     LIMIT 1
                 ) evidence ON TRUE
@@ -2210,6 +2282,8 @@ def retry_unresolved_identities(owner_user_id: int, limit: int = 100) -> int:
                     UPDATE professors
                     SET faculty_status = 'UNVERIFIED', faculty_confidence = 0,
                         faculty_verification_method = NULL,
+                        faculty_checked_at = NULL, identity_retry_at = NULL,
+                        identity_retry_reason = NULL, identity_search_pending = FALSE,
                         next_identity_check_at = NOW(), updated_at = NOW()
                     WHERE id = ANY(%s)
                     """,
@@ -2334,6 +2408,8 @@ def review_faculty_identity(
                     UPDATE professors
                     SET faculty_status = 'UNVERIFIED', faculty_confidence = 0,
                         faculty_verification_method = NULL,
+                        faculty_checked_at = NULL, identity_retry_at = NULL,
+                        identity_retry_reason = NULL, identity_search_pending = FALSE,
                         next_identity_check_at = NOW(), updated_at = NOW()
                     WHERE id = %s
                     """,

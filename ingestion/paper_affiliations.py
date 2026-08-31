@@ -8,14 +8,17 @@ from typing import Any
 from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
 from db import get_db_connection
+from ingestion.affiliation_extract import author_institution, institutions_in_text
 from ingestion.homepagefinder import is_public_http_url
 from ingestion.openalex_client import OpenAlexUnavailable, openalex_get_json
 from settings import setting, setting_bool, setting_int
 
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
+AFFILIATION_VERSION = 2
 AFFILIATION_STOPWORDS = {
     "and", "at", "college", "department", "institute", "of", "school",
     "system", "the", "university",
@@ -85,15 +88,22 @@ def _pdf_url_from_work(work: dict[str, Any]) -> str:
     ]
     for location in locations:
         value = str((location or {}).get("pdf_url") or "").strip()
-        if value and is_public_http_url(value):
+        if value and is_public_http_url(value, allow_pdf=True):
             return value
     return ""
 
 
 def _resolve_open_pdf_url(paper: dict[str, Any]) -> str:
     existing = str(paper.get("pdf_url") or "").strip()
-    if existing and is_public_http_url(existing):
+    if existing and is_public_http_url(existing, allow_pdf=True):
         return existing
+    # Older candidate records may have a DOI but no stored PDF locator. Read
+    # the publisher's declared citation PDF link without spending OpenAlex credits.
+    doi_pdf = _pdf_url_from_doi(str(paper.get("doi") or ""))
+    if doi_pdf:
+        return doi_pdf
+    if setting("PAPER_AFFILIATION_OPENALEX_LOOKUP_ENABLED").casefold() not in {"true", "1", "yes"}:
+        return ""  # Verification must not silently spend discovery API credits.
     work_id = str(paper.get("openalex_id") or "").rstrip("/").rsplit("/", 1)[-1]
     if not work_id:
         return ""
@@ -108,13 +118,55 @@ def _resolve_open_pdf_url(paper: dict[str, Any]) -> str:
     return _pdf_url_from_work(work)
 
 
+def _pdf_url_from_doi(doi: str) -> str:
+    bare = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi.strip(), flags=re.I)
+    if not re.fullmatch(r"10\.\d{4,9}/[^\s]+", bare):
+        return ""
+    current = f"https://doi.org/{bare}"
+    try:
+        for _ in range(5):
+            if not is_public_http_url(current, resolve_dns=True, allow_pdf=True):
+                return ""
+            response = requests.get(current, headers={"User-Agent": "ScholarRadar/1.0 (open-access affiliation verifier)"},
+                                    timeout=8, allow_redirects=False, stream=True)
+            try:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location")
+                    if not location:
+                        return ""
+                    current = urljoin(current, location)
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").casefold()
+                if "application/pdf" in content_type:
+                    return current
+                if "html" not in content_type:
+                    return ""
+                data = bytearray()
+                for chunk in response.iter_content(chunk_size=65536):
+                    data.extend(chunk)
+                    if len(data) >= 1_000_000:
+                        break
+                soup = BeautifulSoup(bytes(data[:1_000_000]), "html.parser")
+                for tag in soup.find_all("meta", attrs={"name": re.compile(r"^citation_pdf_url$", re.I)}):
+                    url = urljoin(current, str(tag.get("content") or ""))
+                    if url and is_public_http_url(url, resolve_dns=True, allow_pdf=True):
+                        return url
+                return ""
+            finally:
+                response.close()
+    except (OSError, ValueError, requests.RequestException):
+        pass
+    return ""
+
+
 def _download_pdf(url: str) -> tuple[bytes, str]:
     maximum = setting_int("PAPER_PDF_MAX_BYTES", 8_000_000, 500_000, 20_000_000)
     timeout = setting_int("PAPER_PDF_TIMEOUT_SECONDS", 15, 5, 45)
     current = url
     headers = {"User-Agent": "ScholarRadar/1.0 (open-access affiliation verifier)"}
     for _redirect in range(4):
-        if not is_public_http_url(current):
+        if not is_public_http_url(current, resolve_dns=True, allow_pdf=True):
             raise ValueError("PDF URL is not a public HTTP resource.")
         response = requests.get(
             current,
@@ -223,13 +275,15 @@ def extract_paper_affiliation(
     name = str(candidate.get("name") or "").strip()
     institution = str(candidate.get("institution_name") or "").strip()
     raw = str(paper.get("raw_affiliation_text") or "").strip()
-    if raw and _institution_matches(institution, raw):
+    raw_names = institutions_in_text(raw)
+    raw_institution = institution if raw and _institution_matches(institution, raw) and len(raw_names) <= 1 else (raw_names[0] if len(raw_names) == 1 else "")
+    if raw_institution:
         emails = EMAIL_PATTERN.findall(raw)
         return {
             "status": "MATCHED",
             "source_url": str(paper.get("openalex_id") or paper.get("doi") or ""),
             "affiliation_text": raw[:2000],
-            "institution_name": institution,
+            "institution_name": raw_institution,
             "email": emails[0] if emails else "",
             "method": "openalex_raw_affiliation",
         }
@@ -257,19 +311,21 @@ def extract_paper_affiliation(
             "affiliation_text": "",
             "method": "open_pdf_no_text",
         }
-    if not _name_matches(name, text) or not _institution_matches(institution, text):
+    extracted_institution, excerpt = author_institution(name, text)
+    if not extracted_institution:
         return {
             "status": "NOT_FOUND",
             "source_url": final_url,
-            "affiliation_text": _evidence_excerpt(name, institution, text),
+            "affiliation_text": excerpt or _evidence_excerpt(name, institution, text),
+            "reason": "Author affiliation could not be uniquely linked in the PDF header.",
             "method": method,
         }
-    emails = EMAIL_PATTERN.findall(text)
+    emails = EMAIL_PATTERN.findall(excerpt)
     return {
         "status": "MATCHED",
         "source_url": final_url,
-        "affiliation_text": _evidence_excerpt(name, institution, text),
-        "institution_name": institution,
+        "affiliation_text": excerpt,
+        "institution_name": extracted_institution,
         "email": emails[0] if emails else "",
         "method": method,
     }
@@ -304,19 +360,21 @@ def enrich_candidate_metadata_affiliations(
     papers = [dict(paper) for paper in list(candidate.get("recent_papers") or [])]
     evidence: list[dict[str, Any]] = []
     for paper in papers[: max(1, min(int(max_papers), 3))]:
-        if str(paper.get("affiliation_status") or "") == "MATCHED":
+        if str(paper.get("affiliation_status") or "") == "MATCHED" and int(paper.get("affiliation_version") or 0) >= AFFILIATION_VERSION:
             result = _cached_result(paper)
         else:
             raw = str(paper.get("raw_affiliation_text") or "").strip()
             institution = str(candidate.get("institution_name") or "").strip()
-            if not raw or not _institution_matches(institution, raw):
+            raw_names = institutions_in_text(raw)
+            raw_institution = institution if raw and _institution_matches(institution, raw) and len(raw_names) <= 1 else (raw_names[0] if len(raw_names) == 1 else "")
+            if not raw_institution:
                 continue
             emails = EMAIL_PATTERN.findall(raw)
             result = {
                 "status": "MATCHED",
                 "source_url": str(paper.get("openalex_id") or paper.get("doi") or ""),
                 "affiliation_text": raw[:2000],
-                "institution_name": institution,
+                "institution_name": raw_institution,
                 "email": emails[0] if emails else "",
                 "method": "openalex_raw_affiliation",
             }
@@ -335,7 +393,8 @@ def _save_result(
         return
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
+            if str(result.get("method") or "").startswith("open_pdf"):
+                cursor.execute(
                 """
                 UPDATE papers
                 SET pdf_url = COALESCE(NULLIF(%s, ''), pdf_url),
@@ -348,6 +407,7 @@ def _save_result(
                 """
                 UPDATE professor_papers
                 SET affiliation_status = %s,
+                    affiliation_version = 2,
                     affiliation_text = %s,
                     affiliation_source_url = %s,
                     affiliation_institution = %s,
@@ -377,7 +437,7 @@ def enrich_candidate_paper_affiliations(
     evidence: list[dict[str, Any]] = []
     for paper in papers[:maximum]:
         status = str(paper.get("affiliation_status") or "NOT_CHECKED")
-        if status == "MATCHED" or (status != "NOT_CHECKED" and _result_is_fresh(paper)):
+        if int(paper.get("affiliation_version") or 0) >= AFFILIATION_VERSION and (status == "MATCHED" or (status != "NOT_CHECKED" and _result_is_fresh(paper))):
             result = _cached_result(paper)
         else:
             result = extract_paper_affiliation(enriched, paper)

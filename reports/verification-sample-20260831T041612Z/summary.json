@@ -1,0 +1,19 @@
+{
+  "candidates": 10,
+  "outcomes": {
+    "VERIFIED": 3,
+    "NOT_FACULTY": 2,
+    "UNVERIFIED": 5
+  },
+  "random_seed": null,
+  "excluded_previous_candidates": 0,
+  "max_queries_per_candidate": 10,
+  "outbound_search_attempts": {
+    "langsearch": 36,
+    "searchapi": 0,
+    "ddgs": 0
+  },
+  "identities_saved": 0,
+  "report": "/home/mel/search_prof/reports/verification-sample-20260831T041612Z",
+  "completed_at": "2026-08-31T04:18:04.695786+00:00"
+}

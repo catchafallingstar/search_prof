@@ -13,6 +13,24 @@ from ingestion.websearch import (
 
 
 class WebSearchTests(unittest.TestCase):
+    def setUp(self):
+        rights = patch("ingestion.websearch.setting_bool", return_value=True)
+        rights.start()
+        self.addCleanup(rights.stop)
+        from contextlib import nullcontext
+        self.slot = patch("ingestion.websearch.search_slot", side_effect=lambda _provider: nullcontext())
+        self.slot.start()
+        self.addCleanup(self.slot.stop)
+        self.pace = patch("ingestion.websearch._pace")
+        self.pace.start()
+        self.addCleanup(self.pace.stop)
+
+    @patch("ingestion.websearch.DDGS")
+    def test_ddgs_explicitly_uses_duckduckgo(self, ddgs):
+        ddgs.return_value.text.return_value = []
+        _fallback_search("example", 3)
+        ddgs.return_value.text.assert_called_once_with("example", max_results=3, backend="duckduckgo")
+
     @patch("ingestion.websearch.setting")
     @patch("ingestion.websearch.requests.get")
     @patch("ingestion.websearch._record_provider_success")
@@ -56,6 +74,14 @@ class WebSearchTests(unittest.TestCase):
         ddgs.return_value.text.side_effect = RuntimeError("No results found.")
         self.assertEqual(_fallback_search('"Rare Name" "University"', 3), [])
 
+    @patch("ingestion.websearch.DDGS")
+    def test_ddgs_upstream_error_is_not_an_empty_result(self, ddgs) -> None:
+        for message in ("No results found: CAPTCHA", "No results found: request timed out"):
+            with self.subTest(message=message):
+                ddgs.return_value.text.side_effect = RuntimeError(message)
+                with self.assertRaisesRegex(RuntimeError, "No results found:"):
+                    _fallback_search('"Rare Name" "University"', 3)
+
     @patch("ingestion.websearch._fallback_search")
     @patch("ingestion.websearch.setting", return_value="")
     @patch("ingestion.websearch._record_provider_success")
@@ -98,7 +124,8 @@ class WebSearchTests(unittest.TestCase):
         self, setting, run_provider, _read_cache, _write_cache
     ) -> None:
         values = {
-            "SEARCH_PROVIDERS": "searxng,ddgs",
+            "SEARCH_PROVIDERS": "searchapi,searxng,ddgs",
+            "SEARCHAPI_API_KEY": "test-secret",
             "SEARXNG_URL": "http://127.0.0.1:8080",
             "SEARCH_PROVIDER_STRATEGY": "parallel",
         }

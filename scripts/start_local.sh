@@ -24,7 +24,10 @@ set -a
 source .env
 set +a
 
-docker compose up -d postgres searxng
+docker compose up -d --wait --wait-timeout 60 postgres
+if [[ ",${SEARCH_PROVIDERS:-ddgs}," == *",searxng,"* ]]; then
+  docker compose up -d searxng
+fi
 
 # Do not rely on whichever environment happened to be active in the caller's
 # shell.  Calling the project interpreter explicitly prevents a different
@@ -35,6 +38,7 @@ if ! .venv/bin/python -c "import psycopg, psycopg_binary, streamlit"; then
 fi
 
 worker_pid=""
+.venv/bin/python -m scripts.migrate_affiliation_quota
 cleanup() {
   if [[ -n "$worker_pid" ]] && kill -0 "$worker_pid" 2>/dev/null; then
     kill "$worker_pid" 2>/dev/null || true
@@ -43,7 +47,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [[ -n "${SEARXNG_URL:-}" ]]; then
+if [[ ",${SEARCH_PROVIDERS:-ddgs}," == *",searxng,"* ]]; then
   echo "ScholarRadar metasearch started at ${SEARXNG_URL}."
   echo "Search outages are paused and retried without creating identity decisions."
 fi

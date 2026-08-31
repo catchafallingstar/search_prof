@@ -49,7 +49,7 @@ def result_matches_institution(institution: str, *values: object) -> bool:
     return len(initialism) >= 2 and initialism in combined_tokens
 
 
-def is_public_http_url(url: str, resolve_dns: bool = False) -> bool:
+def is_public_http_url(url: str, resolve_dns: bool = False, *, allow_pdf: bool = False) -> bool:
     try:
         parsed = urlparse(str(url).strip())
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -57,9 +57,9 @@ def is_public_http_url(url: str, resolve_dns: bool = False) -> bool:
         hostname = parsed.hostname.casefold().rstrip(".")
         if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
             return False
-        if any(hostname == domain or hostname.endswith(f".{domain}") for domain in EXCLUDED_DOMAINS):
+        if hostname != 'sites.google.com' and any(hostname == domain or hostname.endswith(f".{domain}") for domain in EXCLUDED_DOMAINS):
             return False
-        if parsed.path.casefold().endswith(EXCLUDED_SUFFIXES):
+        if parsed.path.casefold().endswith(EXCLUDED_SUFFIXES) and not (allow_pdf and parsed.path.casefold().endswith('.pdf')):
             return False
         try:
             literal_ip = ipaddress.ip_address(hostname)

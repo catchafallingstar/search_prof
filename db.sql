@@ -104,6 +104,10 @@ ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_confidence NUMERIC(4, 3)
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verified_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS next_identity_check_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS orcid_id TEXT;
+-- Retry scheduling is not an identity decision or an identity freshness date.
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_retry_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_retry_reason TEXT;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_check_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS public_hiring_failure_count INTEGER NOT NULL DEFAULT 0;
@@ -496,6 +500,7 @@ ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_source_url TEX
 ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_institution TEXT;
 ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_email TEXT;
 ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_checked_at TIMESTAMPTZ;
+ALTER TABLE professor_papers ADD COLUMN IF NOT EXISTS affiliation_version INTEGER NOT NULL DEFAULT 0;
 
 DO $$
 BEGIN
@@ -707,6 +712,22 @@ ALTER TABLE radar_jobs
     ));
 ALTER TABLE web_search_provider_health
     ADD COLUMN IF NOT EXISTS next_request_at TIMESTAMPTZ;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS usage_day DATE;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS remote_remaining INTEGER;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS remote_checked_at TIMESTAMPTZ;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS remote_reset_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_search_pending BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS usage_month DATE;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_this_month INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_today INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS identity_orcid_cache (
+    orcid_id TEXT PRIMARY KEY,
+    result_json JSONB NOT NULL DEFAULT '{}',
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
 
 -- A run is targeted to one user query. ScholarRadar never attempts to preload
 -- every professor or every field.
@@ -831,3 +852,6 @@ CREATE INDEX IF NOT EXISTS web_search_cache_expiry_idx
 CREATE INDEX IF NOT EXISTS web_search_provider_block_idx
     ON web_search_provider_health (blocked_until)
     WHERE status = 'blocked';
+
+-- Latest bounded identity pass: staff-only snippets, page reasons and affiliation trail.
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_search_audit JSONB NOT NULL DEFAULT '{}'::jsonb;

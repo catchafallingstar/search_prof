@@ -35,3 +35,5 @@ __pycache__/
 # Local database snapshots can contain user email addresses and moderation data.
 before-*.sql
 *.dump
+# Private configuration and code backups created during local maintenance.
+/backups/

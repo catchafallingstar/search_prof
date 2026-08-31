@@ -1,0 +1,15 @@
+{
+  "candidates": 30,
+  "outcomes": {
+    "VERIFIED": 6,
+    "SAMPLE_LIMIT": 22,
+    "NOT_FACULTY": 2
+  },
+  "outbound_search_attempts": {
+    "searchapi": 30,
+    "ddgs": 0
+  },
+  "identities_saved": 0,
+  "report": "/home/mel/search_prof/reports/verification-sample-20260830T200538Z",
+  "completed_at": "2026-08-30T20:08:01.816251+00:00"
+}

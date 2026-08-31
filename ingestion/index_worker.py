@@ -27,6 +27,7 @@ from radar_store import (
     fail_radar_job,
     fetch_radar_topic_by_id,
     fetch_topic_candidate_ids,
+    fetch_topic_identity_retry_delay,
     fetch_topic_enrichment_ids,
     mark_professor_enrichment_checked,
     refresh_topic_coverage,
@@ -38,14 +39,6 @@ from radar_store import (
     update_worker_heartbeat,
 )
 from settings import setting, setting_int
-
-
-SEARCH_DEPENDENT_JOB_TYPES = (
-    "VERIFY_FACULTY",
-    "REFRESH_FACULTY",
-    "CHECK_HIRING",
-    "ENRICH_PROFESSORS",
-)
 
 
 class RetryableJobError(RuntimeError):
@@ -123,22 +116,15 @@ def _discover(job: dict[str, Any]) -> dict[str, Any]:
 
 def _verify(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     topic = _topic_for_job(job)
+    capacity = search_provider_runtime_state()
+    direct_only = not bool(capacity["available"])
+    search_wait = max(2, int(capacity.get("retry_after_seconds") or 60))
     # Identity checks can involve several slow official pages. Keep each job
     # small enough to finish comfortably before the worker's hard deadline.
     # Each completed candidate is committed independently by the verifier, so
     # the next rescheduled job continues with the first unfinished identity.
-    configured_batch_size = setting_int("INDEX_VERIFY_BATCH_SIZE", 3, 1, 6)
-    provider_state = search_provider_runtime_state()
-    available_providers = list(provider_state.get("available") or [])
-    if not available_providers:
-        raise RetryableJobError(
-            "Faculty verification is waiting for a configured search provider to recover.",
-            int(provider_state.get("retry_after_seconds") or 300),
-        )
-    # When only one provider is healthy, process one identity. This avoids
-    # fanning one upstream problem out across every candidate in a batch.
-    batch_size = 1 if len(available_providers) == 1 else configured_batch_size
-    professor_ids = fetch_topic_candidate_ids(int(topic["id"]), batch_size)
+    batch_size = setting_int("INDEX_VERIFY_BATCH_SIZE", 1, 1, 6)
+    professor_ids = fetch_topic_candidate_ids(int(topic["id"]), batch_size, direct_only=direct_only)
     if professor_ids:
         _publish_job_progress(
             job,
@@ -147,38 +133,50 @@ def _verify(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             detail=(
                 "Checking the target university first, then using bounded paper "
                 "affiliation evidence for unresolved identities. "
-                f"Processing {len(professor_ids)} candidate(s) with "
-                f"{len(available_providers)} available search provider(s)."
+                f"Processing {len(professor_ids)} candidate(s); known pages first, web search only if needed."
             ),
         )
-        verification = verify_faculty_candidates(professor_ids)
+        verification = verify_faculty_candidates(professor_ids, direct_only=True, retry_after_seconds=search_wait) if direct_only else verify_faculty_candidates(professor_ids)
     else:
         verification = {
             "verified_ids": [], "checked": 0, "evaluated": 0, "verified": 0
         }
     coverage = refresh_topic_coverage(int(topic["id"]))
     more_due = bool(fetch_topic_candidate_ids(int(topic["id"]), 1))
+    pending_any = more_due or bool(fetch_topic_candidate_ids(int(topic["id"]), 1, include_deferred=True))
     needs_more = (
         int(coverage.get("verified_count") or 0)
         < int(coverage.get("desired_results") or 100)
-        and more_due
+        and pending_any
     )
-    # Do not start opportunity checks while the identity set is still moving.
-    # Once the requested number of professors is verified (or candidates are
-    # exhausted), grants and hiring pages can safely run in parallel.
-    if not needs_more and int(coverage.get("verified_count") or 0) > 0:
+    # Enrichment queries select only verified faculty. A newly verified person
+    # need not wait for every other candidate in this field to finish.
+    if int(verification.get("verified") or 0) > 0 or (
+        not needs_more and int(coverage.get("verified_count") or 0) > 0
+    ):
         enqueue_radar_job(
             "ENRICH_PROFESSORS",
             radar_topic_id=int(topic["id"]),
             requested_by=job.get("requested_by"),
-            priority=45,
+            priority=86,
             max_attempts=20,
         )
+    # Never spin through unrelated candidates every two seconds when the shared
+    # search budget is the thing they are waiting for. Direct-ready work has its
+    # own eligibility path in claim_next_radar_job.
+    if direct_only or int(verification.get("deferred") or 0):
+        retry_delay = max(search_wait if direct_only else 2,
+                          int(verification.get("retry_after_seconds") or 2))
+    else:
+        retry_delay = fetch_topic_identity_retry_delay(int(topic["id"])) if needs_more and not more_due else 2
     return {
         "evaluated": int(verification.get("evaluated") or 0),
         "newly_verified": int(verification.get("verified") or 0),
         "verified_count": int(coverage.get("verified_count") or 0),
         "candidates_seen": int(coverage.get("candidates_seen") or 0),
+        "deferred": int(verification.get("deferred") or 0),
+        "retry_after_seconds": retry_delay,
+        "waiting_for": "web_search" if (direct_only or verification.get("deferred")) else None,
     }, needs_more
 
 
@@ -272,8 +270,11 @@ def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         professor_id = job.get("professor_id")
         if professor_id is None:
             raise RuntimeError("REFRESH_FACULTY requires a professor.")
-        result = verify_faculty_candidates([int(professor_id)])
-        return result, False
+        capacity = search_provider_runtime_state()
+        result = (verify_faculty_candidates([int(professor_id)]) if capacity["available"] else
+                  verify_faculty_candidates([int(professor_id)], direct_only=True,
+                      retry_after_seconds=max(2, int(capacity.get("retry_after_seconds") or 60))))
+        return result, bool(result.get("deferred"))
     if job_type == "CHECK_GRANTS":
         return _check_grants(job)
     if job_type == "CHECK_HIRING":
@@ -369,8 +370,8 @@ def run_worker(
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     jobs_processed = 0
+    announced_wait = False
     job_timeout = setting_int("INDEX_JOB_TIMEOUT_SECONDS", 300, 30, 1800)
-    search_jobs_paused_until = 0.0
     update_worker_heartbeat(worker_id)
     log_event("worker_started", worker_id=worker_id)
     try:
@@ -378,17 +379,17 @@ def run_worker(
             if max_jobs is not None and jobs_processed >= max_jobs:
                 break
             update_worker_heartbeat(worker_id)
-            provider_state = search_provider_runtime_state()
-            search_jobs_paused = (
-                time.monotonic() < search_jobs_paused_until
-                or not provider_state.get("available")
-            )
-            excluded_job_types = (
-                list(SEARCH_DEPENDENT_JOB_TYPES) if search_jobs_paused else []
-            )
-            job = claim_next_radar_job(
-                worker_id, excluded_job_types=excluded_job_types
-            )
+            # Search availability is checked only at the actual web-search step.
+            # Direct pages, cached metadata and grants may still be usable.
+            capacity = search_provider_runtime_state()
+            search_ready = bool(capacity["available"])
+            if not search_ready and not announced_wait:
+                log_event("search_waiting", retry_after_seconds=capacity["retry_after_seconds"],
+                          detail="Search-dependent identities are parked; direct pages, grants and other work can continue.")
+                announced_wait = True
+            elif search_ready:
+                announced_wait = False
+            job = claim_next_radar_job(worker_id, search_ready=search_ready)
             if not job:
                 enqueue_due_maintenance()
                 if once:
@@ -408,7 +409,7 @@ def run_worker(
                     job, worker_id, job_timeout
                 )
                 if needs_more:
-                    reschedule_radar_job(int(job["id"]), 2, result)
+                    reschedule_radar_job(int(job["id"]), max(2, int(result.get("retry_after_seconds") or 2)), result)
                     status = "rescheduled"
                 else:
                     complete_radar_job(int(job["id"]), result)
@@ -422,11 +423,6 @@ def run_worker(
                 )
             except RetryableJobError as error:
                 fail_radar_job(job, error)
-                if str(job.get("job_type")) in SEARCH_DEPENDENT_JOB_TYPES:
-                    search_jobs_paused_until = max(
-                        search_jobs_paused_until,
-                        time.monotonic() + error.retry_after_seconds,
-                    )
                 log_event(
                     "job_deferred",
                     worker_id=worker_id,

@@ -1,13 +1,16 @@
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import streamlit as st
 
 from auth import account_controls, require_site_admin
 from db import database_is_ready
+from ingestion.websearch import configured_search_providers, search_provider_runtime_state
+from ingestion.verification_audit import safe_source_link
 from radar_store import (
     cancel_radar_job,
     fetch_live_indexing_status,
+    fetch_identity_search_waits,
     list_radar_operations,
     recover_stalled_radar_jobs,
     request_topic_index,
@@ -104,6 +107,56 @@ def _format_device_time(value) -> str:
 
 def render_identity_context(identity: dict) -> None:
     """Show the research and source trail needed to distinguish namesakes."""
+    audit = identity.get('identity_search_audit') or {}
+    if audit:
+        st.markdown('**Latest identity search**')
+        st.caption(f"Outcome: {audit.get('outcome', 'Unknown')} · Searched university: {audit.get('search_university') or audit.get('imported_university') or 'Not available'}")
+        st.write(audit.get('reason') or 'No final decision recorded.')
+        expanded_audit = audit.get('version', 1) >= 2
+        if expanded_audit:
+            st.caption(f"{audit.get('links_collected', 0)} links collected · {len(audit.get('results', []))} sources saved")
+            if audit.get('failure_code'):
+                st.caption('Check outcome: ' + audit['failure_code'].replace('_', ' ').capitalize())
+            if audit.get('stopping_reason'):
+                st.caption(audit['stopping_reason'])
+        with st.expander('Saved identity sources and page checks' if expanded_audit else 'Search results and page checks (first 10 links)'):
+            st.caption('Snippets are search-engine excerpts, not confirmed current roles. These diagnostics are staff-only.')
+            for query in audit.get('queries', []):
+                st.code(query.get('query', ''), language=None)
+                st.caption(f"Returned {query.get('returned', 0)} links")
+                if query.get('error'):
+                    st.caption('Search did not complete: ' + query['error'])
+            for rank, result in enumerate(audit.get('results', [])[:100 if expanded_audit else 10], 1):
+                st.write(f"{rank}. {result.get('title') or 'Untitled result'}")
+                url = result.get('url') or ''
+                if safe_source_link(url):
+                    st.link_button('Open source', url)
+                st.text(result.get('snippet') or 'No snippet returned.')
+                if result.get('snippet_hint'):
+                    st.warning(result['snippet_hint'])
+                st.caption(result.get('inspection') or 'Not inspected in this pass')
+                if result.get('discovered_from'):
+                    st.text('Linked from: ' + result['discovered_from'])
+            st.markdown('**Inspected pages**')
+            for page in audit.get('pages', []):
+                st.text(f"{page.get('url')}\n{page.get('status')}: {page.get('reason')}")
+                if page.get('http_status'):
+                    st.caption(f"HTTP {page['http_status']} · {page.get('response_bytes', '?')} bytes · {page.get('content_type', '')}")
+                if page.get('title'):
+                    st.text('Page title: ' + page['title'])
+                if page.get('name_context') or page.get('text_excerpt'):
+                    st.text(page.get('name_context') or page['text_excerpt'])
+                if page.get('rendering_hint'):
+                    st.caption(page['rendering_hint'])
+            for retrieval in audit.get('retrieval_events', []):
+                if retrieval.get('outcome') != 'NO_USEFUL_RESULTS':
+                    continue
+                st.caption(f"{retrieval.get('provider')}: answered, but returned no useful name-matching results")
+                st.code(retrieval.get('query', ''), language=None)
+                for sample in retrieval.get('sample', []):
+                    st.text(f"{sample.get('title')}\n{sample.get('url')}\n{sample.get('snippet')}")
+            if not audit.get('results'):
+                st.caption('No search results were collected in this pass. Known-page or affiliation checks may have run first.')
     st.markdown("**Candidate context**")
     topics = [str(value) for value in identity.get("matching_topics") or [] if value]
     if topics:
@@ -334,6 +387,24 @@ def render_live_activity() -> None:
     checked = max(0, unique_candidates - remaining)
 
     st.subheader("Live indexing activity")
+    search_state = search_provider_runtime_state()
+    if not search_state["available"]:
+        next_search = datetime.now(timezone.utc) + timedelta(seconds=search_state["retry_after_seconds"])
+        st.info(f"Web-search identities are waiting. Next capacity check: {_format_device_time(next_search)}. Known pages and grants can still run.")
+    with st.expander("Search API capacity"):
+        for provider, capacity in search_state.get("capacity", {}).items():
+            st.write(f"{provider}: {capacity.get('reason') or 'Ready'}")
+            st.caption(f"Attempts today: {capacity.get('requests_today', 0)} · Total tracked attempts: {capacity.get('requests_total', 0)}")
+            if capacity.get("remote_checked_at"):
+                remaining = capacity.get("remote_remaining")
+                st.caption(f"Provider allowance: {remaining if remaining is not None else 'unavailable'} · Observed {_format_device_time(capacity['remote_checked_at'])}")
+    waits = fetch_identity_search_waits(int(user["id"]))
+    if waits:
+        st.caption(f"{waits[0]['total_waiting']} identities waiting for web search. Known-page checks can continue.")
+        with st.expander("Next web-search retries"):
+            for item in waits:
+                st.write(f"{item['name']} · Retry after {_format_device_time(item['identity_retry_at'])}")
+                st.caption(item.get("identity_retry_reason") or "Waiting for a search slot")
     if worker:
         progress = worker.get("progress") or {}
         current_stage = str(
@@ -414,6 +485,17 @@ def render_live_activity() -> None:
                 str(entry.get("result_status") or ""),
                 str(entry.get("result_status") or "Completed"),
             )
+            if entry.get('failure_code'):
+                result = {
+                    'SOURCE_BLOCKED': 'Source blocked the check',
+                    'SOURCE_UNAVAILABLE': 'Source unavailable',
+                    'NO_USEFUL_PROFILE': 'No useful profile found',
+                    'MISSING_AFFILIATION': 'University not established',
+                    'CHECK_LIMIT': 'Check limit reached',
+                    'IDENTITY_EVIDENCE_INCOMPLETE': 'Identity evidence incomplete',
+                    'NO_READABLE_CONTENT': 'No readable page content',
+                    'UNSUPPORTED_CONTENT': 'Page format could not be read',
+                }.get(entry['failure_code'], entry['failure_code'].replace('_', ' ').capitalize())
             activity_at = entry.get("activity_at")
             time_label = _format_device_time(activity_at)
             fields = ", ".join(entry.get("research_areas") or []) or "Not linked"
@@ -535,7 +617,9 @@ blocked_openalex = [
 ]
 blocked_identity_search = [
     row for row in blocked_providers
-    if str(row.get("provider_name") or "").casefold() != "openalex"
+    if str(row.get("provider_name") or "").casefold() in {
+        item["provider"] for item in configured_search_providers()
+    }
 ]
 if blocked_openalex:
     next_retry = max(row["blocked_until"] for row in blocked_openalex)
@@ -547,9 +631,9 @@ if blocked_openalex:
 if blocked_identity_search:
     next_retry = max(row["blocked_until"] for row in blocked_identity_search)
     st.warning(
-        "Faculty verification is paused because the public search engines are "
-        "temporarily unavailable. Existing results still work, queued identities "
-        "are safe, and the worker will retry automatically after "
+        "Web-search fallback is paused. Known faculty pages and saved evidence "
+        "can still be checked. Existing results and queued identities are safe. "
+        "Search-dependent checks retry after "
         f"{next_retry}."
     )
 
@@ -638,10 +722,10 @@ else:
 st.subheader(f"Ambiguous identities ({len(operations['identity_review'])})")
 if operations["identity_review"]:
     st.caption(
-        "These records have multiple plausible faculty matches and remain hidden. "
-        "Retry them together before reviewing individual people."
+        "These identities need staff review and remain hidden. University conflicts "
+        "are not retried automatically. Request another check only when you want to override that pause."
     )
-    if st.button("Retry unresolved identities automatically"):
+    if st.button("Request another check for these identities"):
         queued_identities = retry_unresolved_identities(int(user["id"]), limit=100)
         st.success(f"Queued {queued_identities} identities for another automatic check.")
         st.rerun()
@@ -649,7 +733,7 @@ if operations["identity_review"]:
     visible_identities = operations["identity_review"][:identity_limit]
     for identity in visible_identities:
         status_label = {
-            "CONFLICT": "Multiple possible faculty matches",
+            "CONFLICT": "University or identity conflict",
             "MANUAL_REVIEW": "Needs confirmation",
         }.get(identity["faculty_status"], identity["faculty_status"])
         with st.expander(f"{identity['name']} · {status_label}"):

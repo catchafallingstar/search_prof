@@ -20,6 +20,11 @@ def _slow_job(_job):
 
 
 class BackgroundIndexTests(unittest.TestCase):
+    def setUp(self):
+        capacity = patch("ingestion.index_worker.search_provider_runtime_state", return_value={"available": ["ddgs"], "retry_after_seconds": 0})
+        capacity.start()
+        self.addCleanup(capacity.stop)
+
     def test_topic_identity_is_shared_across_spacing_and_case(self) -> None:
         self.assertEqual(topic_key("AI security"), topic_key("  ai   SECURITY  "))
         self.assertEqual(normalize_topic_query("AI-security"), "ai security")
@@ -77,18 +82,18 @@ class BackgroundIndexTests(unittest.TestCase):
         self.assertIn("ORDER BY priority DESC, available_at, created_at", source)
         self.assertIn("active_job_type", source)
 
-    def test_worker_skips_search_jobs_during_a_shared_provider_cooldown(self) -> None:
+    def test_worker_keeps_direct_checks_running_during_search_cooldown(self) -> None:
         worker = (PROJECT_DIR / "ingestion" / "index_worker.py").read_text(
             encoding="utf-8"
         )
         store = (PROJECT_DIR / "radar_store.py").read_text(encoding="utf-8")
         self.assertIn('"VERIFY_FACULTY",', worker)
         self.assertIn('"CHECK_HIRING",', worker)
-        self.assertIn("excluded_job_types=excluded_job_types", worker)
+        self.assertIn("job = claim_next_radar_job(worker_id, search_ready=search_ready)", worker)
         self.assertIn("NOT (job_type = ANY(%s::TEXT[]))", store)
-        self.assertIn("search_jobs_paused_until", worker)
-        self.assertIn("time.monotonic() + error.retry_after_seconds", worker)
-        self.assertIn("SEARCH_DEPENDENT_JOB_TYPES", worker)
+        self.assertNotIn("search_jobs_paused_until", worker)
+        self.assertIn("identity_retry_at", store)
+        self.assertIn("include_deferred=True", worker)
 
     def test_hiring_refresh_is_per_professor_freshness_and_batched(self) -> None:
         source = (PROJECT_DIR / "radar_store.py").read_text(encoding="utf-8")
@@ -108,15 +113,12 @@ class BackgroundIndexTests(unittest.TestCase):
     @patch("ingestion.index_worker.refresh_topic_coverage")
     @patch("ingestion.index_worker.fetch_topic_candidate_ids")
     @patch("ingestion.index_worker.verify_faculty_candidates")
-    @patch("ingestion.index_worker.search_provider_runtime_state")
+    @patch("ingestion.index_worker.setting_int", return_value=1)
     @patch("ingestion.index_worker._topic_for_job")
     def test_verification_uses_one_candidate_when_one_provider_is_available(
-        self, topic_for_job, provider_state, verify, fetch_ids, refresh, enqueue
+        self, topic_for_job, batch_size, verify, fetch_ids, refresh, enqueue
     ) -> None:
         topic_for_job.return_value = {"id": 7}
-        provider_state.return_value = {
-            "available": ["searxng"], "retry_after_seconds": 0
-        }
         verify.return_value = {"evaluated": 1, "verified": 0}
         fetch_ids.side_effect = [[11], [12]]
         refresh.return_value = {
@@ -133,15 +135,14 @@ class BackgroundIndexTests(unittest.TestCase):
         enqueue.assert_not_called()
 
     @patch(
-        "ingestion.index_worker.search_provider_runtime_state",
-        return_value={"available": ["searxng", "ddgs"]},
+        "ingestion.index_worker.setting_int", return_value=3,
     )
     @patch("ingestion.index_worker.enqueue_radar_job")
     @patch("ingestion.index_worker.refresh_topic_coverage")
     @patch("ingestion.index_worker.fetch_topic_candidate_ids")
     @patch("ingestion.index_worker.verify_faculty_candidates")
     @patch("ingestion.index_worker._topic_for_job")
-    def test_enrichment_waits_until_faculty_verification_is_complete(
+    def test_newly_verified_faculty_enrich_before_the_whole_topic_finishes(
         self, topic_for_job, verify, fetch_ids, refresh, enqueue, _provider_state
     ) -> None:
         topic_for_job.return_value = {"id": 7}
@@ -154,11 +155,11 @@ class BackgroundIndexTests(unittest.TestCase):
         }
         _, needs_more = _verify({"job_type": "VERIFY_FACULTY"})
         self.assertTrue(needs_more)
-        enqueue.assert_not_called()
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.args[0], "ENRICH_PROFESSORS")
 
     @patch(
-        "ingestion.index_worker.search_provider_runtime_state",
-        return_value={"available": ["searxng", "ddgs"]},
+        "ingestion.index_worker.setting_int", return_value=3,
     )
     @patch("ingestion.index_worker.enqueue_radar_job")
     @patch("ingestion.index_worker.refresh_topic_coverage")
@@ -170,7 +171,7 @@ class BackgroundIndexTests(unittest.TestCase):
     ) -> None:
         topic_for_job.return_value = {"id": 7}
         verify.return_value = {"evaluated": 2, "verified": 1}
-        fetch_ids.side_effect = [[11, 12], []]
+        fetch_ids.side_effect = [[11, 12], [], []]
         refresh.return_value = {
             "verified_count": 8,
             "desired_results": 100,
@@ -182,7 +183,7 @@ class BackgroundIndexTests(unittest.TestCase):
             "ENRICH_PROFESSORS",
             radar_topic_id=7,
             requested_by=None,
-            priority=45,
+            priority=86,
             max_attempts=20,
         )
 
@@ -221,10 +222,11 @@ class BackgroundIndexTests(unittest.TestCase):
         verifier = (PROJECT_DIR / "ingestion" / "verify_faculty.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('setting_int("INDEX_VERIFY_BATCH_SIZE", 3, 1, 6)', worker)
+        self.assertIn('setting_int("INDEX_VERIFY_BATCH_SIZE", 1, 1, 6)', worker)
         self.assertIn("_save_result(candidate, result)", verifier)
-        self.assertIn('setting_int("FACULTY_VERIFY_MAX_QUERIES", 5, 2, 6)', verifier)
-        self.assertIn('setting_int("FACULTY_VERIFY_MAX_PAGES", 8, 3, 12)', verifier)
+        self.assertTrue('setting_int("FACULTY_IDENTITY_PASS_QUERIES", 10, 1, 10)' in verifier, 'Expected a bounded ten-query maximum')
+        self.assertIn("FACULTY_IDENTITY_PASS_SECONDS", verifier)
+        self.assertTrue('setting_int("FACULTY_IDENTITY_PASS_PAGES", 20, 3, 20)' in verifier, 'Expected a bounded twenty-page maximum')
 
     @patch("ingestion.index_worker.update_worker_heartbeat")
     @patch("ingestion.index_worker.process_job", side_effect=_slow_job)
@@ -268,7 +270,7 @@ class BackgroundIndexTests(unittest.TestCase):
         staff_page = (PROJECT_DIR / "pages" / "5_Radar_control.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Faculty verification is paused", staff_page)
+        self.assertIn("Web-search fallback is paused", staff_page)
         self.assertIn('"search_providers": search_providers', store)
 
     def test_staff_dashboard_distinguishes_stalled_jobs(self) -> None:

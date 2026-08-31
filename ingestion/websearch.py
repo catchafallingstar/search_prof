@@ -7,19 +7,24 @@ import re
 import threading
 import time
 import unicodedata
+from contextlib import nullcontext
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
 from ddgs import DDGS
 from psycopg.types.json import Jsonb
 
 from db import get_db_connection
-from settings import setting, setting_int
+from ingestion.search_budget import SearchBudgetWait, search_slot, provider_capacity
+from ingestion.provider_quota import check_tavily_quota, check_searchapi_quota, brave_quota, save_remote_quota
+from settings import setting, setting_int, setting_bool
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
-SUPPORTED_PROVIDERS = ("searxng", "brave", "ddgs")
+SUPPORTED_PROVIDERS = ("langsearch", "searchapi", "parallel", "searxng", "brave", "tavily", "ddgs")
 
 _state_lock = threading.Lock()
 _provider_semaphores: dict[tuple[str, int], threading.BoundedSemaphore] = {}
@@ -127,6 +132,19 @@ def _results_match_query_anchor(
         normalized = set(re.findall(r"[a-z0-9]+", folded))
         if all(token in normalized for token in tokens):
             return True
+        # Retrieval-only normalization for split names such as "Vari Ny".
+        # Match the entire ordered name with optional internal whitespace;
+        # never edit letters or use this alone to verify the fetched identity.
+        name_pattern = r'\b' + r'\s+'.join(r'\s*'.join(map(re.escape, token)) for token in tokens) + r'\b'
+        if re.search(name_pattern, folded):
+            return True
+        target = re.search(r'\bsite:([a-z0-9.-]+)', query, re.I)
+        if target:
+            parsed = urlparse(str(result.get('href') or ''))
+            host = (parsed.hostname or '').lower()
+            domain = target.group(1).lower()
+            if (host == domain or host.endswith('.' + domain)) and re.search(r'/[^?#]*(?:faculty|directory|people|staff)', parsed.path, re.I):
+                return True  # Bounded directory locator; not a name/role decision.
     return False
 
 
@@ -184,6 +202,9 @@ def _brave_search(
         },
         timeout=setting_int("SEARCH_PROVIDER_TIMEOUT_SECONDS", 8, 3, 30),
     )
+    reported = brave_quota(response.headers)
+    if reported is not None:
+        save_remote_quota("brave", *reported)
     response.raise_for_status()
     return _normalize_results(
         list(response.json().get("web", {}).get("results", [])), max_results
@@ -199,14 +220,115 @@ def _fallback_search(query: str, max_results: int) -> list[dict[str, Any]]:
     if proxy_url:
         kwargs["proxy"] = proxy_url
     try:
-        items = list(DDGS(**kwargs).text(query, max_results=max_results))
+        items = list(DDGS(**kwargs).text(query, max_results=max_results, backend="duckduckgo"))
     except Exception as error:
         # DDGS raises an exception for some valid zero-result queries. A narrow
         # professor search returning nothing is not an upstream outage and must
         # not place the provider into a shared cooldown.
-        if "no results found" in str(error).casefold():
+        if str(error).strip().casefold() in {"no results found", "no results found."}:
             return []
         raise
+    return _normalize_results(items, max_results)
+
+
+def _tavily_search(query: str, max_results: int, api_key: str) -> list[dict[str, str]]:
+    # Basic is one credit; never let automatic parameters silently select advanced.
+    response = requests.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"query": query[:400], "search_depth": "basic", "topic": "general",
+              "max_results": max_results, "auto_parameters": False,
+              "include_answer": False, "include_raw_content": False},
+        timeout=setting_int("SEARCH_PROVIDER_TIMEOUT_SECONDS", 8, 3, 30),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload.get("results"), list):
+        raise RuntimeError("Tavily response missing results; not a valid empty search")
+    return _normalize_results(payload["results"], max_results)
+
+
+def _searchapi_search(query: str, max_results: int, api_key: str) -> list[dict[str, str]]:
+    """One SearchAPI.io Google request; never put credentials in URLs/logs."""
+    response = requests.get(
+        'https://www.searchapi.io/api/v1/search',
+        params={'engine': 'google', 'q': query[:400], 'gl': 'us', 'hl': 'en'},
+        headers={'Authorization': f'Bearer {api_key}', 'Accept': 'application/json'},
+        timeout=setting_int('SEARCHAPI_TIMEOUT_SECONDS', 20, 3, 60),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError('SearchAPI returned an invalid response')
+    status = (payload.get('search_metadata') or {}).get('status')
+    if payload.get('error') or payload.get('errors') or str(status).casefold() != 'success':
+        # Do not log arbitrary provider text: it may contain request details.
+        raise ValueError('SearchAPI did not report a successful search')
+    items = payload.get('organic_results', [])
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError('SearchAPI returned invalid organic results')
+    return _normalize_results([
+        {'href': item.get('link'), 'title': item.get('title'), 'body': item.get('snippet')}
+        for item in items
+    ], max_results)
+
+
+def _langsearch_search(query: str, max_results: int, api_key: str) -> list[dict[str, str]]:
+    """One bounded LangSearch request; returned summaries are not role proof."""
+    response = requests.post(
+        'https://api.langsearch.com/v1/web-search',
+        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+        json={'query': query[:400], 'freshness': 'noLimit', 'summary': False,
+              'count': max(1, min(10, max_results))},
+        timeout=setting_int('LANGSEARCH_TIMEOUT_SECONDS', 20, 3, 60),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError('LangSearch returned an invalid response')
+    code = payload.get('code')
+    # Some API failures are conveyed inside an HTTP-200 JSON envelope. Route
+    # those through the existing auth/quota/Retry-After circuit breaker too.
+    if isinstance(code, int) and not isinstance(code, bool) and 400 <= code <= 599:
+        failure = requests.Response()
+        failure.status_code = code
+        failure.headers = response.headers
+        raise requests.HTTPError(f'LangSearch API error (code {code})', response=failure)
+    data = payload.get('data')
+    pages = data.get('webPages') if isinstance(data, dict) else None
+    items = pages.get('value') if isinstance(pages, dict) else None
+    if (code != 200 or not isinstance(items, list) or
+            any(not isinstance(item, dict) or not isinstance(item.get('url'), str)
+                for item in items)):
+        raise ValueError('LangSearch returned invalid search results; not a valid empty search')
+    return _normalize_results([
+        {'href': item['url'], 'title': item.get('name'), 'body': item.get('snippet')}
+        for item in items
+    ], max(1, min(10, max_results)))
+
+
+def _parallel_search(query: str, max_results: int, api_key: str) -> list[dict[str, str]]:
+    """Parallel.ai is a service, independent of the concurrency strategy name."""
+    response = requests.post(
+        'https://api.parallel.ai/v1/search',
+        headers={'x-api-key': api_key, 'Content-Type': 'application/json'},
+        json={'search_queries': [query[:400]], 'mode': 'fast', 'max_chars_total': 8000},
+        timeout=setting_int('PARALLEL_TIMEOUT_SECONDS', 20, 3, 60),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if (not isinstance(payload, dict) or payload.get('error') or
+            not isinstance(payload.get('results'), list)):
+        raise ValueError('Parallel returned an invalid or unsuccessful search response')
+    items = []
+    for result in payload['results']:
+        if not isinstance(result, dict):
+            raise ValueError('Parallel returned invalid search results')
+        excerpts = result.get('excerpts') or []
+        if not isinstance(excerpts, list) or any(not isinstance(text, str) for text in excerpts):
+            raise ValueError('Parallel returned invalid excerpts')
+        items.append({'href': result.get('url'), 'title': result.get('title'),
+                      'body': '\n'.join(excerpts)[:8000]})
     return _normalize_results(items, max_results)
 
 
@@ -219,8 +341,16 @@ def _provider_names() -> list[str]:
     if not configured:
         # Preserve old installations until the operator explicitly enables the
         # provider pool. Never assume production SearXNG lives on localhost.
+        if setting("LANGSEARCH_API_KEY").strip():
+            configured.append("langsearch")
+        if setting("SEARCHAPI_API_KEY").strip():
+            configured.append("searchapi")
+        if setting("PARALLEL_API_KEY").strip():
+            configured.append("parallel")
         if setting("BRAVE_SEARCH_API_KEY").strip():
             configured.append("brave")
+        if setting("TAVILY_API_KEY").strip():
+            configured.append("tavily")
         if _searxng_url():
             configured.append("searxng")
         if (
@@ -233,12 +363,22 @@ def _provider_names() -> list[str]:
     for provider in configured:
         if provider not in SUPPORTED_PROVIDERS or provider in available:
             continue
+        if provider == "langsearch" and not setting("LANGSEARCH_API_KEY").strip():
+            continue
+        if provider == "searchapi" and not setting("SEARCHAPI_API_KEY").strip():
+            continue
+        if provider == "parallel" and not setting("PARALLEL_API_KEY").strip():
+            continue
         if provider == "searxng" and not _searxng_url():
             continue
         if provider == "brave" and not setting("BRAVE_SEARCH_API_KEY").strip():
             continue
+        if provider == "brave" and not setting_bool("BRAVE_STORAGE_ALLOWED", False):
+            continue  # This app persists search evidence; require suitable plan rights.
+        if provider == "tavily" and not setting("TAVILY_API_KEY").strip():
+            continue
         available.append(provider)
-    return available or ["ddgs"]
+    return [provider for provider in available if provider != "ddgs"] + ["ddgs"]
 
 
 def search_provider_runtime_state() -> dict[str, Any]:
@@ -248,14 +388,14 @@ def search_provider_runtime_state() -> dict[str, Any]:
     Retrying is useful as soon as the earliest configured provider is due.
     """
     providers = _provider_names()
-    blocked = {
-        provider: _persistent_block_remaining(provider)
-        for provider in providers
-    }
+    capacity = {provider: provider_capacity(provider) for provider in providers}
+    blocked = {provider: max(_persistent_block_remaining(provider), int(capacity[provider]["retry_after_seconds"]))
+               for provider in providers}
     available = [provider for provider, seconds in blocked.items() if seconds <= 0]
     waits = [seconds for seconds in blocked.values() if seconds > 0]
     return {
         "providers": providers,
+        "capacity": capacity,
         "available": available,
         "blocked": {
             provider: seconds for provider, seconds in blocked.items() if seconds > 0
@@ -285,7 +425,7 @@ def _provider_semaphore(provider: str) -> threading.BoundedSemaphore:
 
 
 def _pace(provider: str) -> None:
-    minimum = setting_int("SEARCH_MIN_INTERVAL_MS", 8000, 0, 30000) / 1000
+    minimum = setting_int("SEARCH_MIN_INTERVAL_MS", 60000, 1000, 3600000) / 1000
     with _state_lock:
         now = time.monotonic()
         start_at = max(now, _provider_next_start.get(provider, 0.0))
@@ -343,13 +483,28 @@ def _record_provider_success(provider: str) -> None:
 
 
 def _block_provider(provider: str, error: BaseException) -> int:
-    seconds = setting_int("SEARCH_PROVIDER_BACKOFF_SECONDS", 900, 30, 21600)
+    seconds = setting_int("SEARCH_PROVIDER_BACKOFF_SECONDS", 3600, 30, 21600)
     response = getattr(error, "response", None)
-    if response is not None and getattr(response, "status_code", None) in {403, 429}:
+    if response is None and isinstance(error, (requests.Timeout, requests.ConnectionError)):
+        # A single transport failure does not prove exhausted credits or a block.
+        seconds = setting_int("SEARCH_NETWORK_BACKOFF_SECONDS", 60, 30, 3600)
+    restricted = any(word in str(error).casefold() for word in ("captcha", "ratelimit", "rate limit", "too many", "429", "403"))
+    if restricted or (response is not None and getattr(response, "status_code", None) in {403, 429}):
         seconds = max(
             seconds,
             setting_int("SEARCH_RATE_LIMIT_BACKOFF_SECONDS", 3600, 300, 86400),
         )
+    if response is not None:
+        if getattr(response, "status_code", None) in {401, 402, 432, 433}:
+            seconds = max(seconds, 86400)  # auth / credits exhausted: use another provider
+        retry_after = str(response.headers.get("Retry-After", "")).strip()
+        try:
+            requested = int(retry_after) if retry_after.isdigit() else int(
+                (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
+            )
+            seconds = max(seconds, requested)
+        except (ValueError, TypeError, OverflowError):
+            pass
     with _state_lock:
         _provider_blocked_until[provider] = time.monotonic() + seconds
     try:
@@ -406,6 +561,9 @@ def _run_provider(
     _assert_provider_available(provider)
 
     functions: dict[str, Callable[[], list[dict[str, str]]]] = {
+        "langsearch": lambda: _langsearch_search(query, max_results, setting("LANGSEARCH_API_KEY").strip()),
+        "searchapi": lambda: _searchapi_search(query, max_results, setting("SEARCHAPI_API_KEY").strip()),
+        "parallel": lambda: _parallel_search(query, max_results, setting("PARALLEL_API_KEY").strip()),
         "searxng": lambda: _searxng_search(
             query, max_results, _searxng_url()
         ),
@@ -413,14 +571,41 @@ def _run_provider(
             query, max_results, setting("BRAVE_SEARCH_API_KEY").strip()
         ),
         "ddgs": lambda: _fallback_search(query, max_results),
+        "tavily": lambda: _tavily_search(query, max_results, setting("TAVILY_API_KEY").strip()),
     }
-    with _provider_semaphore(provider):
+    semaphore = _provider_semaphore(provider)
+    if not semaphore.acquire(blocking=False):
+        raise SearchProviderUnavailable(f"{provider} is serving another candidate", 2)
+    try:
         try:
             # Another thread or job may have blocked this provider while this
             # request waited for its concurrency slot.
             _assert_provider_available(provider)
-            _pace(provider)
-            results = functions[provider]()
+            if provider == "tavily":
+                check_tavily_quota()
+            elif provider == "searchapi":
+                check_searchapi_quota()
+            with search_slot(provider):
+                try:
+                    results = functions[provider]()
+                except Exception as error:
+                    # Persist the cooldown while the cross-process lock is held,
+                    # before releasing the provider semaphore or search slot.
+                    retry_after = _block_provider(provider, error)
+                    if getattr(getattr(error, 'response', None), 'status_code', None) == 402:
+                        raise SearchProviderUnavailable(
+                            f"{provider} has insufficient available credits (HTTP 402); using fallback",
+                            retry_after,
+                        ) from error
+                    raise SearchProviderUnavailable(
+                        f"{provider} search failed: {error}", retry_after
+                    ) from error
+                with _state_lock:
+                    _provider_blocked_until.pop(provider, None)
+                _record_provider_success(provider)
+        except SearchBudgetWait as error:
+            # A reserved slot/budget is not an upstream error or failed query.
+            raise SearchProviderUnavailable(str(error), error.retry_after_seconds) from error
         except SearchProviderUnavailable:
             raise
         except Exception as error:
@@ -432,39 +617,47 @@ def _run_provider(
                 f"{provider} search failed: {error}",
                 retry_after_seconds=retry_after,
             ) from error
-        with _state_lock:
-            _provider_blocked_until.pop(provider, None)
-        _record_provider_success(provider)
         return results
+    finally:
+        semaphore.release()
 
 
 def _cache_key(query: str, max_results: int) -> str:
     normalized = " ".join(query.casefold().split())
-    return hashlib.sha256(f"{normalized}|{max_results}".encode("utf-8")).hexdigest()
+    # A newly enabled provider must not inherit a different provider's empty query.
+    pool = ",".join(_provider_names()) + "|" + _provider_strategy()
+    return hashlib.sha256(f"{pool}|{normalized}|{max_results}".encode("utf-8")).hexdigest()
 
 
 def _read_cache(query: str, max_results: int) -> list[dict[str, str]] | None:
     if not _cache_enabled():
         return None
     try:
+        normalized = " ".join(query.casefold().split())
+        legacy_key = hashlib.sha256(f"{normalized}|{max_results}".encode("utf-8")).hexdigest()
+        current_key = _cache_key(query, max_results)
         with get_db_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT results_json
+                    SELECT results_json, provider_names
                     FROM web_search_cache
-                    WHERE query_key = %s AND expires_at > NOW()
+                    WHERE query_key = ANY(%s) AND expires_at > NOW()
+                    ORDER BY (query_key = %s) DESC
                     """,
-                    (_cache_key(query, max_results),),
+                    ([current_key, legacy_key], current_key),
                 )
-                row = cursor.fetchone()
-        if not row:
-            return None
-        value = row.get("results_json")
-        if isinstance(value, str):
-            value = json.loads(value)
-        results = _normalize_results(list(value or []), max_results)
-        return results if _results_match_query_anchor(query, results) else None
+                rows = cursor.fetchall()
+        for row in rows:
+            value = row.get("results_json")
+            if isinstance(value, str):
+                value = json.loads(value)
+            results = _normalize_results(list(value or []), max_results)
+            if results and _results_match_query_anchor(query, results):
+                return results  # Preserve usable pre-upgrade cached queries.
+            if not results and set(_provider_names()).issubset(set(row.get("provider_names") or [])):
+                return []  # A new provider still gets a chance on an old empty query.
+        return None
     except Exception:
         # Search continues during first-time setup or a temporary DB outage.
         return None
@@ -476,9 +669,9 @@ def _write_cache(
     results: list[dict[str, str]],
     providers: list[str],
 ) -> None:
-    if not results or not _cache_enabled():
+    if not _cache_enabled():
         return
-    hours = setting_int("SEARCH_CACHE_HOURS", 24, 1, 168)
+    hours = setting_int("SEARCH_CACHE_HOURS", 168, 1, 720) if results else setting_int("SEARCH_EMPTY_CACHE_HOURS", 24, 1, 168)
     now = datetime.now(timezone.utc)
     try:
         with get_db_connection() as connection:
@@ -525,12 +718,29 @@ def search_web(query: str, max_results: int = 3) -> list[dict[str, Any]]:
     after an empty/error response. ``parallel`` asks a bounded number of
     providers at once. SearXNG may itself aggregate several engines.
     """
-    max_results = max(1, min(10, int(max_results)))
+    max_results = max(1, min(20, int(max_results)))
+    from ingestion.verification_audit import CURRENT, remaining_seconds, emit, record_retrieval
+    identity_audit = CURRENT.get()
     cached = _read_cache(query, max_results)
     if cached is not None:
+        if identity_audit is not None:
+            useful = _results_match_query_anchor(query, cached)
+            record_retrieval(query, 'cache', cached, 'RESULTS' if useful else 'NO_USEFUL_RESULTS')
+            if not useful:
+                return []
         return cached
 
     providers = _provider_names()
+    from ingestion.verification_audit import CURRENT, remaining_seconds, emit
+    identity_audit = CURRENT.get()
+    if identity_audit is not None and identity_audit.get('version', 1) >= 2 and providers:
+        # A short normal pacing interval should not trigger a paid fallback or
+        # requeue the candidate. Long cooldowns/quota failures still fall back.
+        delay = provider_capacity(providers[0]).get('retry_after_seconds', 0)
+        if 0 < delay <= 5 and remaining_seconds() > delay + 1:
+            emit('identity_search_pacing', provider=providers[0], seconds=delay)
+            time.sleep(delay + 0.05)
+        remaining_seconds()
     strategy = _provider_strategy()
     used: list[str] = []
     batches: list[list[dict[str, str]]] = []
@@ -539,7 +749,10 @@ def search_web(query: str, max_results: int = 3) -> list[dict[str, Any]]:
 
     if strategy == "parallel" and len(providers) > 1:
         maximum = setting_int("SEARCH_PARALLEL_MAX_PROVIDERS", 2, 1, 3)
-        selected = providers[:maximum]
+        # Parallelize API providers only; DDGS remains the last-resort fallback.
+        selected = [provider for provider in providers if provider != "ddgs"][:maximum]
+        if not selected:
+            selected = ["ddgs"]
         with ThreadPoolExecutor(max_workers=len(selected)) as executor:
             futures = {
                 executor.submit(_run_provider, provider, query, max_results): provider
@@ -563,11 +776,25 @@ def search_web(query: str, max_results: int = 3) -> list[dict[str, Any]]:
                 except SearchProviderUnavailable as error:
                     unavailable.append(error)
                     print(str(error))
+        # Exhaustion of the parallel API group must still reach the remaining
+        # configured providers, including the final DuckDuckGo fallback.
+        if not batches:
+            for provider in [provider for provider in providers if provider not in selected]:
+                used.append(provider)
+                try:
+                    batch = _run_provider(provider, query, max_results)
+                    if batch and _results_match_query_anchor(query, batch):
+                        batches.append(batch)
+                        break
+                except SearchProviderUnavailable as error:
+                    unavailable.append(error)
     else:
         if strategy == "balanced" and len(providers) > 1:
             digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
-            offset = int(digest[:8], 16) % len(providers)
-            providers = providers[offset:] + providers[:offset]
+            apis = [provider for provider in providers if provider != "ddgs"]
+            if apis:
+                offset = int(digest[:8], 16) % len(apis)
+                providers = apis[offset:] + apis[:offset] + ["ddgs"]
         for provider in providers:
             used.append(provider)
             try:
@@ -576,6 +803,14 @@ def search_web(query: str, max_results: int = 3) -> list[dict[str, Any]]:
                 unavailable.append(error)
                 print(str(error))
                 continue
+            if identity_audit is not None:
+                useful = bool(batch) and _results_match_query_anchor(query, batch)
+                record_retrieval(query, provider, batch,
+                                 'RESULTS' if useful else 'NO_USEFUL_RESULTS')
+                # The service answered successfully. Change the identity query,
+                # not its availability state; don't buy a paid fallback for noise.
+                if not useful:
+                    return []
             if not batch:
                 provider_responded = True
                 continue
@@ -588,13 +823,19 @@ def search_web(query: str, max_results: int = 3) -> list[dict[str, Any]]:
                 retry_after_seconds=300,
             ))
 
-    if not provider_responded and unavailable:
+    if not batches and unavailable:
+        # A successful empty fallback must not hide a primary provider outage.
         retry_after = min(error.retry_after_seconds for error in unavailable)
         raise SearchUnavailable(
-            "All configured web-search providers are temporarily unavailable.",
+            "Web search waiting: " + "; ".join(str(error) for error in unavailable)[:700],
             retry_after_seconds=retry_after,
         )
 
     results = _merge_results(batches, max_results)
-    _write_cache(query, max_results, results, used)
+    # Expanded identity passes save selected evidence, not all 100 raw links.
+    # Existing cached responses remain reusable; other search callers still cache.
+    from ingestion.verification_audit import CURRENT
+    identity_audit = CURRENT.get()
+    if identity_audit is None or identity_audit.get('version', 1) < 2:
+        _write_cache(query, max_results, results, used)
     return results
