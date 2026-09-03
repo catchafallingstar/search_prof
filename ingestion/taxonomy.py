@@ -43,12 +43,19 @@ AGENCY_MATRIX = {
 }
 
 OPENALEX_TOPICS_URL = "https://api.openalex.org/topics"
+OPENALEX_NODE_TYPES = ("domain", "field", "subfield", "topic")
+MAX_OPENALEX_MAPPINGS = 12
 STOPWORDS = {"and", "for", "from", "into", "of", "research", "systems", "the", "using", "with"}
 
 # Query expansion is data-driven and shared by every field.  OpenAlex topics
 # supply most expansions.  Compound entries cover phrases whose everyday name
 # is broader than the titles used in papers (for example, "AI security").
 COMPOUND_QUERY_EXPANSIONS: dict[frozenset[str], list[str]] = {
+    frozenset({"math"}): [
+        "mathematics", "applied mathematics", "pure mathematics",
+        "mathematical analysis", "algebra", "geometry", "number theory",
+        "statistics", "probability",
+    ],
     frozenset({"ai", "security"}): [
         "network intrusion detection",
         "adversarial machine learning",
@@ -95,6 +102,20 @@ COMPOUND_QUERY_EXPANSIONS: dict[frozenset[str], list[str]] = {
         "Asian history",
         "Asian politics",
         "Asian culture",
+    ],
+}
+
+BROAD_QUERY_EXPANSIONS: dict[str, list[str]] = {
+    "artificial+intelligence": [
+        "machine learning",
+        "natural language processing",
+        "computer vision",
+        "reinforcement learning",
+        "AI security and robustness",
+        "knowledge representation and reasoning",
+        "AI planning",
+        "speech recognition",
+        "robotics and intelligent systems",
     ],
 }
 
@@ -188,6 +209,137 @@ def _topic_relevance(raw_query: str, topic: dict[str, Any]) -> float:
     return 2.0 if phrase_covers_query(raw_query, display_name) else 1.0
 
 
+def _short_openalex_id(value: object) -> str:
+    return str(value or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _canonical_name(value: str) -> str:
+    tokens = _tokens(value) - STOPWORDS
+    if "ai" in tokens or {"artificial", "intelligence"}.issubset(tokens):
+        tokens -= {"ai", "artificial", "intelligence"}
+        tokens.add("artificial+intelligence")
+    return " ".join(sorted(tokens))
+
+
+def _node_mapping(
+    node: dict[str, Any],
+    node_type: str,
+    *,
+    weight: float,
+    mapping_method: str,
+    parent_id: str | None = None,
+) -> dict[str, Any]:
+    node_id = _short_openalex_id(node.get("id"))
+    filter_field = "topics.id" if node_type == "topic" else f"topics.{node_type}.id"
+    return {
+        "openalex_id": node_id,
+        "node_type": node_type,
+        "display_name": str(node.get("display_name") or node_id),
+        "description": str(node.get("description") or ""),
+        "parent_id": _short_openalex_id(parent_id) or None,
+        "filter_field": filter_field,
+        "weight": round(float(weight), 3),
+        "mapping_method": mapping_method,
+    }
+
+
+def _hierarchy_nodes(topic: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    nodes: list[tuple[str, dict[str, Any]]] = []
+    for node_type in ("domain", "field", "subfield"):
+        node = topic.get(node_type) or {}
+        if node.get("id") and node.get("display_name"):
+            nodes.append((node_type, node))
+    if topic.get("id") and topic.get("display_name"):
+        nodes.append(("topic", topic))
+    return nodes
+
+
+def _exact_hierarchy_match(
+    raw_query: str, topics: list[dict[str, Any]]
+) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+    wanted = _canonical_name(raw_query)
+    if not wanted:
+        return None
+    # Prefer the broadest exact node. This makes "Computer Science" a field
+    # and "Artificial Intelligence" a subfield rather than one narrow topic.
+    for wanted_type in OPENALEX_NODE_TYPES:
+        for topic in topics:
+            for node_type, node in _hierarchy_nodes(topic):
+                if node_type == wanted_type and _canonical_name(
+                    str(node.get("display_name") or "")
+                ) == wanted:
+                    return node_type, node, topic
+    return None
+
+
+def _topic_lookup(search: str) -> list[dict[str, Any]]:
+    params: dict[str, object] = {"search": search, "per_page": 25}
+    contact_email = setting("OPENALEX_EMAIL").strip()
+    if contact_email:
+        params["mailto"] = contact_email
+    api_key = setting("OPENALEX_API_KEY").strip()
+    if api_key:
+        params["api_key"] = api_key
+    return list(
+        openalex_get_json(OPENALEX_TOPICS_URL, params=params, timeout=10).get(
+            "results", []
+        )
+    )
+
+
+def _child_topic_mappings(
+    node_type: str, node: dict[str, Any]
+) -> list[dict[str, Any]]:
+    if node_type == "topic":
+        return []
+    node_id = _short_openalex_id(node.get("id"))
+    if not node_id:
+        return []
+    params: dict[str, object] = {
+        "filter": f"{node_type}.id:{node_id}",
+        "per_page": 100,
+    }
+    contact_email = setting("OPENALEX_EMAIL").strip()
+    if contact_email:
+        params["mailto"] = contact_email
+    api_key = setting("OPENALEX_API_KEY").strip()
+    if api_key:
+        params["api_key"] = api_key
+    children = list(
+        openalex_get_json(OPENALEX_TOPICS_URL, params=params, timeout=10).get(
+            "results", []
+        )
+    )
+    # A bounded, deterministic sample gives each broad field several lanes
+    # without turning one discovery pass into thousands of API requests.
+    if len(children) > MAX_OPENALEX_MAPPINGS - 1:
+        step = len(children) / float(MAX_OPENALEX_MAPPINGS - 1)
+        children = [children[int(index * step)] for index in range(MAX_OPENALEX_MAPPINGS - 1)]
+    return [
+        _node_mapping(
+            child,
+            "topic",
+            weight=0.75,
+            mapping_method="inherited_child",
+            parent_id=node_id,
+        )
+        for child in children
+        if child.get("id")
+    ]
+
+
+def _dedupe_mappings(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    distinct: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values:
+        key = (str(value.get("node_type")), str(value.get("openalex_id")))
+        if not key[1] or key in seen:
+            continue
+        seen.add(key)
+        distinct.append(value)
+    return distinct[:MAX_OPENALEX_MAPPINGS]
+
+
 def build_search_queries(raw_query: str, topic: dict[str, Any] | None = None) -> list[str]:
     """Return a small, deduplicated set of research searches for any field."""
     raw_tokens = _tokens(raw_query) - STOPWORDS
@@ -195,6 +347,7 @@ def build_search_queries(raw_query: str, topic: dict[str, Any] | None = None) ->
     for required, expansions in COMPOUND_QUERY_EXPANSIONS.items():
         if required.issubset(raw_tokens):
             queries.extend(expansions)
+    queries.extend(BROAD_QUERY_EXPANSIONS.get(_canonical_name(raw_query), []))
     if topic:
         display_name = str(topic.get("display_name") or "").strip()
         if display_name:
@@ -209,7 +362,7 @@ def build_search_queries(raw_query: str, topic: dict[str, Any] | None = None) ->
         if normalized and normalized not in seen:
             seen.add(normalized)
             distinct.append(" ".join(query.split()))
-    return distinct[:6]
+    return distinct[:10]
 
 
 def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
@@ -225,34 +378,77 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
         "domain_name": "Unknown",
         "keywords": [clean_query],
         "search_queries": build_search_queries(clean_query),
+        "openalex_mappings": [],
+        "query_level": "text",
         "agency_category": "UNSUPPORTED",
         "router_config": AGENCY_MATRIX["UNSUPPORTED"],
     }
-    params: dict[str, object] = {"search": clean_query, "per_page": 25}
-    contact_email = setting("OPENALEX_EMAIL").strip()
-    if contact_email:
-        params["mailto"] = contact_email
-    api_key = setting("OPENALEX_API_KEY").strip()
-    if api_key:
-        params["api_key"] = api_key
-
     try:
-        results = openalex_get_json(
-            OPENALEX_TOPICS_URL,
-            params=params,
-            timeout=10,
-        ).get("results", [])
+        results = _topic_lookup(clean_query)
         if not results:
             return fallback
-        ranked = sorted(
-            ((_topic_relevance(clean_query, topic), topic) for topic in results),
-            key=lambda pair: pair[0],
-            reverse=True,
+        exact = _exact_hierarchy_match(clean_query, results)
+        clean_tokens = _tokens(clean_query) - STOPWORDS
+        is_compound_query = any(
+            required.issubset(clean_tokens)
+            for required in COMPOUND_QUERY_EXPANSIONS
         )
-        if not ranked or ranked[0][0] <= 0:
-            print(f"OpenAlex returned no relevant topic for {clean_query!r}; using direct works search.")
-            return fallback
-        topic = ranked[0][1]
+        # A compound area such as AI security crosses several OpenAlex topics.
+        # An exact detailed-topic label is evidence, but must not collapse the
+        # whole user request back to that one topic.
+        if exact and not (exact[0] == "topic" and is_compound_query):
+            node_type, node, representative_topic = exact
+            parent = {
+                "topic": representative_topic.get("subfield"),
+                "subfield": representative_topic.get("field"),
+                "field": representative_topic.get("domain"),
+                "domain": None,
+            }.get(node_type) or {}
+            mappings = [
+                _node_mapping(
+                    node,
+                    node_type,
+                    weight=1.0,
+                    mapping_method="exact_hierarchy",
+                    parent_id=parent.get("id"),
+                ),
+            ]
+            topic = representative_topic
+            topic_name = str(node.get("display_name") or clean_query)
+            query_level = node_type
+        else:
+            lookup_terms = [clean_query, *build_search_queries(clean_query)]
+            lookup_terms = list(dict.fromkeys(lookup_terms))[:4]
+            scored_topics: list[tuple[float, dict[str, Any]]] = [
+                (_topic_relevance(clean_query, topic), topic) for topic in results
+            ]
+            for term in lookup_terms[1:]:
+                scored_topics.extend(
+                    (_topic_relevance(term, topic) * 0.85, topic)
+                    for topic in _topic_lookup(term)
+                )
+            ranked = sorted(scored_topics, key=lambda pair: pair[0], reverse=True)
+            relevant = [topic for score, topic in ranked if score > 0]
+            if not relevant:
+                print(
+                    f"OpenAlex returned no relevant taxonomy node for {clean_query!r}; "
+                    "using direct works search."
+                )
+                return fallback
+            topic = relevant[0]
+            mappings = [
+                _node_mapping(
+                    value,
+                    "topic",
+                    weight=1.0 if index == 0 else 0.85,
+                    mapping_method="topic_search",
+                    parent_id=(value.get("subfield") or {}).get("id"),
+                )
+                for index, value in enumerate(relevant[:MAX_OPENALEX_MAPPINGS])
+            ]
+            topic_name = clean_query
+            query_level = "cross_topic" if len(mappings) > 1 else "topic"
+        mappings = _dedupe_mappings(mappings)
         field_name = str((topic.get("field") or {}).get("display_name") or "Unknown")
         domain_name = str((topic.get("domain") or {}).get("display_name") or "Unknown")
         category = "UNSUPPORTED"
@@ -262,12 +458,24 @@ def normalize_taxonomy(raw_query: str) -> dict[str, Any]:
                 break
         return {
             "raw_query": clean_query,
-            "topic_id": topic.get("id"),
-            "topic_name": topic.get("display_name") or clean_query,
+            "topic_id": next(
+                (
+                    value["openalex_id"]
+                    for value in mappings
+                    if value["node_type"] == "topic"
+                ),
+                None,
+            ),
+            "topic_name": topic_name,
             "field_name": field_name,
             "domain_name": domain_name,
             "keywords": topic.get("keywords") or [clean_query],
-            "search_queries": build_search_queries(clean_query, topic),
+            "search_queries": build_search_queries(
+                clean_query,
+                None if query_level in {"domain", "field", "subfield"} else topic,
+            ),
+            "openalex_mappings": mappings,
+            "query_level": query_level,
             "agency_category": category,
             "router_config": AGENCY_MATRIX[category],
         }

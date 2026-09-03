@@ -17,7 +17,6 @@ from db import (
 )
 from ingestion.check_grants import check_and_save_grants
 from ingestion.fetch_prof import fetch_professors_by_keywords
-from ingestion.hiring_discovery import discover_hiring_first_leads
 from ingestion.parse_hiring_signals import scan_hiring_signals
 from ingestion.taxonomy import normalize_taxonomy
 from ingestion.verify_faculty import (
@@ -48,7 +47,7 @@ def execute_radar(
     if (
         continue_partial
         and reused
-        and run["status"] == "completed"
+        and run["status"] in {"completed", "exhausted"}
         and int(run.get("professors_found") or 0) < target_professors
         and int(run.get("faculty_identities_checked") or 0)
             < int(run.get("candidates_ranked") or 0)
@@ -68,7 +67,11 @@ def execute_radar(
     run_id = int(run["id"])
     if reused:
         if progress_callback:
-            message = "Using recent cached radar results" if run["status"] == "completed" else "This radar scan is already running"
+            message = (
+                "Using recent radar results"
+                if run["status"] in {"completed", "exhausted"}
+                else "This radar scan is already running"
+            )
             progress_callback(message, int(run["progress"]), {})
         return {
             "run": run,
@@ -86,6 +89,7 @@ def execute_radar(
         "grants_added": 0,
         "signals_added": 0,
     }
+    verification_deferred = 0
 
     def progress(stage: str, percent: int, updates: dict[str, int] | None = None) -> None:
         if updates:
@@ -111,23 +115,19 @@ def execute_radar(
         )
         ranked_ids = list(discovery.get("professor_ids") or [])
         progress(
-            "Searching first for explicit recruiting pages",
+            "Preparing faculty identity checks",
             22,
             {
                 "papers_found": discovery["papers"],
                 "candidates_ranked": len(ranked_ids),
             },
         )
-        hiring_leads = discover_hiring_first_leads(query, ranked_ids)
-
-        # Explicit hiring leads are verified first. Then continue through the
-        # research ranking in small batches until the requested verified result
-        # maximum is reached, candidates are exhausted, or the time budget ends.
-        verification_order = [
-            *[value for value in ranked_ids if int(value) in hiring_leads],
-            *[value for value in ranked_ids if int(value) not in hiring_leads],
-        ]
-        cached_decisions = get_cached_faculty_decisions(ranked_ids)
+        # Hiring evidence is checked only after identity verification has
+        # established trusted faculty, personal, and lab pages.
+        verification_order = list(ranked_ids)
+        cached_decisions = get_cached_faculty_decisions(
+            ranked_ids, max_age_days=7
+        )
         verified_set = {int(value) for value in cached_decisions["verified_ids"]}
         decided_set = {int(value) for value in cached_decisions["decided_ids"]}
         identities_evaluated = len(decided_set)
@@ -135,17 +135,8 @@ def execute_radar(
             value for value in verification_order if int(value) not in decided_set
         ]
         batch_size = setting_int("FACULTY_VERIFY_BATCH_SIZE", 8, 3, 30)
-        default_verify_budgets = {10: 60, 25: 90, 50: 105, 100: 120}
-        verify_budget = setting_int(
-            "FACULTY_VERIFY_BUDGET_SECONDS",
-            default_verify_budgets.get(target_professors, 90),
-            15,
-            300,
-        )
-        verify_deadline = time.monotonic() + verify_budget
-
         for offset in range(0, len(pending_ids), batch_size):
-            if len(verified_set) >= target_professors or time.monotonic() >= verify_deadline:
+            if len(verified_set) >= target_professors:
                 break
             batch = pending_ids[offset: offset + batch_size]
             progress(
@@ -153,13 +144,18 @@ def execute_radar(
                 min(42, 26 + int(16 * identities_evaluated / max(1, len(ranked_ids)))),
                 {"faculty_identities_checked": identities_evaluated},
             )
-            verification = verify_faculty_candidates(batch)
+            verification = verify_faculty_candidates(
+                batch, cache_max_age_days=7
+            )
+            verification_deferred += int(verification.get("deferred") or 0)
+            # A fresh conflict/non-faculty/unresolved decision must not leave
+            # this run displaying an older cached VERIFIED outcome.
+            verified_set.difference_update(int(value) for value in batch)
             identities_evaluated += int(verification.get("evaluated") or len(batch))
             verified_set.update(int(value) for value in verification["verified_ids"])
 
         selected_ids = [
-            *[value for value in ranked_ids if int(value) in hiring_leads and int(value) in verified_set],
-            *[value for value in ranked_ids if int(value) not in hiring_leads and int(value) in verified_set],
+            value for value in ranked_ids if int(value) in verified_set
         ][:target_professors]
         selected_set = {int(value) for value in selected_ids}
         verified_prospects = [
@@ -177,19 +173,18 @@ def execute_radar(
             },
         )
 
-        # Search results help prioritize identity candidates, but they do not
-        # establish that a page belongs to the professor. Only the trusted-page
-        # scanner below may create a public hiring signal.
+        # Only the trusted-page scanner below may create a public hiring signal.
         lead_signals_added = 0
 
         progress("Checking current public grants", 45)
         professor_ids = [int(value) for value in selected_ids]
-        enrichment_ids = prioritize_professors_for_enrichment([
-            *[value for value in professor_ids if value in hiring_leads],
-            *[value for value in professor_ids if value not in hiring_leads],
-        ])[:web_check_limit]
-        grants = check_and_save_grants(taxonomy, professor_ids=enrichment_ids)
-        mark_radar_prospects_checked(run_id, enrichment_ids, "grants")
+        # Grant lookup is a cheap, professor-keyed NSF request and must cover
+        # every verified result in this search. Keep the bounded priority list
+        # only for the slower public-web hiring checks.
+        grant_ids = professor_ids
+        enrichment_ids = prioritize_professors_for_enrichment(professor_ids)[:web_check_limit]
+        grants = check_and_save_grants(taxonomy, professor_ids=grant_ids)
+        mark_radar_prospects_checked(run_id, grant_ids, "grants")
         progress(
             "Locating laboratory pages and hiring announcements",
             55,
@@ -213,11 +208,7 @@ def execute_radar(
         mark_radar_prospects_checked(
             run_id, list(signals.get("checked_professor_ids") or []), "public"
         )
-        final_stage = (
-            "Time budget reached; saving partial results"
-            if signals.get("timed_out")
-            else "Saving attributed public evidence"
-        )
+        final_stage = "Saving attributed public evidence"
         progress(
             final_stage,
             95,
@@ -226,14 +217,35 @@ def execute_radar(
                 "signals_added": lead_signals_added + signals["signals_added"],
             },
         )
-        finish_radar_run(run_id, topic, counters)
-        progress("Complete", 100)
+        if len(verified_prospects) >= target_professors:
+            final_status, completion_stage = "completed", "Goal reached"
+        elif verification_deferred:
+            final_status, completion_stage = "waiting", "Waiting for search sources"
+        else:
+            final_status, completion_stage = "exhausted", "Candidate pool checked"
+        finish_radar_run(
+            run_id, topic, counters, status=final_status, stage=completion_stage
+        )
+        progress(completion_stage, 100)
         return {
             "run": fetch_radar_run(run_id),
             "cached": False,
             "continued": continued_partial,
             "results": fetch_radar_results(run_id),
             "professors": fetch_radar_prospects(run_id),
+            "report_details": {
+                "topic": topic,
+                "prospects": verified_prospects,
+                "grant_checks": [
+                    {**item, "sources_checked": [
+                        check["source"] for check in grants.get("source_checks", [])
+                        if check.get("professor_id") == item.get("professor_id")
+                        and check.get("status") in {"CHECKED", "DISABLED", "NOT_APPLICABLE"}
+                    ]}
+                    for item in (grants.get("results") or [])
+                ],
+                "hiring_checks": list(signals.get("checks") or []),
+            },
         }
     except Exception as error:
         fail_radar_run(run_id, str(error))

@@ -16,10 +16,27 @@ class IdentityPassLimit(RuntimeError):
 
 def remaining_seconds():
     audit = CURRENT.get()
-    seconds = (audit or {}).get('_deadline', time.monotonic() + 60) - time.monotonic()
+    deadline = (audit or {}).get('_search_deadline')
+    if deadline is None:
+        # Page analysis and evidence storage have no aggregate clock. Their
+        # individual network calls retain their own socket timeouts.
+        return 86_400.0
+    seconds = deadline - time.monotonic()
     if seconds <= 0:
-        raise IdentityPassLimit('Identity check reached its time budget; saved sources show what remains unresolved')
+        raise IdentityPassLimit('This search query reached its 90-second time limit.')
     return seconds
+
+
+def begin_search(seconds):
+    audit = CURRENT.get()
+    if audit is not None:
+        audit['_search_deadline'] = time.monotonic() + max(1, int(seconds))
+
+
+def end_search():
+    audit = CURRENT.get()
+    if audit is not None:
+        audit.pop('_search_deadline', None)
 
 
 def emit(event, **details):
@@ -40,15 +57,22 @@ def finish(audit, decision):
     audit['results'] = chosen or all_results[:10]
     audit['retention'] = 'identity_sources' if chosen else 'first_ten_no_identity_source'
     audit['outcome'] = decision.get('status', 'UNVERIFIED')
-    if audit['outcome'] in {'VERIFIED', 'NOT_FACULTY', 'CONFLICT'}:
+    if audit['outcome'] in {'VERIFIED', 'NOT_FACULTY', 'OUT_OF_SCOPE', 'CONFLICT'}:
         audit['stopping_reason'] = {
             'VERIFIED': 'Stopped early: faculty identity established',
-            'NOT_FACULTY': 'Stopped early: attributable non-faculty role established',
+            'NOT_FACULTY': (
+                'Completed targeted searches: possibly not faculty; staff confirmation recommended'
+                if decision.get('review_recommended')
+                else 'Stopped early: attributable non-faculty role established'
+            ),
+            'OUT_OF_SCOPE': 'Stopped early: faculty role is outside the current US-only scope',
             'CONFLICT': 'Stopped early: identity conflict requires review',
         }[audit['outcome']]
     audit['failure_code'] = decision.get('failure_code')
     audit['source_url'] = decision.get('source_url')
-    for key in ('scope_status', 'scope_reason', 'country_code', 'institution_name'):
+    for key in ('scope_status', 'scope_reason', 'country_code', 'institution_name',
+                'role_category', 'observed_employer', 'currentness', 'source_type',
+                'lookup_status'):
         if decision.get(key):
             audit[key] = decision[key]
     audit['reason'] = decision.get('reason') or decision.get('evidence_text') or 'No decisive role evidence'
@@ -113,7 +137,13 @@ def record_page(url, decision):
     event = {'url': str(url)[:2000], 'status': decision.get('status', 'UNVERIFIED'),
         'reason': decision.get('reason') or decision.get('evidence_text') or decision.get('method') or 'No attributable current faculty role established',
         'role': decision.get('title'), 'institution': decision.get('institution_name'),
-        'failure_code': decision.get('failure_code')}
+        'failure_code': decision.get('failure_code'),
+        'role_category': decision.get('role_category'),
+        'observed_employer': decision.get('observed_employer'),
+        'currentness': decision.get('currentness'),
+        'source_type': decision.get('source_type'),
+        'lookup_status': decision.get('lookup_status'),
+        'scope_status': decision.get('scope_status')}
     document = audit.get('_documents', {}).get(url, {})
     event.update({key: document[key] for key in (
         'http_status', 'final_url', 'content_type', 'response_bytes', 'title',
@@ -142,9 +172,9 @@ def note_result(url, reason, snippet_hint=''):
 
 def new_audit(candidate):
     fields = list(dict.fromkeys(p['matched_query'] for p in candidate.get('recent_papers') or [] if p.get('matched_query')))
-    return {'checked_at': datetime.now(timezone.utc).isoformat(), 'version': 2,
+    return {'checked_at': datetime.now(timezone.utc).isoformat(), 'version': 3,
         'candidate_name': candidate.get('name'),
-        'field': candidate.get('sample_field') or ', '.join(fields) or candidate.get('research_domain'),
+        'field': ', '.join(fields) or candidate.get('sample_field') or candidate.get('research_domain'),
         'imported_university': candidate.get('institution_name'),
         'queries': [], 'results': [], 'pages': [], 'outcome': 'RUNNING'}
 

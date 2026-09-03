@@ -72,6 +72,11 @@ def source_kind(url, summary, *, name_matches, official=False, profile_title=Fal
     if host.endswith('.github.io') or re.search(r'/~|/people/|/team|/about|/profile|/authors/', path) or (
             profile_title and re.search(r'personal|homepage|home page|researcher|professor|student', summary, re.I)):
         return 'personal'
+    # An exact-person title on a non-aggregator root page is a useful personal
+    # homepage lead. It is stored as a lead only; opening and attribution are
+    # still required before it can support identity or hiring evidence.
+    if profile_title and path in {'', '/'}:
+        return 'personal'
     return None
 
 

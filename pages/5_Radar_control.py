@@ -44,6 +44,7 @@ STATUS_LABELS = {
 IDENTITY_STATUS_LABELS = {
     "VERIFIED": "Faculty confirmed",
     "NOT_FACULTY": "Not an eligible professor",
+    "OUT_OF_SCOPE": "Faculty outside the US-only scope",
     "CONFLICT": "Identity conflict",
     "MANUAL_REVIEW": "Needs staff confirmation",
     "UNVERIFIED": "Not enough evidence",
@@ -54,6 +55,13 @@ IDENTITY_METHOD_LABELS = {
     "official_directory_openalex_history": "Official page + affiliation history",
     "official_directory_publication_link": "Official page + matching publication",
     "researcher_profile_publication_link": "Researcher page + matching publication",
+    "attributed_current_nonfaculty_profile": "Current nonfaculty role on exact-name profile",
+    "linkedin_no_faculty_headline": "LinkedIn headline + no faculty profile",
+    "k12_organization_no_faculty_profile": "K–12 organization + no university faculty profile",
+    "completed_three_query_no_faculty_profile": "Three searches found no faculty profile",
+    "personal_current_faculty_claim": "Personal faculty claim awaiting official confirmation",
+    "non_us_faculty_profile": "Faculty profile outside US scope",
+    "current_research_institute_faculty_profile": "Current research-institute faculty profile",
     "official_non_appointment_page": "Official guest/event page - not an appointment",
     "automatic_search": "Automatic search",
     "gemini_assisted": "Gemini-assisted extraction",
@@ -73,6 +81,7 @@ ACTIVITY_STAGE_LABELS = {
 ACTIVITY_RESULT_LABELS = {
     "VERIFIED": "Faculty identity verified",
     "NOT_FACULTY": "Not an eligible professor",
+    "OUT_OF_SCOPE": "Faculty outside the US-only scope",
     "UNVERIFIED": "Not enough evidence",
     "CONFLICT": "Conflicting identity evidence",
     "MANUAL_REVIEW": "Needs staff review",
@@ -254,23 +263,27 @@ def render_identity_context(identity: dict) -> None:
 
     evidence_rows = list(identity.get("identity_evidence") or [])
     if evidence_rows:
-        st.markdown("**Official pages checked automatically**")
+        st.markdown("**Saved identity sources**")
         st.dataframe(
             [
                 {
+                    "Source type": str(row.get("source_type") or "Unknown").replace("_", " ").title(),
                     "Page says": " · ".join(
                         value
                         for value in (
                             row.get("observed_title"),
-                            row.get("observed_institution"),
+                            row.get("observed_employer") or row.get("observed_institution"),
                         )
                         if value
                     ) or "Identity found",
+                    "When": row.get("currentness") or "Unknown",
+                    "Lookup": str(row.get("lookup_status") or "Unknown").replace("_", " ").title(),
                     "Result": IDENTITY_STATUS_LABELS.get(
                         row.get("verification_status"),
                         row.get("verification_status") or "Unresolved",
                     ),
                     "Checked": row.get("checked_at"),
+                    "Evidence": row.get("evidence_excerpt") or row.get("evidence_text") or "—",
                     "Source": row.get("source_url"),
                 }
                 for row in evidence_rows
@@ -306,6 +319,14 @@ def render_identity_editor(
         )
     elif identity["faculty_status"] in {"CONFLICT", "MANUAL_REVIEW"}:
         st.warning("This person is hidden from public results until the identity is resolved.")
+    elif (
+        identity["faculty_status"] == "NOT_FACULTY"
+        and float(identity.get("faculty_confidence") or 0) < 0.8
+    ):
+        st.warning(
+            "Possibly not faculty. The targeted searches completed without finding "
+            "a current faculty profile. Please correct this decision if the evidence is incomplete."
+        )
     render_identity_context(identity)
     reason = identity.get("review_reason") or identity.get("decision_reason")
     if reason:
@@ -327,7 +348,7 @@ def render_identity_editor(
         )
         actions = [
             "Keep automatic decision",
-            "Retry automatic check",
+            "Mark as needs more evidence",
             "Confirm faculty identity",
             "Mark as not faculty",
         ]
@@ -341,7 +362,7 @@ def render_identity_editor(
         return
     decision = {
         "Confirm faculty identity": "VERIFIED",
-        "Retry automatic check": "RETRY",
+        "Mark as needs more evidence": "RETRY",
         "Mark as not faculty": "NOT_FACULTY",
     }[action]
     if decision == "VERIFIED" and not is_official_institution_url(source_url):
@@ -741,7 +762,7 @@ if operations["identity_review"]:
                 identity,
                 int(user["id"]),
                 key_prefix="identity_review",
-                default_action="Retry automatic check",
+                default_action="Mark as needs more evidence",
             )
     if identity_limit < len(operations["identity_review"]):
         if st.button("Show 10 more identity reviews"):
@@ -766,12 +787,13 @@ automatic_decisions = operations["identity_decisions"]
 if automatic_decisions:
     category = st.selectbox(
         "Show automatic decisions",
-        ["All", "Faculty confirmed", "Not eligible", "Unresolved"],
+        ["All", "Faculty confirmed", "Not eligible", "Outside US scope", "Unresolved"],
     )
     category_statuses = {
-        "All": {"VERIFIED", "NOT_FACULTY", "CONFLICT", "MANUAL_REVIEW", "UNVERIFIED"},
+        "All": {"VERIFIED", "NOT_FACULTY", "OUT_OF_SCOPE", "CONFLICT", "MANUAL_REVIEW", "UNVERIFIED"},
         "Faculty confirmed": {"VERIFIED"},
         "Not eligible": {"NOT_FACULTY"},
+        "Outside US scope": {"OUT_OF_SCOPE"},
         "Unresolved": {"CONFLICT", "MANUAL_REVIEW", "UNVERIFIED"},
     }
     visible_decisions = [

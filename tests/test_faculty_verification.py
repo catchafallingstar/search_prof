@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ingestion.verify_faculty import (
+    _ascii_fold,
     _domain_matches_institution,
     _edu_domain,
     _institution_for_domain,
@@ -23,6 +24,55 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 
 
 class FacultyVerificationTests(unittest.TestCase):
+    def test_name_folding_handles_non_decomposing_latin_letters(self) -> None:
+        cases = {
+            "Şafak Kayıkçı": "Safak Kayikci",
+            "Søren Łukasz": "Soren Lukasz",
+            "François L'Œuf": "Francois LOEuf",
+            "Þórður Đorđević": "Thordur Dordevic",
+        }
+        for original, expected in cases.items():
+            with self.subTest(original=original):
+                self.assertEqual(_ascii_fold(original), expected)
+
+    def test_turkish_original_matches_ascii_faculty_profile(self) -> None:
+        from ingestion.verify_faculty import _identity_matches, _profile_title_matches
+
+        self.assertTrue(_identity_matches(
+            "Şafak Kayıkçı",
+            "Safak Kayikci Assistant Professor of Teaching at Florida Atlantic University",
+        ))
+        self.assertTrue(_profile_title_matches(
+            "Şafak Kayıkçı", "Safak Kayikci | Florida Atlantic University"
+        ))
+
+    @patch(
+        "ingestion.verify_faculty._institution_for_domain",
+        return_value="Florida Atlantic University",
+    )
+    @patch("ingestion.verify_faculty._fetch_official_page")
+    def test_turkish_name_verifies_from_ascii_official_profile(
+        self, fetch_page, _institution
+    ) -> None:
+        fetch_page.return_value = (
+            "Safak Kayikci Assistant Professor of Teaching, Department of "
+            "Electrical Engineering and Computer Science, Florida Atlantic University.",
+            "Safak Kayikci | Florida Atlantic University",
+        )
+        result = inspect_faculty_result(
+            {
+                "name": "Şafak Kayıkçı",
+                "institution_name": "Florida Atlantic University",
+            },
+            {
+                "title": "Safak Kayikci | Florida Atlantic University",
+                "body": "Assistant Professor of Teaching at Florida Atlantic University",
+                "href": "https://www.fau.edu/engineering/directory/faculty/kayikci/",
+            },
+        )
+        self.assertEqual(result["status"], "VERIFIED")
+        self.assertIn("Assistant Professor", result["title"])
+
     def setUp(self):
         # These unit tests exercise identity rules, never live DOI discovery.
         locator = patch('ingestion.paper_affiliations._pdf_url_from_doi', return_value='')
@@ -233,7 +283,7 @@ class FacultyVerificationTests(unittest.TestCase):
     @patch("ingestion.verify_faculty._openalex_move_corroborates", return_value=False)
     @patch("ingestion.verify_faculty._institution_for_domain", return_value="Shandong University")
     @patch("ingestion.verify_faculty._fetch_official_page")
-    def test_matching_publication_links_a_common_name_to_a_new_institution(
+    def test_matching_publication_at_non_us_institution_is_out_of_scope(
         self, fetch_page, _institution, _move
     ) -> None:
         paper_title = "A survey on large language model security and privacy"
@@ -254,8 +304,8 @@ class FacultyVerificationTests(unittest.TestCase):
                 "href": "https://faculty.sdu.edu.cn/yue-zhang",
             },
         )
-        self.assertEqual(result["status"], "CONFLICT")
-        self.assertEqual(result["method"], "institution_mismatch_review")
+        self.assertEqual(result["status"], "OUT_OF_SCOPE")
+        self.assertEqual(result["method"], "non_us_official_faculty_profile")
 
     def test_common_international_academic_domains_are_recognized(self) -> None:
         self.assertEqual(_edu_domain("https://faculty.sdu.edu.cn/yue"), "sdu.edu.cn")
@@ -264,7 +314,7 @@ class FacultyVerificationTests(unittest.TestCase):
 
     @patch("ingestion.verify_faculty.assess_identity_with_gemini", return_value=None)
     @patch("ingestion.verify_faculty.search_web", return_value=[])
-    def test_identity_search_uses_target_university_then_paper_queries(
+    def test_identity_search_uses_exactly_three_targeted_queries(
         self, search_web, _gemini
     ) -> None:
         verify_faculty_candidate({
@@ -273,17 +323,15 @@ class FacultyVerificationTests(unittest.TestCase):
             "recent_papers": [{
                 "title": "A survey on large language model security and privacy",
                 "doi": "https://doi.org/10.1016/j.hcc.2024.100211",
+                "matched_query": "AI security",
             }],
         })
         queries = [call.args[0] for call in search_web.call_args_list]
-        self.assertEqual(queries[0], '"Yue Zhang" "Drexel University"')
-        self.assertTrue(any(
-            "A survey on large language model" in query
-            and '"Drexel University"' in query
-            for query in queries
-        ))
-        self.assertNotIn("10.1016/j.hcc.2024.100211", " ".join(queries))
-        self.assertNotIn('"Yue Zhang" faculty professor', queries)
+        self.assertEqual(queries, [
+            '"Yue Zhang" "Drexel University"',
+            '"Yue Zhang" site:drexel.edu',
+            '"Yue Zhang" "Drexel University" AI security',
+        ])
 
     @patch.dict('os.environ', {'FACULTY_IDENTITY_PASS_PAGES': '10', 'FACULTY_IDENTITY_PASS_QUERIES': '4'})
     @patch("ingestion.verify_faculty.assess_identity_with_gemini", return_value=None)
@@ -337,7 +385,7 @@ class FacultyVerificationTests(unittest.TestCase):
 
     @patch("ingestion.verify_faculty._institution_for_domain", return_value="University of Alberta")
     @patch("ingestion.verify_faculty._fetch_official_page")
-    def test_nonstandard_international_official_page_can_verify_faculty(
+    def test_nonstandard_international_official_page_is_out_of_scope(
         self, fetch_page, _institution
     ) -> None:
         fetch_page.return_value = (
@@ -352,7 +400,7 @@ class FacultyVerificationTests(unittest.TestCase):
                 "href": "https://www.ualberta.ca/computing-science/people/faculty/cor-paul-bezemer.html",
             },
         )
-        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(result["status"], "OUT_OF_SCOPE")
 
     def test_academic_pdf_can_reveal_the_personal_homepage_root(self) -> None:
         result = _profile_root_result(
@@ -367,11 +415,11 @@ class FacultyVerificationTests(unittest.TestCase):
     @patch("ingestion.verify_faculty._institution_for_domain", return_value="Hong Kong Polytechnic University")
     @patch("ingestion.verify_faculty._fetch_official_page")
     @patch("ingestion.verify_faculty.search_web")
-    def test_google_scholar_email_domain_only_locates_official_page(
+    def test_google_scholar_email_domain_locates_non_us_out_of_scope_page(
         self, search_web, fetch_page, _institution
     ) -> None:
         def results(query, max_results=5):
-            if query.startswith("site:comp.polyu.edu.hk"):
+            if "site:comp.polyu.edu.hk" in query:
                 return [{
                     "title": "Xiapu Luo | PolyU",
                     "body": "Professor at Hong Kong Polytechnic University",
@@ -398,15 +446,15 @@ class FacultyVerificationTests(unittest.TestCase):
                 "doi": "",
             }],
         })
-        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(result["status"], "OUT_OF_SCOPE")
         self.assertTrue(any(
-            call.args[0].startswith("site:comp.polyu.edu.hk")
+            "site:comp.polyu.edu.hk" in call.args[0]
             for call in search_web.call_args_list
         ))
 
     @patch("ingestion.verify_faculty._fetch_related_publication_text")
     @patch("ingestion.verify_faculty._fetch_official_page")
-    def test_paper_linked_researcher_profile_can_verify_when_official_page_blocks(
+    def test_paper_linked_non_us_faculty_profile_is_out_of_scope(
         self, fetch_page, related_text
     ) -> None:
         paper = "A 2030 Roadmap for Software Engineering"
@@ -427,8 +475,8 @@ class FacultyVerificationTests(unittest.TestCase):
                 "href": "https://abhikrc.com/",
             },
         )
-        self.assertEqual(result["status"], "VERIFIED")
-        self.assertEqual(result["method"], "researcher_profile_publication_link")
+        self.assertEqual(result["status"], "OUT_OF_SCOPE")
+        self.assertEqual(result["method"], "non_us_faculty_profile")
 
     @patch("ingestion.verify_faculty._fetch_related_publication_text")
     @patch("ingestion.verify_faculty._fetch_official_page")
@@ -521,7 +569,8 @@ class FacultyVerificationTests(unittest.TestCase):
             "institution_name": "University of Mount Union",
             "recent_papers": [],
         })
-        self.assertEqual(result["status"], "UNVERIFIED")
+        self.assertEqual(result["status"], "NOT_FACULTY")
+        self.assertLess(result["confidence"], 0.8)
         queries = [call.args[0] for call in search_web.call_args_list]
         self.assertFalse(any("University of San Diego" in query for query in queries))
         self.assertNotIn('"Vahraz Honary" faculty professor', queries)
@@ -555,7 +604,8 @@ class FacultyVerificationTests(unittest.TestCase):
             "institution_name": "Example University",
             "recent_papers": [{"title": "A Relevant Paper", "doi": ""}],
         })
-        self.assertEqual(result["status"], "UNVERIFIED")
+        self.assertEqual(result["status"], "NOT_FACULTY")
+        self.assertEqual(result["method"], "completed_three_query_no_faculty_profile")
         self.assertEqual(events[0], "metadata")
         self.assertLess(events.index("pdf"), events.index("search"))
 

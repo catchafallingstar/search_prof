@@ -37,7 +37,7 @@ class AuthorizationContractTests(unittest.TestCase):
         self.assertIn("def review_faculty_identity(", store)
         self.assertIn("owner_only=True", store)
         self.assertIn("Confirm faculty identity", page)
-        self.assertIn("Retry automatic check", page)
+        self.assertIn("Request another check", page)
         self.assertIn("Mark as not faculty", page)
 
 

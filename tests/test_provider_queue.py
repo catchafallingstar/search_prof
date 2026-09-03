@@ -15,18 +15,27 @@ class ProviderQueueTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.assertTrue(recently_checked({"faculty_checked_at": now - timedelta(days=29)}, now))
         self.assertFalse(recently_checked({"faculty_checked_at": now - timedelta(days=30)}, now))
+        self.assertTrue(recently_checked(
+            {"faculty_checked_at": now - timedelta(days=6)}, now, max_age_days=7
+        ))
+        self.assertFalse(recently_checked(
+            {"faculty_checked_at": now - timedelta(days=8)}, now, max_age_days=7
+        ))
         self.assertFalse(recently_checked({"identity_retry_at": now}, now))
 
     @patch("ingestion.verify_faculty.verify_faculty_candidate")
     @patch("ingestion.verify_faculty.get_db_connection")
-    def test_old_algorithm_does_not_trigger_recheck_inside_month(self, connection, verify):
+    def test_old_algorithm_is_rechecked_even_inside_month(self, connection, verify):
         cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
         cursor.fetchall.side_effect = [[{"id": 1, "faculty_status": "VERIFIED", "faculty_verification_version": 1,
             "faculty_checked_at": datetime.now(timezone.utc) - timedelta(days=3)}], []]
-        result = verify_faculty_candidates([1])
-        verify.assert_not_called()
-        self.assertEqual(result["verified_ids"], [])  # old decision is not made public
-        self.assertEqual(result["checked"], 0)
+        verify.return_value = {"status": "VERIFIED", "search_audit": {}}
+        with patch("ingestion.verify_faculty._save_result") as save_result:
+            result = verify_faculty_candidates([1])
+        verify.assert_called_once()
+        save_result.assert_called_once()
+        self.assertEqual(result["verified_ids"], [1])
+        self.assertEqual(result["checked"], 1)
 
     @patch("ingestion.verify_faculty.fetch_orcid_clues", return_value={})
     @patch("ingestion.verify_faculty.enrich_candidate_paper_affiliations", side_effect=lambda c, **kw: c)

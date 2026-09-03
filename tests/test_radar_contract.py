@@ -124,6 +124,7 @@ class RadarContractTests(unittest.TestCase):
         self.assertIn("for query in search_queries", source)
         self.assertIn('work["_scholarradar_relevance"]', source)
         self.assertIn('work["_scholarradar_matched_query"]', source)
+        self.assertIn('work["_scholarradar_matched_node_id"]', source)
         self.assertIn('"supporting_papers": []', source)
 
     def test_publication_affiliation_cannot_overwrite_safe_current_appointment(self) -> None:

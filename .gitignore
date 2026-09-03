@@ -37,3 +37,4 @@ before-*.sql
 *.dump
 # Private configuration and code backups created during local maintenance.
 /backups/
+data/college_scorecard/

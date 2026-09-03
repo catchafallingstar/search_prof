@@ -10,6 +10,16 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 
 
 class PublicRadarContractTests(unittest.TestCase):
+    def test_requested_topic_precedes_old_sample_field_in_activity(self):
+        from ingestion.verification_audit import new_audit
+        audit = new_audit({
+            'name': 'Jane Smith',
+            'sample_field': 'Machine Learning',
+            'research_domain': 'Machine Learning',
+            'recent_papers': [{'matched_query': 'Materials Science'}],
+        })
+        self.assertEqual(audit['field'], 'Materials Science')
+
     def test_schema_tracks_targeted_runs_and_rank(self) -> None:
         schema = (PROJECT_DIR / "db.sql").read_text(encoding="utf-8")
         self.assertIn("CREATE TABLE IF NOT EXISTS radar_runs", schema)
@@ -232,7 +242,7 @@ class PublicRadarContractTests(unittest.TestCase):
         with (
             patch("ingestion.radar_pipeline.setting", return_value="test-key"),
             patch("ingestion.radar_pipeline.setting_int", side_effect=lambda _n, default, _min, _max: default),
-            patch("ingestion.radar_pipeline.discover_hiring_first_leads", return_value={}),
+
             patch(
                 "ingestion.radar_pipeline.prioritize_professors_for_enrichment",
                 side_effect=lambda professor_ids: professor_ids,
@@ -253,7 +263,7 @@ class PublicRadarContractTests(unittest.TestCase):
         self.assertEqual(result["professors"][0]["professor_id"], 2)
         self.assertIn("Understanding the research topic", stages)
         self.assertTrue(any("Verifying faculty identities" in stage for stage in stages))
-        self.assertIn("Complete", stages)
+        self.assertIn("Candidate pool checked", stages)
         signals.assert_called_once_with(
             domain_name="AI safety",
             professor_ids=[2, 4, 8],
@@ -262,7 +272,7 @@ class PublicRadarContractTests(unittest.TestCase):
         )
         save_prospects.assert_called_once_with(42, prospect_rows)
         discover.assert_called_once_with(normalize.return_value, target_professors=25)
-        verify.assert_called_once_with([2, 4, 8])
+        verify.assert_called_once_with([2, 4, 8], cache_max_age_days=7)
         start_run.assert_called_once_with("AI safety", 25, 12, None)
         self.assertEqual(
             mark_checked.call_args_list,
@@ -271,7 +281,10 @@ class PublicRadarContractTests(unittest.TestCase):
                 call(42, [2, 4, 8], "public"),
             ],
         )
-        finish_run.assert_called_once()
+        finish_run.assert_called_once_with(
+            42, "AI safety", ANY,
+            status="exhausted", stage="Candidate pool checked",
+        )
         self.assertGreaterEqual(update_run.call_count, 6)
 
     @patch("ingestion.radar_pipeline.fetch_radar_prospects")

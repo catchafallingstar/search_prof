@@ -1,0 +1,19 @@
+{
+  "candidates": 9,
+  "outcomes": {
+    "NOT_FACULTY": 1,
+    "UNVERIFIED": 8
+  },
+  "requested_field": "Computer Vision",
+  "include_recently_checked": true,
+  "random_seed": 20260901,
+  "excluded_previous_candidates": 52,
+  "max_queries_per_candidate": 3,
+  "outbound_search_attempts": {
+    "parallel": 4,
+    "ddgs": 11
+  },
+  "identities_saved": 0,
+  "report": "/home/mel/search_prof/reports/verification-sample-20260902T044929Z",
+  "completed_at": "2026-09-02T05:00:24.617345+00:00"
+}

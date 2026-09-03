@@ -7,12 +7,13 @@ from urllib.parse import urlparse
 from db import get_db_connection
 from ingestion.homepagefinder import is_public_http_url
 from ingestion.matchers import clean_and_extract_hiring_quote
+from ingestion.name_normalization import name_tokens
 from ingestion.websearch import SearchUnavailable, search_web
 from settings import setting_int
 
 
 def _normalized_words(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+    return " ".join(name_tokens(value))
 
 
 def _result_names_candidate(name: str, result: dict[str, Any]) -> bool:
@@ -64,10 +65,13 @@ def discover_hiring_first_leads(
     for query in queries:
         try:
             results = search_web(query, max_results=per_query)
-        except SearchUnavailable:
-            # Missing providers must pause the indexing job. They must not be
-            # interpreted as an empty hiring search.
-            raise
+        except SearchUnavailable as error:
+            # This lane only changes verification order; it is not required to
+            # discover or verify professors. A provider outage or irrelevant
+            # result must not abort the entire radar run. Identity verification
+            # and later trusted-page hiring checks still run normally.
+            print(f"Hiring-first search skipped for {research_area}: {error}")
+            continue
         except Exception:
             continue
         for result in results:

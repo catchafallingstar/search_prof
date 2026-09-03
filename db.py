@@ -227,7 +227,7 @@ def start_or_reuse_radar_run(
                 SELECT * FROM radar_runs
                 WHERE query_key = %s
                   AND (
-                    (status = 'completed' AND completed_at > NOW() - (%s * INTERVAL '1 hour'))
+                    (status IN ('completed', 'exhausted') AND completed_at > NOW() - (%s * INTERVAL '1 hour'))
                     OR (status = 'running' AND heartbeat_at > NOW() - INTERVAL '2 minutes')
                   )
                 ORDER BY created_at DESC LIMIT 1
@@ -377,13 +377,18 @@ def finish_radar_run(
     run_id: int,
     normalized_topic: str,
     counters: dict[str, int],
+    *,
+    status: str = "completed",
+    stage: str = "Goal reached",
 ) -> None:
+    if status not in {"completed", "exhausted", "waiting"}:
+        raise ValueError("Unsupported final radar status.")
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE radar_runs
-                SET normalized_topic = %s, status = 'completed', stage = 'Complete',
+                SET normalized_topic = %s, status = %s, stage = %s,
                     progress = 100, professors_found = %s, papers_found = %s,
                     candidates_ranked = %s, faculty_identities_checked = %s,
                     professors_checked = %s, grants_added = %s, signals_added = %s,
@@ -392,6 +397,8 @@ def finish_radar_run(
                 """,
                 (
                     normalized_topic,
+                    status,
+                    stage,
                     counters.get("professors_found", 0), counters.get("papers_found", 0),
                     counters.get("candidates_ranked", 0),
                     counters.get("faculty_identities_checked", 0),

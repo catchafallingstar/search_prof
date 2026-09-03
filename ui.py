@@ -32,26 +32,40 @@ def configure_page(title: str) -> None:
     st.markdown(
         """
         <style>
-        [data-testid="stAppViewContainer"] { background: #f7faf7; }
-        [data-testid="stHeader"] { background: rgba(247,250,247,.88); }
+        :root {
+          --sr-blue: #00274c;
+          --sr-blue-strong: #001b33;
+          --sr-blue-soft: #e8f1fa;
+          --sr-maize: #ffcb05;
+          --sr-ink: #152536;
+          --sr-muted: #506274;
+          --sr-line: #b8c7d5;
+          --sr-surface: #ffffff;
+          --sr-cyan: #007c91;
+        }
+        [data-testid="stAppViewContainer"] {
+          background: radial-gradient(circle at 88% -8%, #d7ebfb 0, transparent 27rem), #f6f9fc;
+          color: var(--sr-ink);
+        }
+        [data-testid="stHeader"] { background: rgba(246,249,252,.92); }
         [data-testid="stSidebar"] { display: none; }
         /* The app does not use Streamlit's sidebar, so its expand arrow would
            open an invisible panel and then appear to vanish. */
         [data-testid="stExpandSidebarButton"] { display: none !important; }
         /* Streamlit's fixed header is about 3.5rem tall. Keep the custom
            navigation below it so the header cannot wash out or intercept it. */
-        .block-container { max-width: 1180px; padding-top: 4.25rem; padding-bottom: 4rem; }
+        .block-container { max-width: 1200px; padding-top: 4.25rem; padding-bottom: 4rem; }
         .st-key-sr_nav {
-          padding: .2rem 0 1.15rem;
+          padding: .2rem 0 1rem;
           margin-bottom: .25rem;
-          border-bottom: 1px solid rgba(49, 51, 63, .18);
+          border-bottom: 1px solid var(--sr-line);
         }
         .st-key-sr_nav button {
           min-height: 2.5rem;
-          border: 1px solid rgba(49, 51, 63, .22);
-          border-radius: .55rem;
+          border: 1px solid var(--sr-line);
+          border-radius: .45rem;
           background: #ffffff;
-          color: #253129;
+          color: var(--sr-blue);
           font-weight: 600;
           box-shadow: 0 1px 2px rgba(20, 40, 28, .04);
           transition: border-color .15s ease, background-color .15s ease,
@@ -62,25 +76,25 @@ def configure_page(title: str) -> None:
           min-height: 2.5rem;
           align-items: center;
           justify-content: center;
-          border: 1px solid rgba(49, 51, 63, .22);
-          border-radius: .55rem;
+          border: 1px solid var(--sr-line);
+          border-radius: .45rem;
           background: #ffffff;
-          color: #253129;
+          color: var(--sr-blue);
           font-weight: 600;
           text-decoration: none;
           box-shadow: 0 1px 2px rgba(20, 40, 28, .04);
         }
         .st-key-sr_nav .sr-nav-link:hover,
         .st-key-sr_nav .sr-nav-link:focus-visible {
-          border-color: #2f6d4b;
-          background: #edf7f0;
-          color: #17482e;
+          border-color: var(--sr-blue);
+          background: var(--sr-blue-soft);
+          color: var(--sr-blue-strong);
         }
         .st-key-sr_nav button:hover,
         .st-key-sr_nav button:focus-visible {
-          border-color: #2f6d4b;
-          background: #edf7f0;
-          color: #17482e;
+          border-color: var(--sr-blue);
+          background: var(--sr-blue-soft);
+          color: var(--sr-blue-strong);
           transform: translateY(-1px);
         }
         .st-key-nav_home button {
@@ -90,58 +104,79 @@ def configure_page(title: str) -> None:
           box-shadow: none;
           font-size: 1.2rem;
           font-weight: 750;
-          color: #1e5d3b;
+          color: var(--sr-blue);
           white-space: nowrap;
         }
         .st-key-nav_home button:hover,
         .st-key-nav_home button:focus-visible {
           border-color: transparent;
           background: transparent;
-          color: #17482e;
+          color: var(--sr-blue-strong);
           transform: none;
         }
-        .sr-hero { text-align: center; padding: 3.3rem 1rem 1.6rem; }
-        .sr-kicker { color: #2f6d4b; font-weight: 700; letter-spacing: .02em; }
-        .sr-hero h1 { max-width: 780px; margin: .5rem auto .8rem; font-size: clamp(2.4rem, 5vw, 4rem); line-height: 1.05; }
-        .sr-hero p { max-width: 720px; margin: 0 auto; color: #5b685f; font-size: 1.08rem; }
-        div[data-testid="stVerticalBlockBorderWrapper"] { background: white; }
-        .sr-evidence { color: #637068; font-size: .86rem; }
+        .sr-hero {
+          position: relative; overflow: hidden; text-align: center;
+          padding: 4rem 1rem 2.15rem; border-bottom: 1px solid var(--sr-line);
+        }
+        .sr-hero::before, .sr-hero::after {
+          content: ""; position: absolute; width: 16rem; height: 16rem;
+          border: 1px solid rgba(0,39,76,.16); border-radius: 50%; pointer-events: none;
+        }
+        .sr-hero::before { left: -11rem; top: .25rem; }
+        .sr-hero::after { right: -10rem; bottom: -12rem; }
+        .sr-kicker { color: var(--sr-cyan); font-weight: 800; letter-spacing: .12em; font-size: .78rem; }
+        .sr-hero h1 { max-width: 830px; margin: .6rem auto .9rem; color: var(--sr-blue); font-size: clamp(2.5rem, 5vw, 4.35rem); letter-spacing: -.04em; line-height: 1.02; }
+        .sr-hero p { max-width: 690px; margin: 0 auto; color: var(--sr-muted); font-size: 1.1rem; line-height: 1.55; }
+        div[data-testid="stVerticalBlockBorderWrapper"] { background: var(--sr-surface); border-color: var(--sr-line); box-shadow: 0 8px 24px rgba(0,39,76,.06); }
+        .sr-evidence { color: var(--sr-muted); font-size: .86rem; }
+        h1, h2, h3 { color: var(--sr-blue); letter-spacing: -.02em; }
+        div[data-testid="stForm"] { border: 1px solid var(--sr-line); border-radius: .75rem; background: rgba(255,255,255,.94); box-shadow: 0 8px 28px rgba(0,39,76,.07); }
+        label, [data-testid="stWidgetLabel"] p { color: var(--sr-blue-strong) !important; font-weight: 650 !important; }
+        input, [data-baseweb="select"] > div { border-color: #7c93a7 !important; }
+        input:focus, [data-baseweb="select"] > div:focus-within { border-color: var(--sr-blue) !important; box-shadow: 0 0 0 3px rgba(0,39,76,.22) !important; }
+        .stButton > button, .stLinkButton > a { border-radius: .45rem; font-weight: 700; }
+        .stButton > button[kind="primary"], .stFormSubmitButton > button { background: var(--sr-blue); border-color: var(--sr-blue); color: #fff; }
+        .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button:hover { background: var(--sr-blue-strong); border-color: var(--sr-blue-strong); }
+        a { color: #005a9c; }
+        :focus-visible { outline: 3px solid var(--sr-maize) !important; outline-offset: 3px; }
         @media (prefers-color-scheme: dark) {
-          [data-testid="stAppViewContainer"] { background: #111713; }
-          [data-testid="stHeader"] { background: rgba(17,23,19,.88); }
+          [data-testid="stAppViewContainer"] { background: #071929; color: #edf5fb; }
+          [data-testid="stHeader"] { background: rgba(7,25,41,.92); }
           .st-key-sr_nav { border-bottom-color: rgba(230, 239, 232, .18); }
           .st-key-sr_nav button {
-            border-color: rgba(230, 239, 232, .24);
-            background: #19221c;
-            color: #e4eee7;
+            border-color: #54708b;
+            background: #102b43;
+            color: #edf5fb;
           }
           .st-key-sr_nav .sr-nav-link {
-            border-color: rgba(230, 239, 232, .24);
-            background: #19221c;
-            color: #e4eee7;
+            border-color: #54708b;
+            background: #102b43;
+            color: #edf5fb;
           }
           .st-key-sr_nav button:hover,
           .st-key-sr_nav button:focus-visible,
           .st-key-sr_nav .sr-nav-link:hover,
           .st-key-sr_nav .sr-nav-link:focus-visible {
-            border-color: #91cba4;
-            background: #223129;
+            border-color: var(--sr-maize);
+            background: #173b59;
             color: #ffffff;
           }
           .st-key-nav_home button {
             border-color: transparent;
             background: transparent;
-            color: #a9ddba;
+            color: #8fc8ff;
           }
           .st-key-nav_home button:hover,
           .st-key-nav_home button:focus-visible {
             border-color: transparent;
             background: transparent;
-            color: #d7f3df;
+            color: #ffffff;
           }
-          .sr-kicker { color: #91cba4; }
-          .sr-hero p, .sr-evidence { color: #aeb9b1; }
-          div[data-testid="stVerticalBlockBorderWrapper"] { background: #19221c; }
+          .sr-kicker { color: #62d2dd; }
+          .sr-hero h1, h1, h2, h3 { color: #ffffff; }
+          .sr-hero p, .sr-evidence { color: #c4d3e0; }
+          div[data-testid="stVerticalBlockBorderWrapper"], div[data-testid="stForm"] { background: #102b43; border-color: #54708b; }
+          label, [data-testid="stWidgetLabel"] p { color: #ffffff !important; }
         }
         @media (max-width: 760px) {
           .block-container { padding-top: 4rem; }
@@ -376,7 +411,10 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
         if row.get("grant_title"):
             st.write(f"**Active grant:** {row['grant_title']} — {row.get('funder') or 'public funder'}")
         elif row.get("grant_sources_checked"):
-            st.caption("Funding: no active matching NSF award found")
+            sources = ", ".join(row.get("grant_check_sources") or []) or "configured sources"
+            checked_at = row.get("grant_checked_at")
+            suffix = f" · last checked {checked_at:%Y-%m-%d}" if hasattr(checked_at, "strftime") else ""
+            st.caption(f"Funding: no active topic-matching award found ({sources}){suffix}")
         else:
             st.caption("Funding: not checked yet")
         if row.get("hiring_evidence"):

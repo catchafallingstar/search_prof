@@ -11,8 +11,8 @@ from radar_store import _attach_identity_review_context
 class IdentityAuditPostgresTests(unittest.TestCase):
     def test_audit_roundtrip_uses_temporary_tables_only(self):
         with get_db_connection() as connection:
-            connection.execute('CREATE TEMP TABLE professors (LIKE public.professors INCLUDING DEFAULTS)')
-            connection.execute('CREATE TEMP TABLE faculty_verification_evidence (LIKE public.faculty_verification_evidence INCLUDING DEFAULTS)')
+            connection.execute('CREATE TEMP TABLE professors (LIKE public.professors INCLUDING ALL)')
+            connection.execute('CREATE TEMP TABLE faculty_verification_evidence (LIKE public.faculty_verification_evidence INCLUDING ALL)')
             connection.execute("INSERT INTO professors(id,name,institution_name) VALUES (-987654, 'Test Person', 'Example University')")
             @contextmanager
             def borrowed():
@@ -26,4 +26,7 @@ class IdentityAuditPostgresTests(unittest.TestCase):
             with connection.cursor() as cursor:
                 _attach_identity_review_context(cursor,[identity])
             self.assertEqual(identity['identity_search_audit'],evidence)
+            self.assertEqual(identity['identity_evidence'][0]['source_type'], 'LINKEDIN_SNIPPET')
+            self.assertEqual(identity['identity_evidence'][0]['role_category'], 'STUDENT')
+            self.assertIn('PhD candidate', identity['identity_evidence'][0]['evidence_excerpt'])
             connection.rollback()

@@ -170,7 +170,8 @@ class VerificationRepairsV2Tests(unittest.TestCase):
                 'title': 'Jin Yang', 'body': 'Researcher profile'}]), \
              patch.object(v, '_fetch_official_page', side_effect=AssertionError('Must not fetch aggregator')):
             result = v.verify_faculty_candidate({'name': 'Jin Yang', 'institution_name': 'Massachusetts Institute of Technology'})
-        self.assertEqual(result['failure_code'], 'NO_USEFUL_PROFILE')
+        self.assertEqual(result['status'], 'NOT_FACULTY')
+        self.assertEqual(result['method'], 'completed_three_query_no_faculty_profile')
 
     def test_institution_mapping_does_not_confuse_missouri(self):
         self.assertTrue(v._domain_matches_institution('https://ucmo.edu/faculty', 'University of Central Missouri'))
@@ -199,14 +200,14 @@ class VerificationRepairsV2Tests(unittest.TestCase):
             audit.setdefault('_documents', {})[url] = {'text': text, 'links': [], 'finished': True}
             return text, 'CV document'
         def search(query, **kw):
-            if query.endswith(' CV'):
+            if query == '"Jane Smith" "Example University"':
                 return [{'href': 'https://example.com/jane-cv.pdf', 'title': 'Jane Smith CV'}]
             return []
         with patch.object(v, 'search_web', side_effect=search) as get, patch.object(v, '_fetch_official_page', side_effect=fetch):
             v.verify_faculty_candidate({'name': 'Jane Smith', 'institution_name': 'Example University'})
         queries = [call.args[0] for call in get.call_args_list]
         self.assertIn('"Jane Smith" site:campus.edu', queries)
-        self.assertLess(queries.index('"Jane Smith" site:campus.edu'), queries.index('"Jane Smith" "Example University" academic profile'))
+        self.assertEqual(queries[1], '"Jane Smith" site:campus.edu')
 
     def test_split_name_is_retrieval_lead_not_different_spelling(self):
         self.assertTrue(w._results_match_query_anchor('"Michael Variny" "Ohio University"',
@@ -279,13 +280,16 @@ class VerificationRepairsV2Tests(unittest.TestCase):
         with patch.object(v, 'search_web', return_value=[{'href': 'https://smu.edu/faculty/jia-zhang', 'title': 'Jia Zhang'}]), \
              patch.object(v, '_fetch_official_page', side_effect=AssertionError('Do not fetch another named person')):
             result = v.verify_faculty_candidate({'name': 'Jing Cao', 'institution_name': 'Southern Methodist University'})
-        self.assertEqual(result['failure_code'], 'NO_USEFUL_PROFILE')
+        self.assertEqual(result['status'], 'NOT_FACULTY')
+        self.assertEqual(result['method'], 'completed_three_query_no_faculty_profile')
 
     def test_us_filter_applies_before_sql_pagination(self):
         import radar_store
         with patch.object(radar_store, 'get_db_connection') as conn, \
              patch.object(radar_store, '_target_country_code', return_value='US'), \
-             patch.object(radar_store, 'fetch_radar_topic', return_value={'id': 1, 'discovery_version': 3}):
+             patch.object(radar_store, 'fetch_radar_topic', return_value={
+                 'id': 1, 'discovery_version': radar_store.RADAR_DISCOVERY_VERSION
+             }):
             cursor = conn.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
             cursor.fetchall.return_value = []
             radar_store.fetch_indexed_professors('Robotics')

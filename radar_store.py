@@ -14,9 +14,9 @@ from settings import setting, setting_int
 from ingestion.institution_domains import OFFSHORE_SOURCE_PATTERN
 
 
-FACULTY_VERIFICATION_VERSION = 11
+FACULTY_VERIFICATION_VERSION = 18
 MIN_PUBLIC_FACULTY_VERIFICATION_VERSION = 8
-RADAR_DISCOVERY_VERSION = 3
+RADAR_DISCOVERY_VERSION = 4
 
 
 def _target_country_code() -> str:
@@ -651,12 +651,14 @@ def save_topic_candidates(
                         """
                         INSERT INTO radar_topic_professor_papers (
                             radar_topic_id, professor_id, paper_id,
-                            relevance_score, matched_query, is_current_match
-                        ) VALUES (%s, %s, %s, %s, %s, TRUE)
+                            relevance_score, matched_query,
+                            matched_openalex_node_id, is_current_match
+                        ) VALUES (%s, %s, %s, %s, %s, %s, TRUE)
                         ON CONFLICT (radar_topic_id, professor_id, paper_id)
                         DO UPDATE SET
                             relevance_score = EXCLUDED.relevance_score,
                             matched_query = EXCLUDED.matched_query,
+                            matched_openalex_node_id = EXCLUDED.matched_openalex_node_id,
                             is_current_match = TRUE,
                             last_matched_at = NOW()
                         """,
@@ -666,8 +668,66 @@ def save_topic_candidates(
                             int(evidence["paper_id"]),
                             float(evidence.get("relevance_score") or 0),
                             str(evidence.get("matched_query") or ""),
+                            evidence.get("matched_openalex_node_id"),
                         ),
                     )
+
+
+def save_topic_taxonomy_mappings(
+    radar_topic_id: int, mappings: list[dict[str, Any]]
+) -> None:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM radar_topic_openalex_nodes WHERE radar_topic_id = %s",
+                (radar_topic_id,),
+            )
+            for mapping in mappings:
+                node_id = str(mapping.get("openalex_id") or "").strip()
+                if not node_id:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO openalex_research_nodes (
+                        openalex_id, node_type, display_name, description, parent_id
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (openalex_id) DO UPDATE SET
+                        node_type = EXCLUDED.node_type,
+                        display_name = EXCLUDED.display_name,
+                        description = COALESCE(
+                            NULLIF(EXCLUDED.description, ''),
+                            openalex_research_nodes.description
+                        ),
+                        parent_id = COALESCE(
+                            EXCLUDED.parent_id, openalex_research_nodes.parent_id
+                        ),
+                        updated_at = NOW()
+                    """,
+                    (
+                        node_id,
+                        str(mapping.get("node_type") or "topic"),
+                        str(mapping.get("display_name") or node_id),
+                        str(mapping.get("description") or ""),
+                        mapping.get("parent_id"),
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO radar_topic_openalex_nodes (
+                        radar_topic_id, openalex_node_id, weight, mapping_method
+                    ) VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (radar_topic_id, openalex_node_id) DO UPDATE SET
+                        weight = EXCLUDED.weight,
+                        mapping_method = EXCLUDED.mapping_method,
+                        reviewed_at = NOW()
+                    """,
+                    (
+                        radar_topic_id,
+                        node_id,
+                        float(mapping.get("weight") or 0),
+                        str(mapping.get("mapping_method") or "automatic"),
+                    ),
+                )
 
 
 def update_topic_after_discovery(
@@ -878,6 +938,40 @@ def fetch_topic_enrichment_ids(
         if source_kind == "hiring"
         else ""
     )
+    grant_due = """
+        (
+            NOT EXISTS (
+                SELECT 1 FROM professor_topic_grant_checks check_row
+                WHERE check_row.professor_id = p.id
+                  AND check_row.radar_topic_id = rtp.radar_topic_id
+                  AND check_row.source = 'NSF'
+                  AND check_row.next_check_at > NOW()
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM professor_topic_grant_checks check_row
+                WHERE check_row.professor_id = p.id
+                  AND check_row.radar_topic_id = rtp.radar_topic_id
+                  AND check_row.source = 'NIH_REP'
+                  AND check_row.next_check_at > NOW()
+            )
+            OR (
+                p.orcid_id IS NOT NULL AND p.orcid_id <> ''
+                AND NOT EXISTS (
+                    SELECT 1 FROM professor_topic_grant_checks check_row
+                    WHERE check_row.professor_id = p.id
+                      AND check_row.radar_topic_id = rtp.radar_topic_id
+                      AND check_row.source = 'ORCID'
+                      AND check_row.next_check_at > NOW()
+                )
+            )
+        )
+    """ if source_kind == "grants" else f"""
+        (
+            p.{timestamp_column} IS NULL
+            OR p.{timestamp_column} <= NOW() - INTERVAL '{interval}'
+            {additional_due}
+        )
+    """
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -890,11 +984,7 @@ def fetch_topic_enrichment_ids(
                   AND rtp.is_current_match = TRUE
                   AND institution.country_code = %s
                   AND p.faculty_status = 'VERIFIED'
-                  AND (
-                      p.{timestamp_column} IS NULL
-                      OR p.{timestamp_column} <= NOW() - INTERVAL '{interval}'
-                      {additional_due}
-                  )
+                  AND {grant_due}
                 ORDER BY p.{timestamp_column} NULLS FIRST, rtp.result_rank
                 LIMIT %s
                 """,
@@ -925,6 +1015,34 @@ def mark_professor_enrichment_checked(
                 f"UPDATE professors SET {column} = NOW(), updated_at = NOW() WHERE id = ANY(%s)",
                 (professor_ids,),
             )
+
+
+def save_topic_grant_checks(
+    radar_topic_id: int, source_checks: list[dict[str, Any]],
+) -> None:
+    """Persist grant-source freshness for one professor/topic relationship."""
+    if not source_checks:
+        return
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for check in source_checks:
+                cursor.execute(
+                    """
+                    INSERT INTO professor_topic_grant_checks (
+                        professor_id, radar_topic_id, source, status,
+                        checked_at, next_check_at, last_error
+                    ) VALUES (%s, %s, %s, %s, NOW(), NOW() + INTERVAL '30 days', %s)
+                    ON CONFLICT (professor_id, radar_topic_id, source) DO UPDATE
+                    SET status = EXCLUDED.status, checked_at = NOW(),
+                        next_check_at = NOW() + INTERVAL '30 days',
+                        last_error = EXCLUDED.last_error
+                    """,
+                    (
+                        int(check["professor_id"]), radar_topic_id,
+                        str(check["source"]), str(check["status"]),
+                        check.get("error"),
+                    ),
+                )
 
 
 def request_visible_hiring_refreshes(
@@ -1005,6 +1123,7 @@ def fetch_indexed_professors(
     signal_filters = [
         "candidate_signal.professor_id = p.id",
         "candidate_signal.attribution_status = 'VERIFIED'",
+        "candidate_signal.freshness_status IN ('CURRENT', 'UPCOMING', 'UNDATED')",
         "(candidate_signal.expires_at IS NULL OR candidate_signal.expires_at > NOW())",
     ]
     signal_params: list[Any] = []
@@ -1036,9 +1155,10 @@ def fetch_indexed_professors(
                     rtp.professor_id, rtp.result_rank, rtp.research_score,
                     rtp.matching_papers, rtp.latest_paper_title,
                     rtp.latest_paper_year, rtp.latest_paper_url,
-                    (p.grant_checked_at IS NOT NULL) AS grant_sources_checked,
+                    (gc.last_checked_at IS NOT NULL) AS grant_sources_checked,
                     (p.public_hiring_checked_at IS NOT NULL) AS public_sources_checked,
-                    p.public_hiring_checked_at, p.grant_checked_at,
+                    p.public_hiring_checked_at, gc.last_checked_at AS grant_checked_at,
+                    COALESCE(gc.sources, ARRAY[]::TEXT[]) AS grant_check_sources,
                     p.public_hiring_check_status, p.public_hiring_failure_count,
                     p.public_hiring_next_check_at,
                     p.lab_gpa_policy, p.lab_gpa_evidence_text,
@@ -1122,6 +1242,13 @@ def fetch_indexed_professors(
                 JOIN professors p ON p.id = rtp.professor_id
                 JOIN institutions institution_record
                   ON institution_record.id = p.institution_id
+                LEFT JOIN LATERAL (
+                    SELECT MAX(checked_at) AS last_checked_at,
+                           ARRAY_AGG(source ORDER BY source) AS sources
+                    FROM professor_topic_grant_checks grant_check
+                    WHERE grant_check.professor_id = p.id
+                      AND grant_check.radar_topic_id = rtp.radar_topic_id
+                ) gc ON TRUE
                 LEFT JOIN LATERAL (
                     SELECT COUNT(*) OVER () AS active_grants, grant_title, funder,
                            amount, expiration_date, source_url
@@ -1590,7 +1717,10 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
         )
         SELECT professor_id, source_url, observed_title, observed_institution,
                evidence_text, verification_status, confidence,
-               decision_method, checked_at
+               decision_method, source_type, page_title, role_category,
+               observed_employer, currentness, lookup_status,
+               evidence_excerpt, extracted_text, http_status,
+               supports_decision, scope_status, checked_at
         FROM ranked_evidence
         WHERE evidence_rank <= 5
         ORDER BY professor_id, evidence_rank
@@ -1606,6 +1736,17 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
             "verification_status": evidence["verification_status"],
             "confidence": evidence["confidence"],
             "decision_method": evidence["decision_method"],
+            "source_type": evidence["source_type"],
+            "page_title": evidence["page_title"],
+            "role_category": evidence["role_category"],
+            "observed_employer": evidence["observed_employer"],
+            "currentness": evidence["currentness"],
+            "lookup_status": evidence["lookup_status"],
+            "evidence_excerpt": evidence["evidence_excerpt"],
+            "extracted_text": evidence["extracted_text"],
+            "http_status": evidence["http_status"],
+            "supports_decision": evidence["supports_decision"],
+            "scope_status": evidence["scope_status"],
             "checked_at": evidence["checked_at"],
         }
         for identity in rows_by_id[int(evidence["professor_id"])]:

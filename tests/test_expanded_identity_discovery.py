@@ -118,10 +118,11 @@ class ExpandedIdentityTests(unittest.TestCase):
             {'title': f'A supporting paper with a unique title {i}', 'matched_query': 'Biology'} for i in range(3)]}
         with patch.object(v, 'search_web', side_effect=search) as get:
             result = v.verify_faculty_candidate(candidate)
-        self.assertEqual(get.call_count, 10)
-        self.assertEqual(result['search_audit']['links_collected'], 100)
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(result['search_audit']['links_collected'], 30)
         self.assertEqual(len(result['search_audit']['results']), 10)
-        self.assertEqual(result['failure_code'], 'NO_USEFUL_PROFILE')
+        self.assertEqual(result['status'], 'NOT_FACULTY')
+        self.assertTrue(result['review_recommended'])
         self.assertFalse(any(k.startswith('_') for k in result['search_audit']))
 
     def test_news_follows_link_but_is_not_itself_verified(self):
@@ -165,14 +166,17 @@ class ExpandedIdentityTests(unittest.TestCase):
             result = v.verify_faculty_candidate(CANDIDATE)
         self.assertEqual(result['status'], 'UNVERIFIED')
         self.assertEqual(result['failure_code'], 'SOURCE_BLOCKED')
-        self.assertIn('access restriction', result['reason'])
+        self.assertIn('blocked', result['reason'].lower())
 
-    def test_deadline_is_clear_and_audit_is_preserved(self):
-        with patch.object(v, '_verify_faculty_candidate', side_effect=a.IdentityPassLimit('Time budget reached')):
-            result = v.verify_faculty_candidate(CANDIDATE)
-        self.assertEqual(result['failure_code'], 'CHECK_LIMIT')
-        self.assertEqual(result['search_audit']['reason'], 'Time budget reached')
-        self.assertIsNone(a.CURRENT.get())
+    def test_only_an_active_search_has_a_deadline(self):
+        audit = a.new_audit(CANDIDATE)
+        token = a.CURRENT.set(audit)
+        self.addCleanup(a.CURRENT.reset, token)
+        self.assertGreater(a.remaining_seconds(), 3600)
+        a.begin_search(90)
+        self.assertLessEqual(a.remaining_seconds(), 90)
+        a.end_search()
+        self.assertGreater(a.remaining_seconds(), 3600)
 
     def test_logs_include_discarded_results_but_database_audit_does_not(self):
         output = io.StringIO()

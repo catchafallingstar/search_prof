@@ -6,13 +6,13 @@ from unittest.mock import patch
 
 from db import get_db_connection
 from radar_store import fetch_topic_candidate_ids, claim_next_radar_job
-from ingestion.verify_faculty import get_cached_faculty_decisions
+from ingestion.verify_faculty import FACULTY_VERIFICATION_VERSION, get_cached_faculty_decisions
 from ingestion.verify_faculty import _save_result
 
 
 @unittest.skipUnless(os.getenv("RUN_DB_INTEGRATION") == "1", "explicit database test required")
 class QueuePostgresTests(unittest.TestCase):
-    def test_conflict_is_saved_without_retry_and_reused_indefinitely(self):
+    def test_conflict_is_saved_and_rechecked_after_month(self):
         with get_db_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute('''
@@ -26,10 +26,12 @@ class QueuePostgresTests(unittest.TestCase):
                         {'status': 'CONFLICT', 'institution_name': 'Other University', 'method': 'institution_mismatch_review',
                          'source_url': 'https://example.edu/test', 'evidence_text': 'Test evidence'})
                     cursor.execute("SELECT faculty_status, next_identity_check_at, institution_name FROM professors WHERE id = -999")
-                    self.assertEqual(cursor.fetchone(), {'faculty_status': 'CONFLICT', 'next_identity_check_at': None,
-                                                       'institution_name': 'Example University'})
+                    saved = cursor.fetchone()
+                    self.assertEqual(saved['faculty_status'], 'CONFLICT')
+                    self.assertIsNotNone(saved['next_identity_check_at'])
+                    self.assertEqual(saved['institution_name'], 'Example University')
                     cursor.execute("UPDATE professors SET faculty_checked_at = NOW() - INTERVAL '365 days' WHERE id = -999")
-                    self.assertEqual(get_cached_faculty_decisions([-999])['decided_ids'], [-999])
+                    self.assertEqual(get_cached_faculty_decisions([-999])['decided_ids'], [])
 
     def test_recent_checks_reused_and_search_only_jobs_remain_unclaimed(self):
         with get_db_connection() as connection:
@@ -55,19 +57,24 @@ class QueuePostgresTests(unittest.TestCase):
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     );
                     INSERT INTO institutions VALUES (1, 'US');
-                    INSERT INTO professors(id, institution_id, faculty_status, faculty_checked_at)
-                        VALUES (1, 1, 'VERIFIED', NOW() - INTERVAL '5 days');
                     INSERT INTO professors(id, institution_id, identity_search_pending) VALUES (2, 1, TRUE);
                     INSERT INTO professors(id, institution_id, homepage_url) VALUES (3, 1, 'https://example.edu/faculty');
                     INSERT INTO radar_topic_professors(radar_topic_id, professor_id) VALUES (1,1), (1,2), (2,3);
                     INSERT INTO radar_jobs(id, job_type, radar_topic_id) VALUES (10, 'VERIFY_FACULTY', 1), (20, 'VERIFY_FACULTY', 2);
                 """)
+                cursor.execute(
+                    """INSERT INTO professors(
+                           id, institution_id, faculty_status,
+                           faculty_verification_version, faculty_checked_at
+                       ) VALUES (1, 1, 'VERIFIED', %s, NOW() - INTERVAL '5 days')""",
+                    (FACULTY_VERIFICATION_VERSION,),
+                )
                 with patch("radar_store.get_db_connection", side_effect=lambda: nullcontext(connection)), \
                      patch("ingestion.verify_faculty.get_db_connection", side_effect=lambda: nullcontext(connection)), \
                      patch("radar_store._target_country_code", return_value="US"):
                     self.assertEqual(fetch_topic_candidate_ids(1), [2])
                     self.assertEqual(fetch_topic_candidate_ids(1, direct_only=True), [])
-                    self.assertEqual(get_cached_faculty_decisions([1]), {"verified_ids": [], "decided_ids": [1]})
+                    self.assertEqual(get_cached_faculty_decisions([1]), {"verified_ids": [1], "decided_ids": [1]})
                     first = claim_next_radar_job("test", search_ready=False)
                     self.assertEqual(first["id"], 20)
                     self.assertIsNone(claim_next_radar_job("test", search_ready=False))

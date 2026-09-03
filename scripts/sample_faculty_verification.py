@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import time
 from unittest.mock import patch
 
@@ -15,6 +16,162 @@ from ingestion.search_budget import provider_capacity
 from ingestion.websearch import search_web, SearchUnavailable, _provider_names
 from settings import setting_int
 from radar_store import fetch_radar_topic
+
+
+def _compact_text(value, limit: int = 900) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _historical_attributions(text: str) -> list[dict]:
+    """Extract explicit historical education claims for diagnostic display.
+
+    These rows explain identity continuity; they never establish a current
+    faculty appointment. Keep the quoted sentence so a human can audit the
+    extraction instead of trusting the label alone.
+    """
+    attributions = []
+    normalized_text = _compact_text(text, 4000)
+    claim_pattern = re.compile(
+        r"\b(?:earned|received|completed|obtained|holds?)\b.{0,120}?"
+        r"\b(?P<degree>Ph\.?D\.?|doctoral\s+degree|doctorate|master(?:'s)?\s+degree|M\.?S\.?)\b"
+        r".{0,140}?\b(?:from|at)\s+(?P<institution>"
+        r"(?:the\s+)?(?:University|College|Institute|School)[^,;.!?]{1,100})",
+        re.IGNORECASE,
+    )
+    # Search the full text rather than splitting on periods: abbreviations such
+    # as "Ph.D." otherwise look like sentence endings.
+    for claim in claim_pattern.finditer(normalized_text):
+        degree = claim.group("degree")
+        observed_role = (
+            "PhD graduate"
+            if re.search(r"ph\.?d\.?|doctoral|doctorate", degree, re.I)
+            else "Master's graduate"
+        )
+        attributions.append({
+            "observed_role": observed_role,
+            "role_category": "EDUCATION",
+            "observed_institution": _compact_text(claim.group("institution"), 140),
+            "observed_employer": None,
+            "currentness": "HISTORICAL",
+            "evidence": _compact_text(claim.group(0)),
+        })
+    return attributions
+
+
+def useful_sources(decision: dict) -> list[dict]:
+    """Return a readable, source-by-source attribution trail for JSON/Markdown."""
+    sources = []
+    for row in verifier._identity_evidence_rows(decision):
+        url = str(row.get("source_url") or "").strip()
+        if not url:
+            continue
+        source_type = str(row.get("source_type") or "SEARCH_RESULT").upper()
+        excerpt = _compact_text(
+            row.get("evidence_excerpt")
+            or row.get("evidence_text")
+            or row.get("extracted_text")
+            or row.get("snippet")
+        )
+        role = row.get("observed_title") or row.get("role")
+        role_category = str(row.get("role_category") or "UNKNOWN").upper()
+        institution = row.get("observed_institution")
+        if not institution and role_category in {"FACULTY", "STUDENT", "POSTDOC"}:
+            found = verifier.institutions_in_text(excerpt)
+            institution = found[0] if found else row.get("institution_name")
+        attribution = {
+            "observed_role": _compact_text(role, 160) or None,
+            "role_category": role_category,
+            "observed_institution": _compact_text(institution, 180) or None,
+            "observed_employer": _compact_text(row.get("observed_employer"), 180) or None,
+            "currentness": str(row.get("currentness") or "UNKNOWN").upper(),
+            "evidence": excerpt or None,
+        }
+        attributions = []
+        if any(attribution[key] for key in (
+            "observed_role", "observed_institution", "observed_employer", "evidence"
+        )):
+            attributions.append(attribution)
+        historical_text = " ".join(str(row.get(key) or "") for key in (
+            "extracted_text", "evidence_text", "evidence_excerpt", "snippet"
+        ))
+        for historical in _historical_attributions(historical_text):
+            if not any(
+                item.get("currentness") == "HISTORICAL"
+                and item.get("observed_role") == historical["observed_role"]
+                and item.get("observed_institution") == historical["observed_institution"]
+                for item in attributions
+            ):
+                attributions.append(historical)
+        useful_type = source_type in {
+            "OFFICIAL_UNIVERSITY_PAGE", "PERSONAL_WEBSITE", "LAB_WEBSITE",
+            "CV", "LINKEDIN_SNIPPET", "GOOGLE_SCHOLAR",
+        }
+        if not (attributions and (useful_type or row.get("supports_decision") or role_category != "UNKNOWN")):
+            continue
+        sources.append({
+            "source_type": source_type,
+            "url": url,
+            "page_title": _compact_text(row.get("page_title"), 220) or None,
+            "lookup_status": str(row.get("lookup_status") or "FOUND").upper(),
+            "inspection_status": str(row.get("inspection_status") or "UNKNOWN").upper(),
+            "supports_decision": bool(row.get("supports_decision")),
+            "attributions": attributions,
+        })
+    return sources
+
+
+def render_markdown_report(results: list[dict], attempts_label: str,
+                           max_searches_per_candidate: int) -> str:
+    lines = [
+        "# Faculty verification diagnostic", "",
+        f"Candidates: {len(results)} · Outbound attempts: {attempts_label}", "",
+        f"Up to {max_searches_per_candidate} queries per candidate. "
+        "No identity decisions were published or saved.", "",
+        "| Candidate | Field | Outcome | Useful sources |", "|---|---|---|---|",
+    ]
+    for row in results:
+        name = str(row.get("name") or "Unknown").replace("|", "/")
+        field = str(row.get("field") or "Unassigned").replace("|", "/")
+        lines.append(
+            f"| {name} | {field} | {row.get('status')} | "
+            f"{len(row.get('useful_sources') or [])} |"
+        )
+    for row in results:
+        lines.extend([
+            "", f"## {row.get('index')}. {row.get('name')} — {row.get('status')}", "",
+            f"- Field: {row.get('field') or 'Unassigned'}",
+            f"- Imported university: {row.get('imported_university') or 'Not available'}",
+            f"- Decision method: {row.get('method') or 'Not available'}",
+            f"- Failure code: {row.get('failure_code') or 'None'}",
+            f"- Reason: {_compact_text(row.get('reason'), 1000)}", "",
+            "### Useful identity sources", "",
+        ])
+        sources = row.get("useful_sources") or []
+        if not sources:
+            lines.append("No useful identity source was retained in this bounded pass.")
+            continue
+        for source_index, source in enumerate(sources, 1):
+            lines.extend([
+                f"#### Source {source_index}: {source['source_type'].replace('_', ' ').title()}", "",
+                f"- URL: {source['url']}",
+                f"- Page title: {source.get('page_title') or 'Not available'}",
+                f"- Lookup status: {source.get('lookup_status') or 'UNKNOWN'}",
+                f"- Source handling: {'Opened and evaluated' if source.get('inspection_status') == 'INSPECTED' else 'Returned by search only'}",
+                "- Used in assessment: Yes",
+                f"- Proves final classification: {'Yes' if source.get('supports_decision') else 'No'}",
+            ])
+            for attribution_index, attribution in enumerate(source.get("attributions") or [], 1):
+                lines.extend([
+                    "", f"Attribution {attribution_index}:", "",
+                    f"- Observed role: {attribution.get('observed_role') or 'Not stated'}",
+                    f"- Role category: {attribution.get('role_category') or 'UNKNOWN'}",
+                    f"- Observed institution: {attribution.get('observed_institution') or 'Not stated'}",
+                    f"- Observed employer: {attribution.get('observed_employer') or 'Not stated'}",
+                    f"- Currentness: {attribution.get('currentness') or 'UNKNOWN'}",
+                    f"> {attribution.get('evidence') or 'No text excerpt retained.'}",
+                ])
+    return "\n".join(lines) + "\n"
 
 
 def candidates(limit: int, random_seed: int | None = None, excluded_ids: list[int] | None = None,
@@ -220,6 +377,7 @@ def main():
                    'search_audit': decision.get('search_audit') or {},
                    'papers': [{'title': p['title'], 'doi': p.get('doi'), 'pdf_url': p.get('pdf_url'), 'raw_affiliation': p.get('raw_affiliation_text')} for p in candidate['recent_papers']],
                    'queries': queries, 'pages': pages, 'seconds': round(time.monotonic() - started, 2)}
+            row['useful_sources'] = useful_sources(decision)
             results.append(row)
             summary[status] += 1
             with (output / 'results.jsonl').open('a', encoding='utf-8') as stream:
@@ -238,11 +396,10 @@ def main():
              'identities_saved': 0, 'report': str(output), 'completed_at': datetime.now(timezone.utc).isoformat()}
     (output / 'summary.json').write_text(json.dumps(final, indent=2), encoding='utf-8')
     attempts_label = ', '.join(f'{provider}: {count}' for provider, count in attempts.items())
-    lines = ['# Faculty verification diagnostic', '', f"Candidates: {len(results)} · Outbound attempts: {attempts_label}",
-             '', f'Up to {args.max_searches_per_candidate} queries per candidate. No identity decisions were published or saved.',
-             '', '| Candidate | Field | Outcome |', '|---|---|---|']
-    lines += [f"| {r['name'].replace('|', '/')} | {r['field'].replace('|', '/')} | {r['status']} |" for r in results]
-    (output / 'REPORT.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    (output / 'REPORT.md').write_text(
+        render_markdown_report(results, attempts_label, args.max_searches_per_candidate),
+        encoding='utf-8',
+    )
     print(json.dumps({'event': 'sample_complete', **final}), flush=True)
 
 

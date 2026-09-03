@@ -2,14 +2,19 @@
 from datetime import datetime, timedelta, timezone
 
 
-def recently_checked(candidate: dict, now: datetime | None = None) -> bool:
+def recently_checked(
+    candidate: dict,
+    now: datetime | None = None,
+    *,
+    max_age_days: int = 30,
+) -> bool:
     checked = candidate.get("faculty_checked_at")
     if checked is None:
         return False
     now = now or datetime.now(timezone.utc)
     if checked.tzinfo is None:
         checked = checked.replace(tzinfo=timezone.utc)
-    return checked > now - timedelta(days=30)
+    return checked > now - timedelta(days=max(1, int(max_age_days)))
 
 
 def minimum_recheck_sql(alias: str = "p") -> str:

@@ -145,14 +145,15 @@ class VerificationRepairTests(unittest.TestCase):
         self.assertEqual(result['status'], 'UNVERIFIED')
         self.assertEqual(result['failure_code'], 'CURRENT_AFFILIATION_UNCONFIRMED')
 
-    def test_personal_student_without_link_or_paper_remains_unresolved(self):
+    def test_exact_name_personal_student_is_not_faculty(self):
         self.audit('Tianyi Zhang')
         html = '<title>Tianyi Zhang</title><h1>Tianyi Zhang</h1><p>PhD student at Stanford University</p>'
         with patch.object(v.requests, 'get', return_value=self.response(html)):
             result = v.inspect_researcher_profile_result(
                 {'name': 'Tianyi Zhang', 'institution_name': 'Stanford University'},
                 {'href': 'https://tiiiger.github.io/', 'title': 'Tianyi Zhang'})
-        self.assertEqual(result['status'], 'UNVERIFIED')
+        self.assertEqual(result['status'], 'NOT_FACULTY')
+        self.assertEqual(result['role_category'], 'STUDENT')
 
     def test_domain_hints_do_not_accept_news_lookalike(self):
         self.assertTrue(v._domain_matches_institution('https://wagner.nyu.edu/faculty/jane', 'New York University'))

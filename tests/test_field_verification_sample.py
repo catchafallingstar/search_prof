@@ -4,6 +4,52 @@ from scripts import sample_faculty_verification as sample
 
 
 class FieldSampleTests(unittest.TestCase):
+    def test_useful_sources_preserve_current_and_historical_attributions(self):
+        decision = {
+            'status': 'NOT_FACULTY',
+            'source_url': 'https://tyuezhan.github.io/',
+            'source_type': 'PERSONAL_WEBSITE',
+            'title': 'Software Engineer',
+            'role_category': 'INDUSTRY',
+            'observed_employer': 'Zoox',
+            'currentness': 'CURRENT',
+            'evidence_text': (
+                'I am a Software Engineer at Zoox. I earned my Ph.D. and '
+                "Master's degree from the University of Pennsylvania."
+            ),
+        }
+        sources = sample.useful_sources(decision)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]['url'], 'https://tyuezhan.github.io/')
+        current, historical = sources[0]['attributions']
+        self.assertEqual(current['role_category'], 'INDUSTRY')
+        self.assertEqual(current['observed_employer'], 'Zoox')
+        self.assertEqual(current['currentness'], 'CURRENT')
+        self.assertEqual(historical['observed_role'], 'PhD graduate')
+        self.assertEqual(historical['observed_institution'], 'the University of Pennsylvania')
+        self.assertEqual(historical['currentness'], 'HISTORICAL')
+
+    def test_markdown_report_lists_every_candidate_and_source_details(self):
+        report = sample.render_markdown_report([{
+            'index': 1, 'name': 'Yuezhan Tao', 'field': 'Robotics',
+            'status': 'NOT_FACULTY', 'imported_university': 'University of Pennsylvania',
+            'method': 'attributed_current_nonfaculty_profile', 'failure_code': None,
+            'reason': 'Current industry role found.',
+            'useful_sources': [{
+                'source_type': 'PERSONAL_WEBSITE', 'url': 'https://tyuezhan.github.io/',
+                'page_title': 'Yuezhan Tao', 'lookup_status': 'FOUND',
+                'supports_decision': True, 'attributions': [{
+                    'observed_role': 'Software Engineer', 'role_category': 'INDUSTRY',
+                    'observed_institution': None, 'observed_employer': 'Zoox',
+                    'currentness': 'CURRENT', 'evidence': 'I am a Software Engineer at Zoox.'
+                }]
+            }]
+        }], 'langsearch: 1', 10)
+        self.assertIn('## 1. Yuezhan Tao — NOT_FACULTY', report)
+        self.assertIn('URL: https://tyuezhan.github.io/', report)
+        self.assertIn('Observed employer: Zoox', report)
+        self.assertIn('> I am a Software Engineer at Zoox.', report)
+
     @patch.object(sample, 'fetch_radar_topic', return_value={'id': 7, 'requested_query': 'AI security'})
     @patch.object(sample, 'get_db_connection')
     def test_field_filters_candidates_and_exact_supporting_papers(self, connection, _topic):

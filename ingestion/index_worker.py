@@ -33,6 +33,8 @@ from radar_store import (
     refresh_topic_coverage,
     reschedule_radar_job,
     save_topic_candidates,
+    save_topic_grant_checks,
+    save_topic_taxonomy_mappings,
     stop_worker_heartbeat,
     update_topic_after_discovery,
     update_radar_job_progress,
@@ -92,6 +94,9 @@ def _discover(job: dict[str, Any]) -> dict[str, Any]:
     )
     taxonomy = normalize_taxonomy(str(topic["requested_query"]))
     normalized_topic = str(taxonomy.get("topic_name") or topic["normalized_query"])
+    save_topic_taxonomy_mappings(
+        int(topic["id"]), list(taxonomy.get("openalex_mappings") or [])
+    )
     discovery = fetch_professors_by_keywords(taxonomy, target_professors=100)
     prospects = list(discovery.get("prospects") or [])
     save_topic_candidates(int(topic["id"]), prospects)
@@ -136,7 +141,17 @@ def _verify(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
                 f"Processing {len(professor_ids)} candidate(s); known pages first, web search only if needed."
             ),
         )
-        verification = verify_faculty_candidates(professor_ids, direct_only=True, retry_after_seconds=search_wait) if direct_only else verify_faculty_candidates(professor_ids)
+        research_area = str(
+            topic.get("requested_query") or topic.get("normalized_query") or ""
+        ).strip()
+        verify_kwargs: dict[str, Any] = {}
+        if research_area:
+            verify_kwargs["research_area"] = research_area
+        if direct_only:
+            verify_kwargs.update(
+                direct_only=True, retry_after_seconds=search_wait
+            )
+        verification = verify_faculty_candidates(professor_ids, **verify_kwargs)
     else:
         verification = {
             "verified_ids": [], "checked": 0, "evaluated": 0, "verified": 0
@@ -194,6 +209,7 @@ def _check_grants(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     )
     taxonomy = normalize_taxonomy(str(topic["requested_query"]))
     result = check_and_save_grants(taxonomy, professor_ids=professor_ids)
+    save_topic_grant_checks(int(topic["id"]), list(result.get("source_checks") or []))
     mark_professor_enrichment_checked(professor_ids, "grants")
     more = bool(fetch_topic_enrichment_ids(int(topic["id"]), "grants", 1))
     return {
@@ -308,12 +324,11 @@ def _job_process_entry(
         )
 
 
-def run_job_with_deadline(
+def run_job_isolated(
     job: dict[str, Any],
     worker_id: str,
-    timeout_seconds: int,
 ) -> tuple[dict[str, Any], bool]:
-    """Run one job with a hard deadline while maintaining worker health."""
+    """Run one job in isolation and heartbeat until its bounded requests finish."""
     context = multiprocessing.get_context("fork")
     output = context.Queue(maxsize=1)
     process = context.Process(
@@ -322,20 +337,10 @@ def run_job_with_deadline(
         daemon=False,
     )
     process.start()
-    deadline = time.monotonic() + max(1, int(timeout_seconds))
     try:
-        while process.is_alive() and time.monotonic() < deadline:
+        while process.is_alive():
             process.join(timeout=2)
             update_worker_heartbeat(worker_id, int(job["id"]))
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=2)
-            raise TimeoutError(
-                f"Job exceeded its {int(timeout_seconds)}-second deadline."
-            )
         try:
             message = output.get(timeout=2)
         except queue.Empty as error:
@@ -371,7 +376,6 @@ def run_worker(
     signal.signal(signal.SIGTERM, request_stop)
     jobs_processed = 0
     announced_wait = False
-    job_timeout = setting_int("INDEX_JOB_TIMEOUT_SECONDS", 300, 30, 1800)
     update_worker_heartbeat(worker_id)
     log_event("worker_started", worker_id=worker_id)
     try:
@@ -405,9 +409,7 @@ def run_worker(
                 attempt=int(job["attempts"]),
             )
             try:
-                result, needs_more = run_job_with_deadline(
-                    job, worker_id, job_timeout
-                )
+                result, needs_more = run_job_isolated(job, worker_id)
                 if needs_more:
                     reschedule_radar_job(int(job["id"]), max(2, int(result.get("retry_after_seconds") or 2)), result)
                     status = "rescheduled"

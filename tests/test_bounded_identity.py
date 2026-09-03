@@ -19,10 +19,11 @@ class BoundedIdentityTests(unittest.TestCase):
 
     def test_snippet_is_saved_but_does_not_become_student_decision(self):
         decision,search=self.run_candidate([{'href':'https://www.linkedin.com/in/nadia', 'title':'Nadia Ahbab', 'body':'Nadia Ahbab PhD Candidate at Old Dominion University'}])
-        self.assertEqual(decision['status'],'UNVERIFIED')
-        self.assertLessEqual(search.call_count,2)
+        self.assertEqual(decision['status'],'NOT_FACULTY')
+        self.assertEqual(decision['method'], 'completed_three_query_no_faculty_profile')
+        self.assertLessEqual(search.call_count,3)
         self.assertIn('Snippet suggests',decision['search_audit']['results'][0]['snippet_hint'])
-        self.assertEqual(decision['search_audit']['outcome'],'UNVERIFIED')
+        self.assertEqual(decision['search_audit']['outcome'],'NOT_FACULTY')
 
     def test_twenty_links_are_one_query_not_twenty_queries(self):
         decision,search=self.run_candidate([{'href':f'https://example.edu/people/{i}', 'title':'Nadia Ahbab', 'body':'Nadia Ahbab'} for i in range(20)])
@@ -32,8 +33,9 @@ class BoundedIdentityTests(unittest.TestCase):
 
     def test_no_results_completes_unverified_pass(self):
         decision,search=self.run_candidate([])
-        self.assertEqual(decision['status'],'UNVERIFIED')
-        self.assertLessEqual(search.call_count,2)
+        self.assertEqual(decision['status'],'NOT_FACULTY')
+        self.assertEqual(decision['method'], 'completed_three_query_no_faculty_profile')
+        self.assertLessEqual(search.call_count,3)
 
     def test_outage_preserves_audit_without_identity_verdict(self):
         with patch.object(v,'fetch_orcid_clues',return_value=None), patch.object(v,'assess_identity_with_gemini',return_value=None), patch.object(v,'search_web',side_effect=SearchUnavailable('unavailable',60)):
@@ -49,6 +51,17 @@ class BoundedIdentityTests(unittest.TestCase):
     def test_named_family_professorship_and_advisor_safety(self):
         self.assertIsNotNone(v._attributed_role('Jane Smith','Jane Smith Morton and Claire Goulder and Family Professor',v.FACULTY_TITLE_PATTERN))
         self.assertIsNone(v._attributed_role('Jane Smith','Jane Smith PhD candidate supervised by Professor John Doe',v.FACULTY_TITLE_PATTERN))
+
+    def test_endowed_title_and_abbreviated_given_name_are_preserved(self):
+        text = ('L. Burak Kara George Tallman Ladd and Florence Barrett Ladd '
+                'Professor, Mechanical Engineering')
+        context = v._identity_context('Levent Burak Kara', text)
+        role = v._attributed_role('Levent Burak Kara', context, v.FACULTY_TITLE_PATTERN)
+        self.assertIsNotNone(role)
+        self.assertEqual(
+            v._detailed_faculty_title('Levent Burak Kara', context, role),
+            'George Tallman Ladd and Florence Barrett Ladd Professor',
+        )
 
     def test_google_sites_is_not_blanket_blocked(self):
         with patch.object(v,'_fetch_official_page',return_value=('', '')) as fetch:

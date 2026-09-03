@@ -10,6 +10,43 @@ CREATE TABLE IF NOT EXISTS institutions (
     CONSTRAINT institutions_name_unique UNIQUE (name)
 );
 
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS organization_type TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS organization_type_method TEXT;
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS organization_type_checked_at TIMESTAMPTZ;
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS scorecard_unit_id BIGINT;
+ALTER TABLE institutions DROP CONSTRAINT IF EXISTS institutions_organization_type_check;
+ALTER TABLE institutions ADD CONSTRAINT institutions_organization_type_check CHECK (
+    organization_type IN (
+        'HIGHER_EDUCATION', 'K12_SCHOOL', 'COMPANY', 'GOVERNMENT',
+        'NATIONAL_LAB', 'RESEARCH_INSTITUTE', 'UNKNOWN'
+    )
+);
+
+-- A local copy of the US Department of Education College Scorecard directory.
+-- It is intentionally separate from institutions: the source directory can be
+-- replaced atomically without changing professor records.
+CREATE TABLE IF NOT EXISTS college_scorecard_institutions (
+    unit_id BIGINT PRIMARY KEY,
+    ope_id TEXT,
+    institution_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    city TEXT,
+    state_code TEXT,
+    postal_code TEXT,
+    homepage_url TEXT,
+    primary_domain TEXT,
+    is_main_campus BOOLEAN,
+    is_currently_operating BOOLEAN,
+    source_file TEXT,
+    imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS college_scorecard_institutions_name_idx
+    ON college_scorecard_institutions (normalized_name);
+CREATE INDEX IF NOT EXISTS college_scorecard_institutions_domain_idx
+    ON college_scorecard_institutions (primary_domain)
+    WHERE primary_domain IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS users (
     id BIGSERIAL PRIMARY KEY,
     oidc_subject TEXT NOT NULL UNIQUE,
@@ -58,7 +95,7 @@ CREATE TABLE IF NOT EXISTS professors (
     career_stage TEXT NOT NULL DEFAULT 'UNKNOWN'
         CHECK (career_stage IN ('NEW_AP', 'ESTABLISHED_PI', 'UNKNOWN')),
     faculty_status TEXT NOT NULL DEFAULT 'UNVERIFIED'
-        CHECK (faculty_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'CONFLICT', 'MANUAL_REVIEW')),
+        CHECK (faculty_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'OUT_OF_SCOPE', 'CONFLICT', 'MANUAL_REVIEW')),
     faculty_title TEXT,
     faculty_source_url TEXT,
     faculty_verification_method TEXT,
@@ -85,6 +122,8 @@ CREATE TABLE IF NOT EXISTS professors (
     previous_institutions TEXT[] NOT NULL DEFAULT '{}',
     official_institution_domain TEXT,
     appointment_year INTEGER CHECK (appointment_year IS NULL OR appointment_year BETWEEN 1900 AND 2200),
+    appointment_start_date DATE,
+    appointment_date_precision TEXT CHECK (appointment_date_precision IS NULL OR appointment_date_precision IN ('YEAR', 'MONTH', 'DAY')),
     graduate_faculty_status TEXT NOT NULL DEFAULT 'UNKNOWN'
         CHECK (graduate_faculty_status IN ('UNKNOWN', 'VERIFIED', 'NOT_LISTED')),
     radar_score INTEGER NOT NULL DEFAULT 0,
@@ -123,12 +162,15 @@ ALTER TABLE professors ADD COLUMN IF NOT EXISTS gpa_last_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS previous_institutions TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS official_institution_domain TEXT;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_year INTEGER;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_start_date DATE;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_date_precision TEXT;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS graduate_faculty_status TEXT NOT NULL DEFAULT 'UNKNOWN';
 
 UPDATE professors
 SET next_identity_check_at = faculty_checked_at + CASE
         WHEN faculty_status = 'VERIFIED' THEN INTERVAL '90 days'
         WHEN faculty_status = 'NOT_FACULTY' THEN INTERVAL '75 days'
+        WHEN faculty_status = 'OUT_OF_SCOPE' THEN INTERVAL '90 days'
         WHEN faculty_status = 'CONFLICT' THEN INTERVAL '45 days'
         ELSE INTERVAL '30 days'
     END
@@ -136,10 +178,9 @@ WHERE next_identity_check_at IS NULL AND faculty_checked_at IS NOT NULL;
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'professors_faculty_status_check') THEN
-        ALTER TABLE professors ADD CONSTRAINT professors_faculty_status_check
-            CHECK (faculty_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'CONFLICT', 'MANUAL_REVIEW'));
-    END IF;
+    ALTER TABLE professors DROP CONSTRAINT IF EXISTS professors_faculty_status_check;
+    ALTER TABLE professors ADD CONSTRAINT professors_faculty_status_check
+        CHECK (faculty_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'OUT_OF_SCOPE', 'CONFLICT', 'MANUAL_REVIEW'));
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'professors_faculty_confidence_check') THEN
         ALTER TABLE professors ADD CONSTRAINT professors_faculty_confidence_check
             CHECK (faculty_confidence BETWEEN 0 AND 1);
@@ -164,7 +205,7 @@ CREATE TABLE IF NOT EXISTS faculty_verification_evidence (
     observed_institution TEXT,
     evidence_text TEXT,
     verification_status TEXT NOT NULL
-        CHECK (verification_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'CONFLICT', 'MANUAL_REVIEW')),
+        CHECK (verification_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'OUT_OF_SCOPE', 'CONFLICT', 'MANUAL_REVIEW')),
     confidence NUMERIC(4, 3) NOT NULL DEFAULT 0
         CHECK (confidence BETWEEN 0 AND 1),
     decision_method TEXT,
@@ -180,6 +221,37 @@ ALTER TABLE faculty_verification_evidence
     ADD COLUMN IF NOT EXISTS model_name TEXT;
 ALTER TABLE faculty_verification_evidence
     ADD COLUMN IF NOT EXISTS prompt_version INTEGER;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS page_title TEXT;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS role_category TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS observed_employer TEXT;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS currentness TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS lookup_status TEXT NOT NULL DEFAULT 'FOUND';
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS evidence_excerpt TEXT;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS extracted_text TEXT;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS http_status INTEGER;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS supports_decision BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE faculty_verification_evidence
+    ADD COLUMN IF NOT EXISTS scope_status TEXT NOT NULL DEFAULT 'UNKNOWN';
+
+DO $$
+BEGIN
+    ALTER TABLE faculty_verification_evidence
+        DROP CONSTRAINT IF EXISTS faculty_verification_evidence_verification_status_check;
+    ALTER TABLE faculty_verification_evidence
+        ADD CONSTRAINT faculty_verification_evidence_verification_status_check
+        CHECK (verification_status IN ('UNVERIFIED', 'VERIFIED', 'NOT_FACULTY', 'OUT_OF_SCOPE', 'CONFLICT', 'MANUAL_REVIEW'));
+END $$;
 
 CREATE INDEX IF NOT EXISTS faculty_verification_evidence_professor_idx
     ON faculty_verification_evidence (professor_id, checked_at DESC);
@@ -531,6 +603,21 @@ CREATE TABLE IF NOT EXISTS fundings (
 ALTER TABLE fundings
     ADD COLUMN IF NOT EXISTS research_domains TEXT[] NOT NULL DEFAULT '{}';
 
+-- Funding freshness is topic- and source-specific. A Chemistry NSF check must
+-- not suppress a later Political Science ORCID/NIH check for the same person.
+CREATE TABLE IF NOT EXISTS professor_topic_grant_checks (
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('CHECKED', 'NO_MATCH', 'NOT_APPLICABLE', 'SOURCE_UNAVAILABLE', 'DISABLED')),
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    next_check_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '30 days',
+    last_error TEXT,
+    PRIMARY KEY (professor_id, radar_topic_id, source)
+);
+CREATE INDEX IF NOT EXISTS professor_topic_grant_checks_due_idx
+    ON professor_topic_grant_checks (radar_topic_id, next_check_at);
+
 CREATE TABLE IF NOT EXISTS hiring_signals (
     id BIGSERIAL PRIMARY KEY,
     professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
@@ -552,6 +639,11 @@ CREATE TABLE IF NOT EXISTS hiring_signals (
     consecutive_check_failures INTEGER NOT NULL DEFAULT 0,
     next_check_at TIMESTAMPTZ,
     source_date_text TEXT,
+    source_date DATE,
+    source_date_precision TEXT
+        CHECK (source_date_precision IS NULL OR source_date_precision IN ('YEAR', 'MONTH', 'DAY', 'SEASON')),
+    freshness_status TEXT NOT NULL DEFAULT 'UNDATED'
+        CHECK (freshness_status IN ('CURRENT', 'UPCOMING', 'UNDATED', 'OLDER', 'HISTORICAL', 'EXPIRED')),
     expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -564,6 +656,9 @@ ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS check_status TEXT NOT NULL D
 ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS consecutive_check_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMPTZ;
 ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS source_date_text TEXT;
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS source_date DATE;
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS source_date_precision TEXT;
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS freshness_status TEXT NOT NULL DEFAULT 'UNDATED';
 
 -- Automated web discoveries used to create pending opportunity advertisements.
 -- They are evidence records, not submissions, so keep the evidence in
@@ -600,6 +695,28 @@ CREATE TABLE IF NOT EXISTS radar_topics (
 ALTER TABLE radar_topics
     ADD COLUMN IF NOT EXISTS discovery_version INTEGER NOT NULL DEFAULT 0;
 
+-- Stable OpenAlex hierarchy nodes used by ScholarRadar. One user-facing
+-- research area can map to several domains, fields, subfields, or topics.
+CREATE TABLE IF NOT EXISTS openalex_research_nodes (
+    openalex_id TEXT PRIMARY KEY,
+    node_type TEXT NOT NULL
+        CHECK (node_type IN ('domain', 'field', 'subfield', 'topic')),
+    display_name TEXT NOT NULL,
+    description TEXT,
+    parent_id TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS radar_topic_openalex_nodes (
+    radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
+    openalex_node_id TEXT NOT NULL
+        REFERENCES openalex_research_nodes(openalex_id) ON DELETE CASCADE,
+    weight NUMERIC(5, 3) NOT NULL DEFAULT 1.0,
+    mapping_method TEXT NOT NULL,
+    reviewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_topic_id, openalex_node_id)
+);
+
 CREATE TABLE IF NOT EXISTS radar_topic_professors (
     radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
     professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
@@ -626,6 +743,7 @@ CREATE TABLE IF NOT EXISTS radar_topic_professor_papers (
     paper_id BIGINT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
     relevance_score NUMERIC(5, 2) NOT NULL DEFAULT 0,
     matched_query TEXT NOT NULL,
+    matched_openalex_node_id TEXT,
     is_current_match BOOLEAN NOT NULL DEFAULT TRUE,
     discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -633,6 +751,8 @@ CREATE TABLE IF NOT EXISTS radar_topic_professor_papers (
     FOREIGN KEY (professor_id, paper_id)
         REFERENCES professor_papers(professor_id, paper_id) ON DELETE CASCADE
 );
+ALTER TABLE radar_topic_professor_papers
+    ADD COLUMN IF NOT EXISTS matched_openalex_node_id TEXT;
 
 -- Durable work queue. The partial unique index prevents duplicate active work
 -- for the same topic/professor while allowing a later refresh job.
@@ -738,7 +858,7 @@ CREATE TABLE IF NOT EXISTS radar_runs (
     normalized_topic TEXT,
     requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
     status TEXT NOT NULL DEFAULT 'running'
-        CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+        CHECK (status IN ('running', 'completed', 'exhausted', 'waiting', 'failed', 'cancelled')),
     stage TEXT NOT NULL DEFAULT 'Starting radar',
     progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
     professors_found INTEGER NOT NULL DEFAULT 0,
@@ -764,6 +884,12 @@ ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS target_professors INTEGER NOT NU
 ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS web_check_limit INTEGER NOT NULL DEFAULT 12;
 ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS candidates_ranked INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS faculty_identities_checked INTEGER NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+    ALTER TABLE radar_runs DROP CONSTRAINT IF EXISTS radar_runs_status_check;
+    ALTER TABLE radar_runs ADD CONSTRAINT radar_runs_status_check
+        CHECK (status IN ('running', 'completed', 'exhausted', 'waiting', 'failed', 'cancelled'));
+END $$;
 
 -- Every professor discovered for a run is retained, even if no explicit hiring
 -- statement is found. Hiring evidence and probable-opportunity signals are

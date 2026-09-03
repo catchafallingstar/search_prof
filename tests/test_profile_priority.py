@@ -19,7 +19,7 @@ class ProfilePriorityTests(unittest.TestCase):
             'Kenneth Merz Research Computational Approaches to Biomolecular Systems '
             'Area(s) of Interest Selected Publications Random Forest Refinement', 'Kenneth Merz')
         self.assertEqual(result['status'], 'VERIFIED')
-        self.assertEqual(result['title'], 'Member Of The Faculty')
+        self.assertEqual(result['title'], 'Member of the faculty')
         self.assertEqual(result['method'], 'official_faculty_membership')
 
     def test_generic_profile_url_does_not_prove_faculty(self):

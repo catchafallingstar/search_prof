@@ -5,6 +5,7 @@ import requests
 
 from ingestion.homepagefinder import is_public_http_url, result_matches_institution
 from ingestion.matchers import is_valid_signal_text
+from ingestion.name_normalization import name_tokens
 from ingestion.websearch import SearchUnavailable, search_web
 
 EXCLUDED_DOMAINS = {
@@ -22,10 +23,10 @@ _bluesky_unavailable = False
 
 
 def _identity_matches(prof_name: str, *values: str) -> bool:
-    parts = [part.casefold() for part in prof_name.split() if len(part) > 1]
+    parts = name_tokens(prof_name)
     if not parts:
         return False
-    combined = " ".join(value or "" for value in values).casefold()
+    combined = name_tokens(" ".join(value or "" for value in values))
     if len(parts) == 1:
         return parts[0] in combined
     return parts[0] in combined and parts[-1] in combined

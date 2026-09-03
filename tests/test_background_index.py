@@ -7,7 +7,7 @@ from ingestion.index_worker import (
     _enrich_professors,
     _verify,
     process_job,
-    run_job_with_deadline,
+    run_job_isolated,
 )
 from radar_store import normalize_topic_query, save_topic_candidates, topic_key
 
@@ -205,14 +205,14 @@ class BackgroundIndexTests(unittest.TestCase):
         self.assertIn("SET status = 'queued', attempts = 0", continuation)
         self.assertIn("last_error = NULL", continuation)
 
-    def test_worker_enforces_deadline_in_a_separate_process(self) -> None:
+    def test_worker_isolates_jobs_without_an_aggregate_deadline(self) -> None:
         worker = (PROJECT_DIR / "ingestion" / "index_worker.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("def run_job_with_deadline", worker)
+        self.assertIn("def run_job_isolated", worker)
         self.assertIn('multiprocessing.get_context("fork")', worker)
-        self.assertIn("process.terminate()", worker)
-        self.assertIn('setting_int("INDEX_JOB_TIMEOUT_SECONDS", 300', worker)
+        self.assertNotIn("Job exceeded its", worker)
+        self.assertNotIn('setting_int("INDEX_JOB_TIMEOUT_SECONDS"', worker)
         self.assertIn("update_worker_heartbeat(worker_id", worker)
 
     def test_identity_jobs_are_small_and_resume_from_saved_decisions(self) -> None:
@@ -224,19 +224,19 @@ class BackgroundIndexTests(unittest.TestCase):
         )
         self.assertIn('setting_int("INDEX_VERIFY_BATCH_SIZE", 1, 1, 6)', worker)
         self.assertIn("_save_result(candidate, result)", verifier)
-        self.assertTrue('setting_int("FACULTY_IDENTITY_PASS_QUERIES", 10, 1, 10)' in verifier, 'Expected a bounded ten-query maximum')
-        self.assertIn("FACULTY_IDENTITY_PASS_SECONDS", verifier)
+        self.assertIn("query_limit = 3", verifier, "Expected the agreed three-query maximum")
+        self.assertIn("FACULTY_SEARCH_QUERY_TIMEOUT_SECONDS", verifier)
         self.assertTrue('setting_int("FACULTY_IDENTITY_PASS_PAGES", 20, 3, 20)' in verifier, 'Expected a bounded twenty-page maximum')
 
     @patch("ingestion.index_worker.update_worker_heartbeat")
-    @patch("ingestion.index_worker.process_job", side_effect=_slow_job)
-    def test_worker_terminates_a_job_that_exceeds_its_deadline(
-        self, _process_job, _heartbeat
+    @patch("ingestion.index_worker.process_job", return_value=({"ok": True}, False))
+    def test_worker_waits_for_isolated_job_completion(
+        self, _process_job, heartbeat
     ) -> None:
-        started = time.monotonic()
-        with self.assertRaisesRegex(TimeoutError, "1-second deadline"):
-            run_job_with_deadline({"id": 999}, "test-worker", 1)
-        self.assertLess(time.monotonic() - started, 5)
+        result, needs_more = run_job_isolated({"id": 999}, "test-worker")
+        self.assertEqual(result, {"ok": True})
+        self.assertFalse(needs_more)
+        heartbeat.assert_called()
 
     def test_retry_uses_a_fresh_runtime_window(self) -> None:
         source = (PROJECT_DIR / "radar_store.py").read_text(encoding="utf-8")
@@ -340,7 +340,8 @@ class BackgroundIndexTests(unittest.TestCase):
         self.assertIn('identity["identity_evidence"]', source)
         self.assertIn("Papers supporting current search matches", page_source)
         self.assertIn("Other recent papers for identity checking", page_source)
-        self.assertIn("Official pages checked automatically", page_source)
+        self.assertIn("Saved identity sources", page_source)
+        self.assertIn('row.get("evidence_excerpt")', page_source)
         self.assertIn("Imported institution (may be historical)", page_source)
 
     def test_reindex_marks_only_the_latest_candidate_set_as_current(self) -> None:
@@ -390,13 +391,13 @@ class BackgroundIndexTests(unittest.TestCase):
         self.assertEqual(len(evidence_calls), 1)
         self.assertEqual(
             evidence_calls[0].args[1],
-            (7, 11, 13, 8.0, "AI security"),
+            (7, 11, 13, 8.0, "AI security", None),
         )
 
     def test_old_discovery_versions_upgrade_only_when_requested(self) -> None:
         source = (PROJECT_DIR / "radar_store.py").read_text(encoding="utf-8")
         schema = (PROJECT_DIR / "db.sql").read_text(encoding="utf-8")
-        self.assertIn("RADAR_DISCOVERY_VERSION = 3", source)
+        self.assertIn("RADAR_DISCOVERY_VERSION = 4", source)
         self.assertIn('topic.get("discovery_version")', source)
         self.assertIn("discovery_version INTEGER NOT NULL DEFAULT 0", schema)
         self.assertIn("return topic, []", source)

@@ -6,7 +6,8 @@ import unicodedata
 import time
 import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from calendar import monthrange
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -28,24 +29,67 @@ from ingestion.paper_affiliations import (
 )
 from ingestion.websearch import SearchUnavailable, search_web
 from ingestion import verification_audit as audit_log
+from ingestion.name_normalization import fold_name_text, name_tokens
+from ingestion.institution_classifier import lookup_institution_classification
 from ingestion.identity_sources import (source_kind, cv_homepage, linked_profile_leads,
                                         canonical_source_url, text_url_leads, excluded_profile_source)
 from ingestion.institution_domains import (record_for_name, record_for_host,
-    canonical_institution, academic_domain_hint, offshore_appointment)
+    canonical_institution, academic_domain_hint, offshore_appointment,
+    institutions_equivalent)
 from settings import setting, setting_bool, setting_int
 
 OPENALEX_INSTITUTIONS_URL = "https://api.openalex.org/institutions"
 OPENALEX_AUTHORS_URL = "https://api.openalex.org/authors"
-FACULTY_VERIFICATION_VERSION = 11
+FACULTY_VERIFICATION_VERSION = 18
 FACULTY_TITLE_PATTERN = re.compile(
-    r"\b(?:tenure[- ]track\s+)?(?:assistant|associate|full|research|clinical|teaching|adjunct|visiting)?\s*"
-    r"professor(?:\s+of\s+practice)?\b|\bmember\s+of\s+the\s+(?:graduate\s+)?faculty\b",
+    r"\b(?:(?:tenure[- ]track|assistant|asst\.?|associate|assoc\.?|full|research|clinical|teaching|adjunct|adj\.?|visiting|distinguished|endowed)\s+){0,3}"
+    r"(?:professor|prof\.)(?:\s+of\s+practice)?(?=\s|$|[.,;:)\]])|"
+    r"\b(?:senior\s+|principal\s+|clinical\s+|teaching\s+|adjunct\s+|visiting\s+)?"
+    r"(?:lecturer|lect\.|instructor|instr\.)(?=\s|$|[.,;:)\]])|"
+    r"\bmember\s+of\s+the\s+(?:graduate\s+)?faculty\b",
     re.IGNORECASE,
 )
 NON_FACULTY_PATTERN = re.compile(
-    r"\b(?:ph\.?d\.?|doctoral|graduate|undergraduate)\s+(?:student|candidate|researcher)\b|"
-    r"\bpostdoctoral\s+(?:fellow|researcher|associate)\b|\bdata\s+scientist\b|"
-    r"\bresearch\s+assistant\b|\balumn(?:us|a|i)\b",
+    r"\b(?:ph\.?\s*d\.?|doctoral|graduate|grad\.?|undergraduate|undergrad\.?)\s+"
+    r"(?:students?|candidates?|researchers?)\b|"
+    r"\bpost[- ]?doc\b|\bpost[- ]?doctoral\s+(?:fellows?|researchers?|associates?|scholars?)\b|"
+    r"\bdata\s+scientists?\b|\bresearch\s+(?:assistants?|asst\.?)\b|"
+    r"\balumn(?:us|a|i|ae)\b",
+    re.IGNORECASE,
+)
+CURRENT_NONFACULTY_ROLE_PATTERN = re.compile(
+    r"\b(?:(?:senior|staff|principal|lead)\s+){0,2}(?:machine\s+learning\s+|"
+    r"ai\s+|computer\s+vision\s+)?(?:research\s+scientist|research\s+engineer|"
+    r"software\s+engineer|data\s+scientist|scientist|engineer)\b|"
+    r"\bpost[- ]?doc(?:toral)?\s+(?:scientist|fellow|researcher|associate|scholar)\b|"
+    r"\b(?:industry|industrial|national[- ]lab)\s+researcher\b|"
+    r"\b(?:[a-z][a-z-]*\s+){0,3}researcher\b|"
+    r"\b(?:research|visiting)\s+scientist\b|\btechnical\s+lead\b|"
+    r"\b(?:(?:senior|staff|principal|lead|chief|associate|assistant)\s+){0,2}"
+    r"(?:engineering|product|project|program|operations?|software|systems?|data|"
+    r"security|technology|technical|business|policy|education|school|laboratory|lab)?\s*"
+    r"(?:manager|developer|analyst|consultant|architect|specialist|officer|"
+    r"technician|teacher|educator|administrator|coordinator)\b",
+    re.IGNORECASE,
+)
+CURRENT_ROLE_CUE_PATTERN = re.compile(
+    r"\b(?:I\s+am|I\s*m|currently|current\s+appointment|present\s+position|"
+    r"works?\s+as|serves?\s+as|joined)\b|"
+    r"\b(?:manager|developer|analyst|consultant|architect|specialist|officer|"
+    r"technician|teacher|educator|administrator|coordinator|engineer|scientist|"
+    r"researcher)\s+(?:at|@)\b",
+    re.IGNORECASE,
+)
+LINKEDIN_FACULTY_WORDING_PATTERN = re.compile(
+    r"\b(?:professor|faculty|lecturer|instructor|dean|academic\s+faculty)\b",
+    re.IGNORECASE,
+)
+NON_US_LOCATION_PATTERN = re.compile(
+    r"\b(?:China|Canada|United\s+Kingdom|Australia|India|Japan|South\s+Korea|"
+    r"Singapore|Germany|France|Italy|Spain|Netherlands|Switzerland|Sweden|"
+    r"Norway|Denmark|Finland|Belgium|Austria|Ireland|New\s+Zealand|Brazil|"
+    r"Mexico|United\s+Arab\s+Emirates|Qatar|Saudi\s+Arabia|Israel|Taiwan|"
+    r"Hong\s+Kong)\b",
     re.IGNORECASE,
 )
 NON_APPOINTMENT_ROLE_PATTERN = re.compile(
@@ -63,8 +107,14 @@ NON_PROFILE_URL_PATTERN = re.compile(
     r"alumni|commencement|dissertation|theses",
     re.IGNORECASE,
 )
+STALE_FACULTY_PROFILE_HINT_PATTERN = re.compile(
+    r"honou?red[-_/ ]?faculty|emerit(?:us|a|i)|retired[-_/ ]?faculty|"
+    r"former[-_/ ]?faculty|past[-_/ ]?faculty|faculty[-_/ ]?archive|legacy[-_/ ]?profile",
+    re.IGNORECASE,
+)
 HISTORICAL_APPOINTMENT_URL_PATTERN = re.compile(
     r"(?:^|/)(?:news|events?|press|stories|announcements?)(?:/|$)|"
+    r"(?:^|/)(?:seminars?|talks?|conferences?)(?:/|$)|"
     r"new[-_/ ]*faculty|faculty[-_/ ]*hires?",
     re.IGNORECASE,
 )
@@ -109,17 +159,11 @@ PAPER_LINKED_PROFILE_BLOCKED_DOMAINS = {
 
 
 def _ascii_fold(value: str) -> str:
-    compact = value.translate(str.maketrans("", "", "'’ʻ`"))
-    return "".join(
-        character
-        for character in unicodedata.normalize("NFKD", compact)
-        if not unicodedata.combining(character)
-    )
+    return fold_name_text(value)
 
 
 def _name_tokens(name: str) -> list[str]:
-    folded = _ascii_fold(name).casefold()
-    return [token for token in re.findall(r"[a-z0-9]+", folded) if len(token) > 1]
+    return name_tokens(name)
 
 
 def _identity_matches(name: str, text: str) -> bool:
@@ -127,7 +171,9 @@ def _identity_matches(name: str, text: str) -> bool:
     observed = _name_tokens(text)
     if not expected or not observed:
         return False
-    minimum = len(expected)
+    # A profile may omit middle names/initials or join a compound given name.
+    # Never reduce a multi-token identity to a one-token surname match.
+    minimum = 2 if len(expected) >= 2 else 1
     maximum = min(len(observed), len(expected) + 2)
     for start in range(len(observed)):
         for width in range(minimum, maximum + 1):
@@ -140,23 +186,63 @@ def _identity_matches(name: str, text: str) -> bool:
 
 
 def _name_tokens_compatible(expected: list[str], observed: list[str]) -> bool:
-    """Allow middle names/initials while preserving the first and last names."""
-    if expected == observed:
-        return True
+    """Compare safe structural variants without guessing a person's ethnicity.
+
+    Handles surname-first directory headings, omitted middle initials, and
+    joined/split compound names such as ``Guo-Wei`` / ``Guowei``.  These forms
+    only locate identity evidence; role and institution checks still decide it.
+    """
+    def forms(tokens: list[str]) -> set[tuple[str, ...]]:
+        if not tokens:
+            return set()
+        # Single-letter middle initials are optional.  The shared tokenizer
+        # already drops most of them, but retain this for callers/tests that
+        # supply tokens directly.
+        compact = [
+            value for index, value in enumerate(tokens)
+            if not (0 < index < len(tokens) - 1 and len(value) == 1)
+        ]
+        variants = {tuple(tokens), tuple(compact)}
+        for values in (tokens, compact):
+            if len(values) >= 2:
+                # Western directory form: Family, Given Middle.
+                variants.add(tuple([values[-1], *values[:-1]]))
+                # Names natively stored family-name first but displayed
+                # given-name first by another source.
+                variants.add(tuple([*values[1:], values[0]]))
+        return {variant for variant in variants if variant}
+
     if len(expected) < 2 or len(observed) < 2:
-        return False
-    if expected[0] != observed[0] or expected[-1] != observed[-1]:
-        return False
-    if len(expected) == 2:
-        return len(observed) <= 4
-    observed_middle = observed[1:-1]
-    for token in expected[1:-1]:
-        if not any(
-            token == value or token[:1] == value[:1] and min(len(token), len(value)) == 1
-            for value in observed_middle
-        ):
+        return expected == observed
+    # Candidate-specific pages commonly abbreviate one given name, for example
+    # ``Levent Burak Kara`` -> ``L. Burak Kara``. Permit initials only while
+    # the remaining ordered name (including the full surname) still matches.
+    def initial_compatible(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+        if len(left) != len(right) or len(left) < 2 or left[-1] != right[-1]:
             return False
-    return True
+        exact_full_tokens = 0
+        for left_token, right_token in zip(left, right):
+            if left_token == right_token:
+                if len(left_token) > 1:
+                    exact_full_tokens += 1
+                continue
+            if min(len(left_token), len(right_token)) != 1:
+                return False
+            if left_token[0] != right_token[0]:
+                return False
+        return exact_full_tokens >= 1
+    expected_forms, observed_forms = forms(expected), forms(observed)
+    if expected_forms & observed_forms:
+        return True
+    if any(initial_compatible(left, right)
+           for left in expected_forms for right in observed_forms):
+        return True
+    # Joining tokens is safe here because the complete ordered letter string
+    # must match, not merely one token: Guo + Wei == Guowei.
+    return bool(
+        {"".join(value) for value in expected_forms}
+        & {"".join(value) for value in observed_forms}
+    )
 
 
 def _profile_title_matches(name: str, page_title: str) -> bool:
@@ -170,27 +256,38 @@ def _profile_title_matches(name: str, page_title: str) -> bool:
     page_title = unicodedata.normalize('NFKC', page_title)
     page_title = re.sub(r'\bPh\s*\.\s*D\.?', 'PhD', page_title, flags=re.I)
     page_title = re.sub(r'\bM\s*\.\s*D\.?', 'MD', page_title, flags=re.I)
-    for segment in re.split(r"\s*(?:\||·|—|–)\s*|\s+-\s+", page_title):
+    for raw_segment in re.split(r"\s*(?:\||·|—|–)\s*|\s+-\s+", page_title):
+        # A parenthetical alias after the primary name is still the same
+        # person's profile: ``Rui-Feng Wang (Swee-Fong Wong)``.  Evaluate both
+        # the full segment and a version without the alias.
+        segments = [raw_segment]
+        without_alias = re.sub(r"\s*\([^)]{1,120}\)\s*", " ", raw_segment).strip()
+        if without_alias and without_alias != raw_segment:
+            segments.append(without_alias)
+        for segment in segments:
         # A faculty role is a suffix, not part of the name. Only strip an
         # explicit role suffix; do not skip an arbitrary preceding name.
-        role = FACULTY_TITLE_PATTERN.search(segment)
-        if role and role.start() > 0:
-            segment = segment[:role.start()].rstrip(' ,:-')
-        tokens = _name_tokens(re.sub(r"['’]s\b", "", segment, flags=re.IGNORECASE))
-        while tokens and tokens[0] in {"dr", "prof", "professor"}:
-            tokens.pop(0)
-        for start in (0,):
-            if start >= len(tokens):
-                continue
-            for width in range(len(expected), min(len(tokens) - start, len(expected) + 2) + 1):
-                observed = tokens[start:start + width]
-                if not _name_tokens_compatible(expected, observed):
+            role = FACULTY_TITLE_PATTERN.search(segment)
+            if role and role.start() > 0:
+                segment = segment[:role.start()].rstrip(' ,:-')
+            tokens = _name_tokens(re.sub(r"['’]s\b", "", segment, flags=re.IGNORECASE))
+            while tokens and tokens[0] in {"dr", "prof", "professor"}:
+                tokens.pop(0)
+            for start in (0,):
+                if start >= len(tokens):
                     continue
-                remainder = tokens[start + width:]
-                if not remainder or all(
-                    token in TITLE_AFTER_NAME_TOKENS for token in remainder[:3]
+                for width in range(
+                    2 if len(expected) >= 2 else 1,
+                    min(len(tokens) - start, len(expected) + 2) + 1,
                 ):
-                    return True
+                    observed = tokens[start:start + width]
+                    if not _name_tokens_compatible(expected, observed):
+                        continue
+                    remainder = tokens[start + width:]
+                    if not remainder or all(
+                        token in TITLE_AFTER_NAME_TOKENS for token in remainder[:3]
+                    ):
+                        return True
     return False
 
 
@@ -204,14 +301,7 @@ def _institution_tokens(value: str) -> set[str]:
 
 
 def _institution_similarity(left: str, right: str) -> float:
-    left_record, right_record = record_for_name(left), record_for_name(right)
-    if left_record and right_record:
-        return 1.0 if left_record == right_record else 0.0
-    left_tokens = _institution_tokens(left)
-    right_tokens = _institution_tokens(right)
-    if not left_tokens or not right_tokens:
-        return 0.0
-    return len(left_tokens & right_tokens) / min(len(left_tokens), len(right_tokens))
+    return 1.0 if institutions_equivalent(left, right) else 0.0
 
 
 def _institution_search_aliases(institution: str) -> list[str]:
@@ -269,17 +359,29 @@ def _identity_context(name: str, text: str, window: int = 350) -> str:
             continue
         positions.extend(match.start() for match in re.finditer(re.escape(value), lowered))
     positions = sorted(set(positions))
-    # Use the same optional-middle-initial normalization as name matching.
+    # Use the same optional-middle-initial, surname-first, and joined-compound
+    # normalization as name matching.
     tokens = _name_tokens(name)
     if len(tokens) >= 2:
-        pattern = r'\b' + r'[\W_]+(?:[A-Za-z]\.?[\W_]+)?'.join(map(re.escape, tokens)) + r'\b'
-        positions = sorted(set(positions + [m.start() for m in re.finditer(pattern, text, re.I)]))
+        orders = [tokens, [tokens[-1], *tokens[:-1]], [*tokens[1:], tokens[0]]]
+        if len(tokens) >= 3:
+            # Current bios sometimes use a first initial plus the complete
+            # middle/given name and surname: ``L. Burak Kara``.
+            orders.extend(([tokens[0][0], *tokens[1:]], tokens[1:]))
+        for order in orders:
+            # ``*`` permits a joined compound (GuoWei) as well as hyphenated or
+            # spaced spellings. The complete ordered name must still match.
+            pattern = r'\b' + r'[\W_]*(?:[A-Za-z]\.?[\W_]*)?'.join(
+                map(re.escape, order)
+            ) + r'\b'
+            positions.extend(m.start() for m in re.finditer(pattern, text, re.I))
+        positions = sorted(set(positions))
     if not positions:
         return ""
     # Repeated page titles and navigation often contain the name before the
     # actual profile block. Prefer an occurrence whose nearby text contains a
     # role, while keeping the wider context for evidence and new-faculty dates.
-    for pattern in (FACULTY_TITLE_PATTERN, NON_FACULTY_PATTERN):
+    for pattern in (FACULTY_TITLE_PATTERN, NON_FACULTY_PATTERN, CURRENT_NONFACULTY_ROLE_PATTERN):
         for position in positions:
             nearby = text[max(0, position - 100): position + len(name) + 180]
             if pattern.search(nearby):
@@ -647,7 +749,57 @@ def _institution_for_domain(domain: str) -> str:
         return ""
 
 
+MONTH_NUMBER = {
+    name: number for number, name in enumerate(
+        ('', 'january', 'february', 'march', 'april', 'may', 'june',
+         'july', 'august', 'september', 'october', 'november', 'december')
+    ) if name
+}
+MONTH_NUMBER.update({name[:3]: number for name, number in list(MONTH_NUMBER.items())})
+
+
+def _partial_date(year: int, month: int | None = None, day: int | None = None,
+                  *, end: bool = False) -> tuple[date, str]:
+    """Represent only the precision supplied by a source without inventing it."""
+    if day is not None and month is not None:
+        return date(year, month, day), 'DAY'
+    if month is not None:
+        return date(year, month, monthrange(year, month)[1] if end else 1), 'MONTH'
+    return date(year, 12, 31) if end else date(year, 1, 1), 'YEAR'
+
+
+def _extract_appointment_date(text: str) -> tuple[date | None, str | None]:
+    """Read a dated appointment cue at year, month, or day precision."""
+    value = ' '.join(str(text or '').split())
+    cue = r'(?:joined|joins|appointed|became|starting|starts|since|beginning|began)'
+    month_names = '|'.join(sorted(MONTH_NUMBER, key=len, reverse=True))
+    patterns = (
+        rf'\b{cue}\b[^.;\n]{{0,100}}?\b({month_names})\s+(\d{{1,2}}),?\s+(20\d{{2}})\b',
+        rf'\b{cue}\b[^.;\n]{{0,100}}?\b({month_names})\s+(20\d{{2}})\b',
+        rf'\b{cue}\b[^.;\n]{{0,100}}?\b(20\d{{2}})\b',
+        r'\b(20\d{2})\s*(?:[-–—]|to)\s*(?:present|current|now)\b',
+    )
+    for index, pattern in enumerate(patterns):
+        match = re.search(pattern, value, re.I)
+        if not match:
+            continue
+        try:
+            if index == 0:
+                month = MONTH_NUMBER[match.group(1).casefold()]
+                return _partial_date(int(match.group(3)), month, int(match.group(2)))
+            if index == 1:
+                month = MONTH_NUMBER[match.group(1).casefold()]
+                return _partial_date(int(match.group(2)), month)
+            return _partial_date(int(match.group(1)))
+        except (KeyError, ValueError):
+            continue
+    return None, None
+
+
 def _extract_appointment_year(text: str) -> int | None:
+    appointment_date, _precision = _extract_appointment_date(text)
+    if appointment_date:
+        return appointment_date.year
     current_year = datetime.now(timezone.utc).year
     for match in re.finditer(r"\b(20\d{2})\b", text):
         year = int(match.group(1))
@@ -806,17 +958,28 @@ def _attributed_role(name: str, context: str, pattern: re.Pattern) -> re.Match |
     tokens = _name_tokens(name)
     if not tokens:
         return None
-    names = list(re.finditer(r'\b' + r'[\W_]+(?:[A-Za-z]\.[\W_]+)?'.join(
-        map(re.escape, tokens)) + r'\b', text, flags=re.I))
+    orders = [tokens]
+    if len(tokens) >= 2:
+        orders.extend(([tokens[-1], *tokens[:-1]], [*tokens[1:], tokens[0]]))
+    if len(tokens) >= 3:
+        orders.extend(([tokens[0][0], *tokens[1:]], tokens[1:]))
+    names_by_span: dict[tuple[int, int], re.Match] = {}
+    for order in orders:
+        name_pattern = r'\b' + r'[\W_]*(?:[A-Za-z]\.?[\W_]*)?'.join(
+            map(re.escape, order)
+        ) + r'\b'
+        for found in re.finditer(name_pattern, text, flags=re.I):
+            names_by_span[(found.start(), found.end())] = found
+    names = sorted(names_by_span.values(), key=lambda value: (value.start(), value.end()))
     for role in pattern.finditer(text):
         before = text[max(0, role.start() - 180):role.start()]
         # "I am an Associate Professor" on an already attributed profile.
-        if re.search(r"\bI(?:\s+am|'m)(?:\s+(?:currently|now|an?|the))*\s*$", before, re.I):
+        if re.search(r"\bI(?:\s+am|\s*m)(?:\s+(?:currently|now|an?|the))*\s*$", before, re.I):
             return role
         # "I am VP at Company, a professor at University, and ..." shares
         # the first-person subject. Do not cross a sentence, another subject,
         # historical clause, or mentorship relationship.
-        shared = re.search(r"\bI(?:\s+am|'m)\s+([^.!?;\n]{0,170})[,;]\s*(?:and\s+)?(?:an?\s*)?$", before, re.I)
+        shared = re.search(r"\bI(?:\s+am|\s*m)\s+([^.!?;\n]{0,170})[,;]\s*(?:and\s+)?(?:an?\s*)?$", before, re.I)
         if shared and not re.search(r'\b(?:was|former|formerly|previously|worked|with|under|advisor|adviser|mentor|supervis\w*|who|he|she|they|student|candidate)\b', shared.group(1), re.I):
             return role
         for person in reversed(names):
@@ -835,6 +998,19 @@ def _attributed_role(name: str, context: str, pattern: re.Pattern) -> re.Match |
                 # subject. Keep mentorship and intervening-role exclusions above.
                 if re.search(r'\b(?:chair|endowed|family)\b', bridge, re.I):
                     name_bridge = ''
+                # Names inside an endowed chair title identify donors, not a
+                # second profile subject. Keep this narrow: it must be a short
+                # title-case phrase containing ``and`` or ``&``.
+                donor_words = re.findall(r"[A-Za-z][A-Za-z'’.-]*|&", bridge)
+                donor_title = bool(
+                    pattern is FACULTY_TITLE_PATTERN
+                    and 3 <= len(donor_words) <= 14
+                    and any(word.casefold() in {'and', '&'} for word in donor_words)
+                    and all(word.casefold() in {'and', '&'} or word[:1].isupper()
+                            for word in donor_words)
+                )
+                if donor_title:
+                    name_bridge = ''
                 if re.search(r"\b[A-Z][a-z'’.-]{2,}\s+[A-Z][a-z'’.-]{2,}\b", name_bridge):
                     continue
                 if FACULTY_TITLE_PATTERN.search(bridge) or NON_FACULTY_PATTERN.search(bridge):
@@ -851,11 +1027,481 @@ def _attributed_role(name: str, context: str, pattern: re.Pattern) -> re.Match |
     return None
 
 
+def _clean_faculty_title(value: str | None) -> str | None:
+    """Clean presentation artifacts while preserving named professorships."""
+    title = ' '.join(str(value or '').split()).strip(' |,:;-–—')
+    if not title:
+        return None
+    title = re.sub(
+        r'^(?:is\s+|serves\s+as\s+)?(?:currently\s+|now\s+)?(?:an?\s+|the\s+)?',
+        '', title, flags=re.I,
+    )
+    title = re.sub(r'\bAsst\.?\s+Prof\.?\b', 'Assistant Professor', title, flags=re.I)
+    title = re.sub(r'\bAssoc\.?\s+Prof\.?\b', 'Associate Professor', title, flags=re.I)
+    title = re.sub(r'\bAdj\.?\s+Prof\.?\b', 'Adjunct Professor', title, flags=re.I)
+    title = re.sub(r'\bProf\.?(?=\s|$)', 'Professor', title, flags=re.I)
+    title = re.sub(r'\bLect\.?(?=\s|$)', 'Lecturer', title, flags=re.I)
+    title = re.sub(r'\bInstr\.?(?=\s|$)', 'Instructor', title, flags=re.I)
+    # Department/degree abbreviations occasionally leak in immediately before
+    # a standard rank (for example ``MS Assistant Professor``).
+    title = re.sub(
+        r'^(?:[A-Z]{2,6}\s+)(?=(?:Assistant|Associate|Adjunct|Research|Clinical|'
+        r'Teaching|Visiting|Distinguished|Endowed|Professor|Lecturer|Instructor)\b)',
+        '', title,
+    )
+    return title.strip(' |,:;-–—') or None
+
+
+def _detailed_faculty_title(
+    name: str, context: str, role: re.Match | None
+) -> str | None:
+    """Return the exact public rank or named professorship from the profile."""
+    if role is None:
+        return None
+    normalized = " ".join(unicodedata.normalize("NFKC", context).split())
+    folded = _ascii_fold(normalized)
+    tokens = _name_tokens(name)
+    if tokens:
+        own_name = r"\b" + r"[\W_]+".join(map(re.escape, tokens)) + r"\b"
+        preceding = list(re.finditer(own_name, folded[:role.start()], re.I))
+        if preceding:
+            nearest = preceding[-1]
+            candidate_title = normalized[nearest.end():role.end()].strip(" ,:;-–—")
+            candidate_title = re.sub(r"^(?:Dr\.?\s+)", "", candidate_title, flags=re.I)
+            if not re.search(
+                r"\b(?:apply|links?|menu|tools?|search|directory|profile|contact|email|phone)\b",
+                candidate_title,
+                re.I,
+            ):
+                words = re.findall(r"[A-Za-z][A-Za-z'’.-]*|&", candidate_title)
+                if (
+                    1 <= len(words) <= 14
+                    and re.search(r"\b(?:professor|lecturer|instructor)\b", candidate_title, re.I)
+                ):
+                    return _clean_faculty_title(candidate_title)
+    name_patterns: list[str] = []
+    if tokens:
+        name_patterns.append(r"\b" + r"[\W_]+".join(map(re.escape, tokens)) + r"\b")
+    if len(tokens) >= 3:
+        name_patterns.extend([
+            r"\b" + re.escape(tokens[0][0]) + r"\.?[\W_]+" +
+            r"[\W_]+".join(map(re.escape, tokens[1:])) + r"\b",
+            r"\b" + r"[\W_]+".join(map(re.escape, tokens[1:])) + r"\b",
+        ])
+    for name_pattern in name_patterns:
+        for person in re.finditer(name_pattern, _ascii_fold(normalized), re.I):
+            tail = normalized[person.end():person.end() + 190].lstrip(" ,:;-–—")
+            # Page title + body often repeats the person's name before the
+            # actual title. Remove one repeated identity, not arbitrary words.
+            for repeated_name in name_patterns:
+                repeated = re.match(repeated_name, _ascii_fold(tail), re.I)
+                if repeated:
+                    tail = tail[repeated.end():].lstrip(" ,:;-–—")
+                    break
+            tail = re.sub(
+                r"^(?:is\s+)?(?:currently\s+|now\s+)?(?:an?\s+|the\s+)?",
+                "", tail, flags=re.I,
+            )
+            endowed = re.match(
+                r"(?P<title>(?:(?:[A-Z][A-Za-z'’.-]*|and|&)\s+){2,14}"
+                r"Professor(?:\s+of\s+Practice)?)\b",
+                tail,
+            )
+            if endowed:
+                return _clean_faculty_title(endowed.group("title"))
+            ranked = re.match(
+                r"(?P<title>(?:(?:Tenure[- ]Track|Assistant|Associate|Full|Research|"
+                r"Clinical|Teaching|Adjunct|Visiting|Distinguished|Endowed)\s+){0,3}"
+                r"Professor(?:\s+of\s+Practice)?)\b",
+                tail, re.I,
+            )
+            if ranked:
+                return _clean_faculty_title(ranked.group("title"))
+    return _clean_faculty_title(role.group(0))
+
+
+def _current_nonfaculty_role(name: str, context: str) -> re.Match | None:
+    """Return a current, candidate-attributed industry/postdoc role.
+
+    A personal profile saying ``I am a Software Engineer at Zoox`` is decisive
+    negative faculty evidence.  Historical education and employment clauses do
+    not count, and a concurrent faculty title remains ambiguous.
+    """
+    role = _attributed_role(name, context, CURRENT_NONFACULTY_ROLE_PATTERN)
+    if role is None:
+        return None
+    before = _ascii_fold(context[max(0, role.start() - 180):role.start()])
+    after = _ascii_fold(context[role.end():role.end() + 220])
+    sentence = f"{before} {role.group(0)} {after}"
+    if re.search(
+        r"\b(?:formerly|previously|past|was|were|earned|received|completed|"
+        r"graduated|before|until)\b[^.!?;\n]{0,100}$",
+        before,
+        re.IGNORECASE,
+    ):
+        return None
+    if not (
+        CURRENT_ROLE_CUE_PATTERN.search(sentence)
+        or re.search(r"\b(?:current|present)\s+(?:appointment|position|role)\b", sentence, re.I)
+    ):
+        return None
+    return role
+
+
+def _role_category(role_text: str | None) -> str:
+    value = str(role_text or "").casefold()
+    if re.search(
+        r"\b(?:professor|faculty|lecturer|instructor)\b|"
+        r"\b(?:prof|lect|instr)\.",
+        value,
+    ):
+        return "FACULTY"
+    # Check postdoctoral roles before the broader doctoral/student wording:
+    # "postdoctoral" contains "doctoral", but it is a distinct career stage.
+    if re.search(r"\bpost[- ]?doc", value):
+        return "POSTDOC"
+    if re.search(r"ph\.?\s*d\.?|doctoral|graduate|grad\.?|undergraduate|undergrad\.?", value):
+        return "STUDENT"
+    if re.search(
+        r"software\s+engineer|data\s+scientist|technical\s+lead|manager|developer|"
+        r"analyst|consultant|architect|specialist|officer|technician|teacher|"
+        r"educator|administrator|coordinator",
+        value,
+    ):
+        return "INDUSTRY"
+    if re.search(r"research\s+scientist|research\s+engineer|researcher|scientist", value):
+        return "RESEARCHER"
+    if "engineer" in value:
+        return "INDUSTRY"
+    return "UNKNOWN"
+
+
+def _employer_after_role(context: str, role: re.Match | None) -> str | None:
+    if role is None:
+        return None
+    tail = context[role.end():role.end() + 220]
+    clause = re.split(r"[.!?;\n]", tail, maxsplit=1)[0]
+    match = re.match(
+        r"(?:\band\s+(?:the\s+)?(?:technical\s+)?lead\s+)?\s*\bat\s+"
+        r"([^,;.!?\n]{2,100})",
+        clause,
+        re.IGNORECASE,
+    )
+    employer = re.split(
+        r"\s+(?:where|working|with|on|and)\s+",
+        match.group(1) if match else "",
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    employer = " ".join(employer.split()).strip(" ()-")
+    if not employer:
+        current = re.search(
+            r"\b(?:currently|now)\s+(?:working|employed)?\s*(?:on\s+[^.!?;]{0,80}\s+)?"
+            r"(?:at|with)\s+([^,;.!?\n]{2,100})",
+            context,
+            re.I,
+        )
+        employer = " ".join((current.group(1) if current else "").split()).strip(" ()-")
+    if (
+        not employer
+        or "@" in employer
+        or re.search(r"\b(?:email|e-mail|gmail|outlook|contact|reach\s+me|http|www\.)\b", employer, re.I)
+    ):
+        return None
+    return employer
+
+
+def _generic_current_nonfaculty_employer(name: str, context: str) -> str | None:
+    """Read explicit current employment without listing every possible job."""
+    if not _identity_matches(name, context) or FACULTY_TITLE_PATTERN.search(context):
+        return None
+    patterns = (
+        r"\bI\s+am\s+currently\s+(?:working|employed)\b[^.!?;\n]{0,100}?\bat\s+([^,;.!?\n]{2,100})",
+        r"\bI\s+currently\s+work\b[^.!?;\n]{0,80}?\bat\s+([^,;.!?\n]{2,100})",
+        r"\bcurrently\s+(?:working|employed)\s+at\s+([^,;.!?\n]{2,100})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, context, re.I)
+        if not match:
+            continue
+        employer = " ".join(match.group(1).split()).strip(" ()-")
+        employer = re.split(
+            r"\s+(?:where|while|focusing|working)\b", employer, 1, flags=re.I
+        )[0]
+        if (
+            employer
+            and "@" not in employer
+            and not INSTITUTION_NAME_PATTERN.search(employer)
+            and not re.search(r"\b(?:gmail|outlook|email|contact|reach\s+me|http|www\.)\b", employer, re.I)
+        ):
+            return employer
+    return None
+
+
+def _faculty_employer_after_role(context: str, role: re.Match | None) -> str | None:
+    """Keep compound research-institute names attached to a faculty title."""
+    if role is None:
+        return None
+    tail = context[role.end():role.end() + 260]
+    match = re.match(r"\s*(?:at|@)\s+([^.;!?\n]{2,180})", tail, re.IGNORECASE)
+    if not match:
+        return None
+    employer = re.split(
+        r"\s+(?:where|who|whose|and\s+(?:he|she|they))\s+",
+        match.group(1), maxsplit=1, flags=re.IGNORECASE,
+    )[0]
+    return " ".join(employer.split()).strip(" ,-()") or None
+
+
+def _explicit_role_currentness(text: str) -> str:
+    """Honor structured profile end dates instead of labelling every role current."""
+    lowered = str(text or "").casefold()
+    if re.search(r"\bis\s+current\s*:\s*false\b", lowered):
+        return "HISTORICAL"
+    today = datetime.now(timezone.utc).date()
+    appointment_date, _precision = _extract_appointment_date(text)
+    if appointment_date and appointment_date > today:
+        return 'FUTURE'
+    for match in re.finditer(r"\bend\s+date\s*:\s*(20\d{2})(?:-(\d{1,2}))?(?:-(\d{1,2}))?", lowered):
+        try:
+            end_date, _ = _partial_date(
+                int(match.group(1)),
+                int(match.group(2)) if match.group(2) else None,
+                int(match.group(3)) if match.group(3) else None,
+                end=True,
+            )
+            if end_date < today:
+                return "HISTORICAL"
+        except ValueError:
+            continue
+    return "CURRENT"
+
+
+def _non_us_faculty_claim(context: str, url: str, role: re.Match | None) -> bool:
+    domain = _edu_domain(url) or _host_domain(url)
+    if re.search(r"\.(?:edu|ac)\.(?!us$)[a-z]{2}$", domain, re.I):
+        return True
+    if role is None:
+        return False
+    role_context = context[max(0, role.start() - 80):role.end() + 240]
+    return bool(NON_US_LOCATION_PATTERN.search(role_context))
+
+
+def _linkedin_headline(name: str, result: dict[str, Any]) -> str:
+    """Extract a useful exact-person LinkedIn headline without naming every job."""
+    url = str(result.get("href") or "")
+    if not _host_domain(url).endswith("linkedin.com") or "/in/" not in urlparse(url).path:
+        return ""
+    title = " ".join(str(result.get("title") or "").split())
+    body = str(result.get("body") or "")
+    if not _identity_matches(name, f"{title} {body}"):
+        return ""
+    # API-backed LinkedIn results commonly put the useful current role in a
+    # structured body line while the title contains only a location.
+    structured = re.search(
+        r"(?:^|\n)\s*(?:[-*]\s*)?(?:f\s+)?headline\s*:\s*([^\n]{3,240})",
+        body,
+        re.IGNORECASE,
+    )
+    if structured:
+        headline = " ".join(structured.group(1).split()).strip(" -|·")
+        if headline and len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", headline)) >= 4:
+            return headline[:240]
+    folded_name = fold_name_text(name)
+    pieces = re.split(r"\s+(?:[-–—|·])\s+", title, maxsplit=2)
+    usable = [piece.strip() for piece in pieces if piece.strip()]
+    while usable and fold_name_text(usable[0]) == folded_name:
+        usable.pop(0)
+    headline = usable[0] if usable else ""
+    if fold_name_text(headline) in {"linkedin", "professional profile", "profile"}:
+        return ""
+    if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", headline)) < 4:
+        return ""
+    return headline[:240]
+
+
+def _candidate_identity_clues(candidate: dict[str, Any], results: list[dict[str, Any]]) -> list[str]:
+    clues: list[str] = []
+    for key in ("institution_name", "_imported_institution", "_paper_university"):
+        value = str(candidate.get(key) or "").strip()
+        if value:
+            clues.append(value)
+    for affiliation in candidate.get("paper_affiliations") or []:
+        value = str(affiliation.get("institution_name") or "").strip()
+        if value:
+            clues.append(value)
+    # Another exact-name result can connect a new institution mentioned in a
+    # LinkedIn education line to this same publication identity.
+    for result in results:
+        text = " ".join(str(result.get(key) or "") for key in ("title", "body"))
+        if not _identity_matches(str(candidate.get("name") or ""), text):
+            continue
+        clues.extend(match.group(0) for match in INSTITUTION_HINT_PATTERN.finditer(text))
+    return list(dict.fromkeys(clues))
+
+
+def _linkedin_identity_linked(
+    candidate: dict[str, Any], result: dict[str, Any], results: list[dict[str, Any]]
+) -> bool:
+    summary = fold_name_text(" ".join(str(result.get(key) or "") for key in ("title", "body")))
+    for clue in _candidate_identity_clues(candidate, results):
+        folded = fold_name_text(clue)
+        if folded and folded in summary:
+            return True
+    field = next((str(paper.get("matched_query") or "") for paper in candidate.get("recent_papers") or []), "")
+    field_tokens = {token for token in name_tokens(field) if len(token) >= 5}
+    if field_tokens and len(field_tokens.intersection(set(summary.split()))) >= min(2, len(field_tokens)):
+        return True
+    for paper in candidate.get("recent_papers") or []:
+        title_tokens = {token for token in name_tokens(str(paper.get("title") or "")) if len(token) >= 5}
+        if len(title_tokens.intersection(set(summary.split()))) >= 3:
+            return True
+    return False
+
+
+def _public_snippet_nonfaculty_consensus(
+    name: str, results: list[dict[str, Any]], candidate: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Use matching LinkedIn + Google Scholar snippets only as a consensus.
+
+    One snippet can be stale or joined from nearby text. Two independently
+    attributable public-profile snippets, with no faculty result accepted in
+    the pass, are enough to hide the candidate and schedule a later recheck.
+    """
+    evidence: list[dict[str, Any]] = []
+    providers: set[str] = set()
+    for result in results:
+        url = str(result.get("href") or "")
+        host = _host_domain(url)
+        provider = (
+            "LINKEDIN_SNIPPET" if host.endswith("linkedin.com")
+            else "GOOGLE_SCHOLAR" if host.startswith("scholar.google.")
+            else ""
+        )
+        if not provider:
+            continue
+        summary = " ".join(str(result.get(key) or "") for key in ("title", "body"))
+        if not _identity_matches(name, summary):
+            continue
+        if _attributed_role(name, summary, FACULTY_TITLE_PATTERN):
+            return None
+        headline = _linkedin_headline(name, result) if provider == "LINKEDIN_SNIPPET" else ""
+        role = (
+            _current_nonfaculty_role(name, summary)
+            or _attributed_role(name, summary, NON_FACULTY_PATTERN)
+        )
+        linked_headline = bool(
+            headline
+            and not LINKEDIN_FACULTY_WORDING_PATTERN.search(headline)
+            and candidate is not None
+            and _linkedin_identity_linked(candidate, result, results)
+        )
+        if role is None and not linked_headline:
+            continue
+        providers.add(provider)
+        role_text = headline or " ".join(role.group(0).split())
+        evidence.append({
+            "status": "UNVERIFIED",
+            "source_url": url,
+            "source_domain": host,
+            "source_type": provider,
+            "title": role_text,
+            "role_category": _role_category(role_text),
+            "observed_employer": _employer_after_role(summary, role),
+            "currentness": _explicit_role_currentness(summary),
+            "lookup_status": "FOUND",
+            "evidence_text": summary[:900],
+            "confidence": 0.70,
+            "method": "linkedin_meaningful_nonfaculty_headline" if linked_headline else "public_profile_snippet",
+        })
+    linkedin_rows = [
+        row for row in evidence
+        if row["source_type"] == "LINKEDIN_SNIPPET"
+        and row.get("currentness") == "CURRENT"
+    ]
+    # Search-result titles often expose a current role even when LinkedIn blocks
+    # automated page access. Accept one exact-name identity, but keep multiple
+    # same-name LinkedIn profiles ambiguous.
+    scholar_rows = [
+        row for row in evidence
+        if row["source_type"] == "GOOGLE_SCHOLAR"
+        and row.get("currentness") == "CURRENT"
+    ]
+    # A historical LinkedIn position must not participate in a current-role
+    # consensus merely because the provider was present in the result set.
+    has_public_profile_consensus = bool(linkedin_rows and scholar_rows)
+    if (
+        not has_public_profile_consensus
+        and len(linkedin_rows) == 1
+        and (
+            linkedin_rows[0]["method"] == "linkedin_meaningful_nonfaculty_headline"
+            or linkedin_rows[0]["role_category"] in {"INDUSTRY", "RESEARCHER", "POSTDOC", "STUDENT"}
+        )
+    ):
+        primary = linkedin_rows[0]
+        return {
+            **primary,
+            "status": "NOT_FACULTY",
+            "confidence": 0.84,
+            "method": "linkedin_no_faculty_headline",
+            "evidence_text": (
+                "An identity-linked, exact-person LinkedIn profile has a meaningful "
+                "current headline with no faculty wording, and the completed searches "
+                "found no current faculty appointment. " + primary["evidence_text"]
+            )[:900],
+        }
+    if not has_public_profile_consensus:
+        return None
+    primary = next(
+        row for row in evidence
+        if row["source_type"] == "LINKEDIN_SNIPPET"
+        and row.get("currentness") == "CURRENT"
+    )
+    return {
+        **primary,
+        "status": "NOT_FACULTY",
+        "confidence": 0.80,
+        "method": "public_profile_snippet_consensus",
+        "evidence_text": (
+            "Matching LinkedIn and Google Scholar snippets identify a current "
+            "student, postdoctoral, company, or other nonfaculty role; no current "
+            "faculty profile was found in this pass."
+        ),
+        "alternative_evidence": [row for row in evidence if row is not primary],
+    }
+
+
 def _is_current_faculty_listing(url: str, page_title: str) -> bool:
     path = urlparse(url).path
     if _is_news_or_event(url) or HISTORICAL_APPOINTMENT_URL_PATTERN.search(page_title):
         return False
     return bool(CURRENT_FACULTY_LISTING_PATTERN.search(f"{path} {page_title}"))
+
+
+def _document_links_to_institution(
+    document: dict[str, Any], institution: str
+) -> bool:
+    """Confirm that an attributed lab/personal page links to the university.
+
+    This is supporting attribution, never faculty proof by itself. The caller
+    must still find the candidate's own current faculty title.
+    """
+    if not institution:
+        return False
+    for link in document.get('links') or []:
+        href = str(link.get('href') or '')
+        host = _host_domain(href)
+        record = record_for_host(host) if host else None
+        linked_name = record[0] if record else ''
+        if linked_name and _institution_similarity(institution, linked_name) >= 0.5:
+            return True
+        if href.casefold().startswith('mailto:'):
+            email_domain = href.rsplit('@', 1)[-1].split('?', 1)[0]
+            record = record_for_host(email_domain)
+            linked_name = record[0] if record else ''
+            if linked_name and _institution_similarity(institution, linked_name) >= 0.5:
+                return True
+    return False
 
 
 def _is_news_or_event(url: str) -> bool:
@@ -885,6 +1531,23 @@ def _profile_priority(result: dict[str, Any]) -> int:
             return 1
         return 3
     return 4
+
+
+def _faculty_source_quality(url: str) -> int:
+    """Prefer a current individual profile over events and other locators."""
+    value = str(url or '')
+    path = urlparse(value).path
+    if not value or _is_news_or_event(value):
+        return 0
+    if _edu_domain(value):
+        if re.search(r'/(?:faculty-members|faculty|faculty-pages)/[^/]+', path, re.I):
+            return 5
+        if PROFILE_RESULT_PATTERN.search(path):
+            return 4
+        return 2
+    if re.search(r'\b(?:lab|group)\b', value, re.I):
+        return 3
+    return 1
 
 
 def _explicit_faculty_membership(name: str, url: str, title: str, text: str) -> bool:
@@ -1080,6 +1743,18 @@ def inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) ->
 
 def _record_profile_decision(url, decision):
     document = (audit_log.CURRENT.get() or {}).get('_documents', {}).get(url, {})
+    decision.setdefault('source_type', _source_type_for_evidence({
+        **decision, 'source_url': decision.get('source_url') or url,
+        'source_kind': 'university' if 'official' in str(decision.get('method') or '') else None,
+    }))
+    decision.setdefault('lookup_status', _lookup_status_for_evidence({**document, **decision}))
+    decision.setdefault('role_category', _role_category(decision.get('title')))
+    if decision.get('title') and decision.get('status') in {
+        'VERIFIED', 'NOT_FACULTY', 'OUT_OF_SCOPE'
+    }:
+        decision.setdefault('currentness', 'CURRENT')
+    else:
+        decision.setdefault('currentness', 'UNKNOWN')
     if decision.get('status') == 'VERIFIED':
         campus = offshore_appointment(document.get('final_url') or decision.get('source_url') or url or '')
         if campus:
@@ -1173,6 +1848,9 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
         str(candidate.get("institution_name") or ""), institution, page_text
     )
     role_for_excerpt = negative_match or title_match
+    display_faculty_title = _detailed_faculty_title(
+        str(candidate['name']), context, title_match
+    )
     evidence_context = " ".join(context.split())[:700]
     if role_for_excerpt and not membership:
         evidence_context = context[max(0, role_for_excerpt.start() - 120):role_for_excerpt.end() + 260].strip()
@@ -1190,7 +1868,7 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
         return {
             **page_evidence,
             "status": "CONFLICT",
-            "title": " ".join(title_match.group(0).split()).title()
+            "title": display_faculty_title
                 if title_match else None,
             "confidence": 0.95,
             "method": "official_non_appointment_page",
@@ -1205,12 +1883,29 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
     # directory page, but its output must pass stricter quotation/link checks.
     profile_title_matches = profile_identity
     role_is_person_specific = profile_title_matches or directory_title_match is not None
+    source_country = _country_code_for_domain(domain)
+    if title_match and role_is_person_specific and source_country and source_country != "US":
+        return {
+            **page_evidence,
+            "status": "OUT_OF_SCOPE",
+            "title": display_faculty_title,
+            "confidence": 0.96,
+            "method": "non_us_official_faculty_profile",
+            "country_code": source_country,
+            "scope_status": "OUT_OF_SCOPE",
+            "scope_reason": "A faculty role was found outside the current US-only index.",
+            "evidence_text": (
+                "An exact-name official university profile establishes a faculty "
+                f"role outside the United States. Evidence: {evidence_context}"
+            )[:900],
+        }
     expected_institution = str(candidate.get("_paper_university") or candidate.get("institution_name") or "").strip()
     own_role = title_match or negative_match
-    if own_role and role_is_person_specific and expected_institution and institution and _institution_similarity(expected_institution, institution) < 0.5:
-        return {**page_evidence, "status": "CONFLICT", "title": own_role.group(0).title(),
-                "method": "institution_mismatch_review", "confidence": 0.0,
-                "evidence_text": f"Paper/imported university: {expected_institution}. Profile university: {institution}. This may be a move or a different person; staff review is required and automatic retries stop."}
+    same_current_institution = bool(
+        not expected_institution
+        or not institution
+        or _institution_similarity(expected_institution, institution) >= 0.5
+    )
     if negative_match and profile_title_matches and continuity:
         if title_match:
             return {**page_evidence, 'status': 'UNVERIFIED', 'confidence': 0.0,
@@ -1239,14 +1934,26 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
         and role_is_person_specific
         and _paper_identity_link(candidate, page_text, "")
     )
+    appointment_date, appointment_precision = _extract_appointment_date(context)
+    latest_paper_year = max(
+        (int(paper.get('publication_year') or 0) for paper in candidate.get('recent_papers') or []),
+        default=0,
+    )
+    dated_move_corroborated = bool(
+        title_match
+        and role_is_person_specific
+        and appointment_date
+        and appointment_date <= datetime.now(timezone.utc).date()
+        and (not latest_paper_year or appointment_date.year >= latest_paper_year)
+    )
     if title_match and role_is_person_specific and (
-        continuity or paper_corroborated or move_corroborated
+        same_current_institution or paper_corroborated or move_corroborated or dated_move_corroborated
     ):
         appointment_year = _extract_appointment_year(context)
         return {
             **page_evidence,
             "status": "VERIFIED",
-            "title": " ".join(title_match.group(0).split()).title(),
+            "title": display_faculty_title,
             "confidence": 0.96 if paper_corroborated else (
                 0.94 if move_corroborated else 0.97
             ),
@@ -1257,7 +1964,11 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
                 else (
                     "official_directory_openalex_history"
                     if move_corroborated
-                    else "official_directory"
+                    else (
+                        "official_directory_dated_move"
+                        if dated_move_corroborated and not same_current_institution
+                        else "official_directory"
+                    )
                 )
             ),
             "evidence_text": (
@@ -1275,16 +1986,23 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
                 )
             ),
             "appointment_year": appointment_year,
+            "appointment_start_date": appointment_date.isoformat() if appointment_date else None,
+            "appointment_date_precision": appointment_precision,
             "career_stage": "NEW_AP" if (
-                "assistant professor" in title_match.group(0).casefold()
+                "assistant professor" in str(display_faculty_title or '').casefold()
                 and (appointment_year or NEW_FACULTY_PATTERN.search(context))
             ) else None,
         }
+    if own_role and role_is_person_specific and not same_current_institution:
+        return {**page_evidence, "status": "CONFLICT", "title": (
+                    display_faculty_title if title_match else own_role.group(0).title()),
+                "method": "institution_mismatch_review", "confidence": 0.0,
+                "evidence_text": f"Paper/imported university: {expected_institution}. Profile university: {institution}. No sufficiently dated or publication-linked evidence established that this is a career move rather than a different person with the same name; staff review is required."}
     if title_match and not role_is_person_specific:
         return {
             **page_evidence,
             "status": "UNVERIFIED",
-            "title": " ".join(title_match.group(0).split()).title(),
+            "title": display_faculty_title,
             "confidence": 0.0,
             "method": "automatic_search",
         }
@@ -1292,7 +2010,7 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
         return {
             **page_evidence,
             "status": "CONFLICT",
-            "title": " ".join(title_match.group(0).split()).title(),
+            "title": display_faculty_title,
             "evidence_text": (
                 "The official faculty page does not match the candidate's "
                 "institution. This may be a different person with the same name."
@@ -1345,11 +2063,13 @@ def _inspect_researcher_profile_result(candidate, result):
         return {"status": "UNVERIFIED", "reason": f"Personal/lab page unavailable: {type(error).__name__}"}
     name = str(candidate.get("name") or "")
     document = (audit_log.CURRENT.get() or {}).get('_documents', {}).get(url, {})
+    title_identity = _profile_title_matches(name, page_title)
     named_heading = any(_profile_title_matches(name, heading) for heading in document.get('headings', []))
-    if not page_text or not (_profile_title_matches(name, page_title) or named_heading):
+    profile_identity = title_identity or named_heading
+    if not page_text or not profile_identity:
         return {"status": "UNVERIFIED", "reason": "Personal/lab page did not identify the candidate in its title or profile heading"}
     own_sections = document.get('profile_sections') or []
-    own_text = (' '.join(own_sections) if own_sections and not _profile_title_matches(name, page_title)
+    own_text = (' '.join(own_sections) if own_sections and not title_identity
                 else f'{page_title} {page_text}')
     own_text = re.sub(r'[“"]\w+[”"]', '', own_text)
     # Prefer the explicit biography sentence over a short heading like
@@ -1362,16 +2082,26 @@ def _inspect_researcher_profile_result(candidate, result):
     document['name_context'] = context[:900]
     title_match = _attributed_role(name, context, FACULTY_TITLE_PATTERN)
     negative_match = _attributed_role(name, context, NON_FACULTY_PATTERN)
+    current_nonfaculty = _current_nonfaculty_role(name, context)
+    generic_nonfaculty_employer = _generic_current_nonfaculty_employer(name, context)
     institution = str(candidate.get("_paper_university") or candidate.get("institution_name") or "")
     continuity = _institution_continuity(institution, "", page_text)
     official_link = bool(result.get('_official_link_institution') and
                          _institution_similarity(institution, result['_official_link_institution']) >= 0.5)
+    page_institution_linked = bool(
+        _document_links_to_institution(document, institution)
+        and _institution_continuity(institution, '', page_text)
+    )
+    official_link = official_link or page_institution_linked
     paper_linked = _paper_identity_link(candidate, page_text, "")
     if not paper_linked and not official_link:
         linked_text = _fetch_related_publication_text(url)
         paper_linked = _paper_identity_link(candidate, f"{page_text} {linked_text}", "")
     # Match the current role sentence, never a former employer elsewhere in a CV.
-    role = negative_match or title_match
+    # When a person explicitly holds a concurrent faculty and industry role,
+    # attach the institution check to the faculty clause. The industry role is
+    # still retained as separate evidence below.
+    role = title_match or current_nonfaculty or negative_match
     observed = []
     if role:
         role_sentence = re.split(r"[.!?;\n]|\b(?:previously|formerly|before|after)\b", context[role.end():role.end() + 240], maxsplit=1, flags=re.I)[0]
@@ -1382,34 +2112,175 @@ def _inspect_researcher_profile_result(candidate, result):
         alias = record_for_name(employer.group(1).strip()) if employer else None
         if alias:
             observed = [alias[0]]
-        if not observed and official_link and _institution_continuity(institution, '', context):
+        if not observed and official_link and (
+            _institution_continuity(institution, '', context) or page_institution_linked
+        ):
             observed = [institution]
-    identity_linked = paper_linked or official_link
+    role_text = " ".join(role.group(0).split()) if role else None
+    if not role_text and generic_nonfaculty_employer:
+        role_text = "Current non-faculty role"
+    display_faculty_title = _detailed_faculty_title(name, context, title_match)
+    observed_employer = _employer_after_role(context, role) or generic_nonfaculty_employer
+    current_faculty_employer = _faculty_employer_after_role(context, title_match)
+    if title_match and not observed and current_faculty_employer:
+        observed = [current_faculty_employer]
+    career_continuity = bool(
+        title_match
+        and institution
+        and _institution_continuity(institution, "", context)
+        and re.search(
+            r"\b(?:previously|formerly|subsequently|prior\s+to|before|where\s+he\s+worked|where\s+she\s+worked)\b",
+            context,
+            re.IGNORECASE,
+        )
+    )
+    host_key = re.sub(r"[^a-z0-9]", "", host.split(".")[0].casefold())
+    employer_key = re.sub(r"[^a-z0-9]", "", str(current_faculty_employer or "").casefold())
+    organization_owned_profile = bool(
+        title_match and host_key and len(host_key) >= 5 and host_key in employer_key
+    )
+    identity_linked = paper_linked or official_link or career_continuity
     common = {
         "source_url": url,
         "source_domain": host,
         "institution_name": institution,
         "page_title": page_title,
         "_page_text": page_text,
+        "source_type": "PERSONAL_WEBSITE" if host not in {"linkedin.com", "scholar.google.com"} else "PUBLIC_PROFILE",
+        "lookup_status": "FOUND",
+        "currentness": "CURRENT" if role or generic_nonfaculty_employer else "UNKNOWN",
+        "role_category": (
+            _role_category(role_text) if not generic_nonfaculty_employer else "INDUSTRY"
+        ),
+        "observed_employer": observed_employer,
     }
+    if current_nonfaculty and not title_match:
+        return {
+            **common,
+            "status": "NOT_FACULTY",
+            "title": role_text,
+            "confidence": 0.92,
+            "method": (
+                "official_directory_profile_link"
+                if official_link else "attributed_current_nonfaculty_profile"
+            ),
+            "evidence_text": (
+                "The exact-name personal profile states a current nonfaculty role"
+                + (f" at {observed_employer}" if observed_employer else "")
+                + f". Evidence: {context[:500]}"
+            )[:900],
+        }
+    if generic_nonfaculty_employer and not title_match:
+        return {
+            **common,
+            "status": "NOT_FACULTY",
+            "title": role_text,
+            "confidence": 0.92,
+            "method": "attributed_current_employment_profile",
+            "evidence_text": (
+                "The exact-name personal profile explicitly states current employment at "
+                f"{generic_nonfaculty_employer} and contains no faculty appointment. "
+                f"Evidence: {context[:500]}"
+            )[:900],
+        }
+    if negative_match and not title_match and profile_identity:
+        return {
+            **common,
+            "status": "NOT_FACULTY",
+            "title": role_text,
+            "confidence": 0.90,
+            "method": (
+                "official_directory_profile_link"
+                if official_link else "attributed_current_nonfaculty_profile"
+            ),
+            "evidence_text": (
+                "The exact-name personal profile identifies the candidate as "
+                f"{role_text}. Evidence: {context[:550]}"
+            )[:900],
+        }
+    if title_match and profile_identity and _non_us_faculty_claim(context, url, title_match):
+        return {
+            **common,
+            "status": "OUT_OF_SCOPE",
+            "title": display_faculty_title,
+            "confidence": 0.88,
+            "method": "non_us_faculty_profile",
+            "scope_status": "OUT_OF_SCOPE",
+            "scope_reason": "A faculty role was found outside the current US-only index.",
+            "evidence_text": f"The exact-name profile states a faculty role outside the United States. Evidence: {context[:600]}",
+        }
+    if title_match and profile_identity and organization_owned_profile and career_continuity:
+        current_institution = current_faculty_employer or observed_employer or host
+        classification = lookup_institution_classification(current_institution, host)
+        outside_us_university_scope = bool(
+            classification.get("organization_type") != "HIGHER_EDUCATION"
+            and re.search(r"\b(?:research\s+institute|research\s+centre|research\s+center)\b", current_institution, re.I)
+        )
+        if outside_us_university_scope:
+            return {
+                **common,
+                "status": "OUT_OF_SCOPE",
+                "institution_name": current_institution,
+                "title": role_text,
+                "role_category": "FACULTY",
+                "confidence": 0.94,
+                "method": "current_research_institute_faculty_profile",
+                "scope_status": "OUT_OF_SCOPE",
+                "scope_reason": "The current faculty appointment is at a research institute rather than a US College Scorecard university.",
+                "previous_institutions": [institution],
+                "evidence_text": (
+                    f"The current organization profile identifies {name} as {role_text} at "
+                    f"{current_institution}; the same biography links the person to the imported "
+                    f"prior institution, {institution}."
+                ),
+            }
+    if title_match and profile_identity and len(observed) == 1 and institution and _institution_similarity(institution, observed[0]) < 0.5:
+        return {
+            **common,
+            "status": "UNVERIFIED",
+            "institution_name": observed[0],
+            "title": display_faculty_title,
+            "method": "personal_current_faculty_claim",
+            "failure_code": "CURRENT_AFFILIATION_UNCONFIRMED",
+            "confidence": 0.0,
+            "evidence_text": (
+                f"The exact-name personal page states a current faculty role at {observed[0]}, "
+                f"while the imported/paper affiliation is {institution}. ScholarRadar must confirm "
+                "the current appointment on an official university page."
+            ),
+        }
     if role and identity_linked and len(observed) == 1:
         if institution and _institution_similarity(institution, observed[0]) < 0.5:
             return {**common, "status": "CONFLICT", "institution_name": observed[0],
-                    "title": role.group(0).title(), "method": "institution_mismatch_review", "confidence": 0.0,
+                    "title": display_faculty_title or role.group(0).title(), "method": "institution_mismatch_review", "confidence": 0.0,
                     "evidence_text": f"Paper/imported university: {institution}. Researcher page states a faculty role at {observed[0]} and contains a matching paper. Staff review is required; automatic retries stop."}
     # Personal-page positives require a university attached to the role, not
     # merely the old institution appearing somewhere in the page.
     continuity = (len(observed) == 1 and _institution_similarity(institution, observed[0]) >= 0.5) or bool(
         negative_match and not title_match and not observed and
         _institution_continuity(institution, '', context) and identity_linked)
-    if title_match and negative_match:
+    if title_match and current_nonfaculty and continuity and identity_linked:
+        return {
+            **common,
+            "status": "VERIFIED",
+            "title": display_faculty_title,
+            "confidence": 0.90,
+            "method": "concurrent_faculty_profile_publication_link",
+            "role_category": "FACULTY",
+            "evidence_text": (
+                "The exact-name profile states a current faculty appointment at "
+                "the matching university and also states a concurrent nonfaculty "
+                "role. A matching publication connects the profile to this author."
+            ),
+        }
+    if title_match and (negative_match or current_nonfaculty):
         return {**common, 'status': 'UNVERIFIED', 'method': 'contradictory_role_evidence',
                 'evidence_text': 'The researcher page has conflicting current roles; review is required.'}
     if title_match and continuity and identity_linked:
         return {
             **common,
             "status": "VERIFIED",
-            "title": " ".join(title_match.group(0).split()).title(),
+            "title": display_faculty_title,
             "confidence": 0.90,
             "method": "official_directory_profile_link" if official_link else "researcher_profile_publication_link",
             "evidence_text": (
@@ -1443,18 +2314,14 @@ def _inspect_researcher_profile_result(candidate, result):
 
 def verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     audit = audit_log.new_audit(candidate)
-    audit.update(_deadline=time.monotonic() + setting_int('FACULTY_IDENTITY_PASS_SECONDS', 90, 20, 120),
-                 _result_limit=setting_int('FACULTY_IDENTITY_PASS_RESULTS', 100, 10, 100),
+    audit.update(_result_limit=setting_int('FACULTY_IDENTITY_PASS_RESULTS', 100, 10, 100),
                  _page_limit=setting_int('FACULTY_IDENTITY_PASS_PAGES', 20, 3, 20), _pages_used=0)
     token = audit_log.CURRENT.set(audit)
     audit_log.emit('identity_started', university=candidate.get('institution_name'),
-                   max_queries=setting_int('FACULTY_IDENTITY_PASS_QUERIES', 10, 1, 10),
+                   max_queries=3,
                    max_results=audit['_result_limit'], max_pages=audit['_page_limit'])
     try:
-        try:
-            decision = _verify_faculty_candidate(dict(candidate))
-        except audit_log.IdentityPassLimit as error:
-            decision = {'status': 'UNVERIFIED', 'failure_code': 'CHECK_LIMIT', 'reason': str(error)}
+        decision = _verify_faculty_candidate(dict(candidate))
         if decision.get('status') == 'UNVERIFIED':
             reasons = list(dict.fromkeys(str(page['reason'])[:200] for page in audit['pages'] if page.get('reason')))
             codes = [p.get('failure_code') for p in audit['pages'] if p.get('failure_code')]
@@ -1527,11 +2394,15 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     queries_checked = 0
     pages_checked = 0
     search_outage: SearchUnavailable | None = None
-    query_limit = setting_int("FACULTY_IDENTITY_PASS_QUERIES", 10, 1, 10)
+    # Each search may return many links. Limit the paid retrieval stage to the
+    # three targeted queries defined below and spend the remaining work on page
+    # inspection instead of query variations.
+    query_limit = 3
     page_limit = setting_int("FACULTY_IDENTITY_PASS_PAGES", 20, 3, 20)
     result_limit = setting_int('FACULTY_IDENTITY_PASS_RESULTS', 100, 10, 100)
     result_urls: set[str] = set()
     confirming_personal = False
+    confirmation_target_institution = ""
     discovered_domains: list[str] = []
 
     def domain_queries():
@@ -1550,14 +2421,23 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
 
     def confirm_personal_affiliation(proposal):
         """A personal page can retain an old employer after a move. Check once."""
-        nonlocal confirming_personal
-        if proposal.get('method') != 'researcher_profile_publication_link' or proposal.get('status') != 'VERIFIED':
+        nonlocal confirming_personal, confirmation_target_institution
+        if proposal.get('method') not in {
+            'researcher_profile_publication_link', 'personal_current_faculty_claim'
+        } or proposal.get('status') not in {'VERIFIED', 'UNVERIFIED'}:
             return proposal
         if not confirming_personal:
             confirming_personal = True
+            confirmation_target_institution = str(proposal.get('institution_name') or '').strip()
             audit_log.emit('identity_affiliation_confirmation', reason='Personal/lab faculty evidence needs official current-affiliation corroboration')
-            confirm_queries = [f'"{name}" site:{d}' for d in domain_queries()[:1]]
-            confirm_queries.append(f'"{name}" faculty profile')
+            target_record = record_for_name(confirmation_target_institution)
+            confirm_queries = []
+            if target_record:
+                confirm_queries.append(f'"{name}" site:{target_record[1]}')
+            confirm_queries.append(
+                f'"{name}" "{confirmation_target_institution}" faculty profile'
+                if confirmation_target_institution else f'"{name}" faculty profile'
+            )
             try:
                 for query in confirm_queries:
                     corroborated = inspect_query(query)
@@ -1566,6 +2446,7 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
                         return corroborated
             finally:
                 confirming_personal = False
+                confirmation_target_institution = ""
         return {**proposal, 'status': 'UNVERIFIED', 'confidence': 0.0,
                 'failure_code': 'CURRENT_AFFILIATION_UNCONFIRMED',
                 'reason': 'A personal/lab page states a faculty role, but its current university could not be corroborated on an official profile. The page may retain an old appointment.'}
@@ -1621,7 +2502,12 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
                 inspected = {'status': 'UNVERIFIED', 'reason': f'Locator page unavailable: {type(error).__name__}'}
             _record_profile_decision(url, inspected)
         else:
-            inspected = (inspect_faculty_result(candidate, result) if official else
+            inspection_candidate = candidate
+            if official and confirming_personal and confirmation_target_institution:
+                inspection_candidate = dict(candidate)
+                inspection_candidate['institution_name'] = confirmation_target_institution
+                inspection_candidate['_paper_university'] = confirmation_target_institution
+            inspected = (inspect_faculty_result(inspection_candidate, result) if official else
                          inspect_researcher_profile_result(candidate, result))
         document = (audit or {}).get('_documents', {}).get(url, {})
         if document.get('final_url'):
@@ -1654,7 +2540,8 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
                     _record_profile_decision(url, unresolved)
                     ambiguous_pages.append(unresolved)
                     return None
-        if inspected.get('status') in {'VERIFIED', 'NOT_FACULTY'} or inspected.get('method') == 'institution_mismatch_review':
+        if (inspected.get('status') in {'VERIFIED', 'NOT_FACULTY', 'OUT_OF_SCOPE'} or
+                inspected.get('method') in {'institution_mismatch_review', 'personal_current_faculty_claim'}):
             if inspected.get('status') == 'CONFLICT':
                 inspected['alternative_evidence'] = [
                     {key: page.get(key) for key in ('source_url', 'institution_name', 'title', 'status', 'evidence_text')}
@@ -1717,8 +2604,11 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             search_outage = SearchUnavailable("Web search waiting: direct evidence checked; search is scheduled later.",
                                               int(candidate.get("_search_retry_seconds") or 60))
             return None
-        audit_log.remaining_seconds()
         audit_log.emit('identity_search_started', query=query, number=queries_checked, max_queries=query_limit)
+        # The worker process is isolated, so a longer per-query ceiling cannot
+        # stall the whole indexer while a provider is slow but responsive.
+        query_timeout = setting_int('FACULTY_SEARCH_QUERY_TIMEOUT_SECONDS', 300, 10, 300)
+        audit_log.begin_search(query_timeout)
         try:
             results = search_web(
                 query,
@@ -1732,8 +2622,14 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             audit_log.emit('identity_search_wait', query=query, retry_after_seconds=error.retry_after_seconds)
             search_outage = error
             return None
-        except audit_log.IdentityPassLimit:
-            raise
+        except audit_log.IdentityPassLimit as error:
+            if audit is not None:
+                audit['queries'].append({'query': query, 'returned': 0, 'kind': 'search',
+                                         'error': 'SEARCH_TIMEOUT',
+                                         'timeout_seconds': query_timeout})
+            audit_log.emit('identity_search_timeout', query=query,
+                           timeout_seconds=query_timeout, reason=str(error))
+            return None
         except Exception as error:
             # An unexpected retrieval error is not a completed negative search.
             if audit is not None:
@@ -1741,6 +2637,8 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             audit_log.emit('identity_search_error', query=query, error_type=type(error).__name__)
             search_outage = SearchUnavailable(f'Identity search failed: {type(error).__name__}', 60)
             return None
+        finally:
+            audit_log.end_search()
         results = results[:min(20, result_limit - len(result_urls))]
         for result in results:
             classify(result)
@@ -1750,6 +2648,7 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         query_page_ceiling = (max(pages_checked + 1, page_limit // 2)
                               if queries_checked < query_limit and len(results) < 20 and len(result_urls) < result_limit
                               else page_limit)
+        query_negative: dict[str, Any] | None = None
         for result in sorted(results, key=lambda item: (
                 0 if item.get('source_kind') == 'university' and not _is_news_or_event(str(item.get('href') or '')) else 1,
                 _profile_priority(item))):
@@ -1773,11 +2672,21 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             if not inspected:
                 continue
             if inspected.get('status') == 'NOT_FACULTY':
+                # Old university student/postdoc pages often remain live.
+                # Finish the promising results already returned by this query
+                # so a newer explicit faculty appointment can supersede one.
+                if query_negative is None:
+                    query_negative = inspected
+                if negative is None:
+                    negative = inspected
+                continue
+            if inspected.get('status') == 'OUT_OF_SCOPE':
                 return inspected
             if inspected.get('failure_code') == 'CURRENT_AFFILIATION_UNCONFIRMED':
                 if confirming_personal:
                     continue
-                return inspected
+                ambiguous_pages.append(inspected)
+                continue
             if inspected.get("status") == "VERIFIED":
                 return inspected
             if inspected.get('status') == 'CONFLICT' and inspected.get('method') == 'institution_mismatch_review':
@@ -1801,6 +2710,8 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
                 for page in conflicts
             ]
             return conflict
+        if query_negative is not None:
+            return query_negative
         return None
 
     def inspect_known_url(url: str) -> dict[str, Any] | None:
@@ -1863,98 +2774,75 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         institution = paper_institutions[0]
         candidate["institution_name"] = institution
 
-    paper_queries: list[str] = [
-        f'"{name}" "{paper_institution}"'
-        for paper_institution in paper_institutions
-    ]
-    for evidence in paper_evidence:
-        email = str(evidence.get("email") or "").strip()
-        if "@" in email:
-            domain = email.rsplit("@", 1)[-1].casefold()
-            if academic_domain_hint(domain):
-                paper_queries.append(f'site:{domain} "{name}"')
-    for paper in list(candidate.get("recent_papers") or [])[:3]:
-        title = str(paper.get("title") or "").strip()
-        if title:
-            if institution:
-                paper_queries.append(f'"{name}" "{institution}" "{title[:180]}"')
-            else:
-                paper_queries.append(f'"{name}" "{title[:180]}"')
-            continue
-        doi = str(paper.get("doi") or "").strip()
-        if doi:
-            bare_doi = re.sub(
-                r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.I
-            )
-            if institution:
-                paper_queries.append(f'"{name}" "{institution}" "{bare_doi}"')
-            else:
-                paper_queries.append(f'"{name}" "{bare_doi}"')
     if not institution:
         return {"status": "UNVERIFIED", "confidence": 0.0, "method": "missing_paper_affiliation",
                 "evidence_text": "No university could be linked safely from stored authorship metadata or accessible papers. No unanchored name search was sent."}
-    for query in dict.fromkeys(institution_queries):
-        verified = inspect_query(query, allow_researcher_profile_with_paper=True)
-        if verified:
+
+    institution_classification = lookup_institution_classification(
+        institution, str(candidate.get("institution_domain") or "")
+    )
+    candidate["institution_classification"] = institution_classification
+    if audit is not None:
+        audit["institution_classification"] = institution_classification
+
+    # Run three targeted searches only. Known URLs, ORCID locators and paper
+    # metadata above do not consume these search calls.
+    primary_queries = [f'"{name}" "{institution}"']
+    provisional_stale_faculty: dict[str, Any] | None = None
+    verified = inspect_query(
+        primary_queries[0], allow_researcher_profile_with_paper=True
+    )
+    if verified:
+        if (
+            verified.get("status") == "VERIFIED"
+            and STALE_FACULTY_PROFILE_HINT_PATTERN.search(
+                f'{verified.get("source_url") or ""} {verified.get("page_title") or ""}'
+            )
+        ):
+            provisional_stale_faculty = verified
+        else:
             return verified
-    # Retrieval is not complete just because a provider found the name in a
-    # paper/snippet. Narrow to a supported university domain before long titles.
+
+    # Query one can reveal a verified-email or official university domain. Build
+    # the site query afterwards so that evidence is available here.
     domains = domain_queries()
-    for domain in domains:
-        verified = inspect_query(f'"{name}" site:{domain}', allow_researcher_profile_with_paper=True)
-        if verified:
-            return verified
-    expanded_queries = []
-    tokens = name.split()
-    # Remove initials only. Compound names such as Kargar Tasooji stay intact.
-    short_name = ' '.join(t for index, t in enumerate(tokens)
-                          if index in {0, len(tokens) - 1} or len(t.rstrip('.')) > 1)
-    if short_name != name:
-        expanded_queries.append(f'"{short_name}" "{institution}"')
-    plain_name = _ascii_fold(name)
-    if plain_name != name:
-        expanded_queries.append(f'"{plain_name}" "{institution}"')
-    if registered_institution and registered_institution[0] != institution:
-        expanded_queries.append(f'"{name}" "{registered_institution[0]}"')
-    # An explicitly named alternative employer is a search lead, never an
-    # automatic move. Inspect the actual profile before deciding conflict.
-    for hint in _institution_hints(name, search_results):
-        known = record_for_name(hint)
-        if known and known[1] not in domains:
-            expanded_queries.append(f'"{name}" site:{known[1]}')
-            break
-    if field:
-        expanded_queries.append(f'"{name}" "{institution}" {field[:100]}')
-    for domain in domains:
-        expanded_queries.extend([f'"{short_name}" site:{domain} faculty', f'"{short_name}" site:{domain} profile'])
-    expanded_queries.extend([f'"{name}" "{institution}" CV', f'"{name}" "{institution}" academic profile'])
-    for query in dict.fromkeys(expanded_queries):
-        for domain in domain_queries():
-            targeted = f'"{name}" site:{domain}'
-            if targeted not in seen_queries:
-                verified = inspect_query(targeted, allow_researcher_profile_with_paper=True)
-                if verified:
-                    return verified
+    if domains:
+        primary_queries.append(f'"{name}" site:{domains[0]}')
+    else:
+        primary_queries.append(f'"{name}" "{institution}" faculty profile')
+    stale_affiliation_hint = bool(
+        provisional_stale_faculty
+        or any(
+            STALE_FACULTY_PROFILE_HINT_PATTERN.search(
+                f'{item.get("href") or ""} {item.get("title") or ""}'
+            )
+            for item in search_results
+        )
+    )
+    primary_queries.append(
+        f'"{name}" professor current university'
+        if stale_affiliation_hint
+        else (
+            f'"{name}" "{institution}" {field[:100]}'
+            if field else f'"{name}" "{institution}" professor'
+        )
+    )
+    primary_queries = list(dict.fromkeys(primary_queries[:3]))
+    for query in primary_queries[1:]:
         verified = inspect_query(query, allow_researcher_profile_with_paper=True)
         if verified:
+            if (
+                provisional_stale_faculty
+                and verified.get("status") == "VERIFIED"
+                and _institution_similarity(
+                    str(verified.get("institution_name") or ""), institution
+                ) >= 0.5
+            ):
+                provisional_stale_faculty = verified
+                continue
             return verified
-    for domain in _verified_email_domain_hints(name, search_results)[:1]:
-        verified = inspect_query(f'site:{domain} "{name}" professor')
-        if verified:
-            return verified
-    for query in dict.fromkeys(paper_queries):
-        verified = inspect_query(query, allow_researcher_profile_with_paper=True)
-        if verified:
-            return verified
-
-
-    # Google Scholar can be stale and user-edited, so it never proves a role.
-    # Its verified-email domain is useful as a search locator: the resulting
-    # university page must still pass all deterministic title/identity checks.
-    for domain in _verified_email_domain_hints(name, search_results)[:1]:
-        verified = inspect_query(f'site:{domain} "{name}" professor')
-        if verified:
-            return verified
+    if provisional_stale_faculty:
+        return provisional_stale_faculty
 
     # An explicit official student/postdoc result is already a strong rule-based
     # decision. Spend AI quota only on unresolved pages or identity conflicts.
@@ -2007,6 +2895,9 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             if page.get("source_url")
         ]
         return conflict
+    snippet_decision = _public_snippet_nonfaculty_consensus(name, search_results, candidate)
+    if snippet_decision:
+        return snippet_decision
     if search_outage is not None:
         # Preserve the identity; record the retry separately in the batch runner.
         raise search_outage
@@ -2015,6 +2906,9 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
                                     'Result limit reached' if len(result_urls) >= result_limit else
                                     'Query limit reached' if queries_checked >= query_limit else
                                     'Available query variants completed')
+    # A promising personal/lab faculty page with an unconfirmed current
+    # affiliation is stronger than a bare search miss. Keep it reviewable
+    # instead of replacing it with the low-confidence three-query exclusion.
     unresolved = mismatch_pages or ambiguous_pages
     if unresolved:
         best = next((page for page in unresolved if page.get('failure_code') == 'CURRENT_ROLE_UNCONFIRMED'), unresolved[0])
@@ -2024,9 +2918,61 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             "confidence": 0.0,
             "method": "automatic_search",
             "evidence_text": (
-                "A possible official page was found, but the current evidence does "
-                "not safely connect it to this OpenAlex author."
+                "A possible official or attributable profile was found, but the "
+                "current role or institution could not be confirmed safely."
             ),
+        }
+    source_problem_pages = [
+        page for page in (audit or {}).get('pages', [])
+        if page.get('failure_code') in {
+            'SOURCE_BLOCKED', 'SOURCE_UNAVAILABLE', 'PROFILE_REMOVED',
+            'NO_READABLE_CONTENT', 'PDF_PARSE_FAILED', 'PDF_NO_TEXT',
+        }
+    ]
+    if source_problem_pages:
+        first_problem = source_problem_pages[0]
+        return {
+            'status': 'UNVERIFIED',
+            'confidence': 0.0,
+            'method': 'source_problem',
+            'failure_code': first_problem.get('failure_code'),
+            'source_url': first_problem.get('url'),
+            'evidence_text': (
+                'A potentially useful identity source was blocked, unavailable, '
+                'or unreadable. Absence of a readable faculty page is not a '
+                'completed negative search.'
+            ),
+        }
+    if queries_checked == len(primary_queries):
+        if institution_classification.get("organization_type") == "K12_SCHOOL":
+            return {
+                "status": "NOT_FACULTY",
+                "confidence": 0.94,
+                "method": "k12_organization_no_faculty_profile",
+                "review_recommended": True,
+                "evidence_text": (
+                    institution_classification.get("evidence")
+                    or f"{institution} is identified as a K–12 school."
+                ) + " Three completed searches found no current US university faculty appointment.",
+                "institution_classification": institution_classification,
+            }
+        return {
+            "status": "NOT_FACULTY",
+            "confidence": 0.55,
+            "method": "completed_three_query_no_faculty_profile",
+            "review_recommended": True,
+            "evidence_text": (
+                "Three successful targeted searches found no attributable current "
+                "US university faculty profile. This is a low-confidence automatic "
+                "exclusion; staff confirmation is recommended."
+            ),
+            "alternative_evidence": [
+                {
+                    key: page.get(key)
+                    for key in ("source_url", "title", "reason", "failure_code")
+                }
+                for page in (mismatch_pages + ambiguous_pages)[:10]
+            ],
         }
     return {
         "status": "UNVERIFIED",
@@ -2035,9 +2981,146 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _source_type_for_evidence(row: dict[str, Any]) -> str:
+    explicit = str(row.get("source_type") or "").strip().upper()
+    if explicit:
+        return explicit
+    kind = str(row.get("source_kind") or "").casefold()
+    host = _host_domain(str(row.get("source_url") or row.get("url") or ""))
+    method = str(row.get("method") or row.get("decision_method") or "")
+    if "official" in method or kind == "university":
+        return "OFFICIAL_UNIVERSITY_PAGE"
+    if kind == "lab":
+        return "LAB_WEBSITE"
+    if kind == "personal":
+        return "PERSONAL_WEBSITE"
+    if kind == "cv":
+        return "CV"
+    if kind == "linkedin" or host.endswith("linkedin.com"):
+        return "LINKEDIN_SNIPPET"
+    if host.startswith("scholar.google."):
+        return "GOOGLE_SCHOLAR"
+    return "SEARCH_RESULT"
+
+
+def _lookup_status_for_evidence(row: dict[str, Any]) -> str:
+    failure = str(row.get("failure_code") or "").upper()
+    http_status = int(row.get("http_status") or 0)
+    if failure == "SOURCE_BLOCKED" or http_status in {401, 403, 429}:
+        return "BLOCKED"
+    if http_status == 404:
+        return "DELETED"
+    if failure in {"SOURCE_UNAVAILABLE", "NO_READABLE_CONTENT"} or http_status >= 400:
+        return "HTTP_ERROR"
+    return str(row.get("lookup_status") or "FOUND").upper()
+
+
+def _identity_evidence_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Persist the useful attribution trail, not every raw search response."""
+    final_status = str(result.get("status") or "UNVERIFIED")
+    allowed_statuses = {
+        "UNVERIFIED", "VERIFIED", "NOT_FACULTY", "OUT_OF_SCOPE",
+        "CONFLICT", "MANUAL_REVIEW",
+    }
+    if final_status not in allowed_statuses:
+        final_status = "UNVERIFIED"
+    by_url: dict[str, dict[str, Any]] = {}
+
+    def add(row: dict[str, Any], *, supports_decision: bool = False) -> None:
+        source_url = canonical_source_url(str(row.get("source_url") or row.get("final_url") or row.get("url") or ""))
+        if not source_url:
+            return
+        normalized = dict(row)
+        normalized["source_url"] = source_url
+        normalized.setdefault("source_domain", _host_domain(source_url))
+        normalized.setdefault("verification_status", normalized.get("status") or "UNVERIFIED")
+        evidence_status = str(normalized.get("verification_status") or "UNVERIFIED").upper()
+        # CLUE, FOUND, BLOCKED, and similar labels describe retrieval or page
+        # handling; they are not final identity decisions accepted by the DB.
+        normalized["verification_status"] = (
+            evidence_status if evidence_status in allowed_statuses else "UNVERIFIED"
+        )
+        normalized.setdefault("supports_decision", supports_decision)
+        normalized.setdefault("source_type", _source_type_for_evidence(normalized))
+        normalized.setdefault("lookup_status", _lookup_status_for_evidence(normalized))
+        normalized.setdefault("page_title", normalized.get("page_title") or normalized.get("title"))
+        inspection = str(normalized.get("inspection") or "").strip()
+        normalized.setdefault(
+            "inspection_status",
+            "RETURNED_NOT_INSPECTED"
+            if inspection == "Not inspected in this pass"
+            else "INSPECTED" if inspection or normalized.get("status") else "UNKNOWN",
+        )
+        normalized.setdefault(
+            "evidence_excerpt",
+            normalized.get("evidence_text")
+            or normalized.get("reason")
+            or normalized.get("snippet_hint")
+            or normalized.get("snippet"),
+        )
+        normalized.setdefault("extracted_text", normalized.get("name_context") or normalized.get("text_excerpt") or normalized.get("snippet"))
+        if not normalized.get("observed_title"):
+            role_source = " ".join(
+                str(normalized.get(key) or "")
+                for key in ("page_title", "title", "snippet", "evidence_text", "extracted_text")
+            )
+            role_match = (
+                CURRENT_NONFACULTY_ROLE_PATTERN.search(role_source)
+                or NON_FACULTY_PATTERN.search(role_source)
+                or FACULTY_TITLE_PATTERN.search(role_source)
+            )
+            if role_match:
+                normalized["observed_title"] = " ".join(role_match.group(0).split())
+        normalized.setdefault(
+            "role_category", _role_category(normalized.get("observed_title"))
+        )
+        existing = by_url.get(source_url)
+        if existing is None:
+            by_url[source_url] = normalized
+            return
+        for key, value in normalized.items():
+            if value is not None and value != "" and value != [] and value != {} and not existing.get(key):
+                existing[key] = value
+        existing["supports_decision"] = bool(existing.get("supports_decision") or supports_decision)
+
+    add(result, supports_decision=True)
+    for alternative in list(result.get("alternative_evidence") or []):
+        add(alternative)
+    audit = result.get("search_audit") or {}
+    for page in list(audit.get("pages") or []):
+        add(page)
+    for search_result in list(audit.get("results") or []):
+        add(search_result)
+    rows = list(by_url.values())
+    for row in rows:
+        if row.get("supports_decision"):
+            row["verification_status"] = final_status
+        elif str(row.get("verification_status") or "").upper() not in allowed_statuses:
+            row["verification_status"] = "UNVERIFIED"
+        row.setdefault("currentness", "CURRENT" if row.get("role_category") not in {None, "", "UNKNOWN"} else "UNKNOWN")
+        row.setdefault("scope_status", result.get("scope_status") or "UNKNOWN")
+    return rows
+
+
 def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
+    result = dict(result)
     professor_id = int(candidate["id"])
     status = str(result.get("status") or "UNVERIFIED")
+    existing_source = str(candidate.get('faculty_source_url') or '')
+    new_source = str(result.get('source_url') or '')
+    same_saved_institution = institutions_equivalent(
+        str(candidate.get('institution_name') or ''),
+        str(result.get('institution_name') or candidate.get('institution_name') or ''),
+    )
+    if (
+        status in {'VERIFIED', 'OUT_OF_SCOPE'}
+        and same_saved_institution
+        and _faculty_source_quality(existing_source) > _faculty_source_quality(new_source)
+    ):
+        result['source_url'] = existing_source
+        saved_record = record_for_host(_host_domain(existing_source))
+        if saved_record:
+            result['source_domain'] = saved_record[1]
     if status == "SEARCH_UNAVAILABLE":
         raise ValueError("A provider outage cannot be saved as an identity decision.")
     method = str(result.get("method") or (
@@ -2049,13 +3132,15 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                 "UPDATE professors SET identity_retry_at = NULL, identity_retry_reason = NULL, identity_search_pending = FALSE, identity_search_audit = %s::jsonb WHERE id = %s",
                 (json.dumps(result.get('search_audit') or {}), professor_id),
             )
-            institution_name = str(result.get("institution_name") or candidate["institution_name"])
+            institution_name = canonical_institution(
+                str(result.get("institution_name") or candidate["institution_name"])
+            )
             country_code = (
                 str(result.get("country_code") or "").upper()
                 or _country_code_for_domain(str(result.get("source_domain") or ""))
             )
             institution_id = candidate.get("institution_id")
-            if status == "VERIFIED" and institution_name:
+            if status in {"VERIFIED", "OUT_OF_SCOPE"} and institution_name:
                 cursor.execute(
                     """
                     INSERT INTO institutions (name, country_code)
@@ -2088,12 +3173,12 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                         ELSE %s
                     END,
                     faculty_title = CASE
-                        WHEN %s = 'VERIFIED' THEN %s
+                        WHEN %s IN ('VERIFIED', 'OUT_OF_SCOPE') THEN %s
                         WHEN faculty_verification_method = 'official_directory' THEN NULL
                         ELSE faculty_title
                     END,
                     faculty_source_url = CASE
-                        WHEN %s = 'VERIFIED' THEN %s
+                        WHEN %s IN ('VERIFIED', 'OUT_OF_SCOPE') THEN %s
                         WHEN faculty_verification_method = 'official_directory' THEN NULL
                         ELSE faculty_source_url
                     END,
@@ -2102,29 +3187,26 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     faculty_confidence = %s,
                     faculty_checked_at = NOW(),
                     faculty_verified_at = CASE WHEN %s = 'VERIFIED' THEN NOW() ELSE NULL END,
-                    next_identity_check_at = CASE WHEN %s = 'CONFLICT' THEN NULL ELSE NOW() + CASE
-                        WHEN %s = 'VERIFIED' THEN INTERVAL '90 days'
-                        WHEN %s = 'NOT_FACULTY' THEN INTERVAL '75 days'
-                        WHEN %s = 'CONFLICT' THEN INTERVAL '45 days'
-                        ELSE INTERVAL '30 days'
-                    END END,
+                    next_identity_check_at = NOW() + INTERVAL '30 days',
                     official_institution_domain = CASE
-                        WHEN %s = 'VERIFIED' THEN %s
+                        WHEN %s IN ('VERIFIED', 'OUT_OF_SCOPE') THEN %s
                         WHEN faculty_verification_method = 'official_directory' THEN NULL
                         ELSE official_institution_domain
                     END,
                     appointment_year = COALESCE(%s, appointment_year),
+                    appointment_start_date = COALESCE(%s::date, appointment_start_date),
+                    appointment_date_precision = COALESCE(%s, appointment_date_precision),
                     career_stage = COALESCE(%s, career_stage),
                     previous_institutions = CASE
-                        WHEN %s = 'VERIFIED'
+                        WHEN %s IN ('VERIFIED', 'OUT_OF_SCOPE')
                              AND institution_name <> %s
                              AND NOT (institution_name = ANY(previous_institutions))
                             THEN array_append(previous_institutions, institution_name)
                         ELSE previous_institutions
                     END,
-                    institution_id = CASE WHEN %s = 'VERIFIED' THEN %s ELSE institution_id END,
-                    institution_name = CASE WHEN %s = 'VERIFIED' THEN %s ELSE institution_name END,
-                    homepage_url = CASE WHEN %s = 'VERIFIED' THEN %s ELSE homepage_url END,
+                    institution_id = CASE WHEN %s IN ('VERIFIED', 'OUT_OF_SCOPE') THEN %s ELSE institution_id END,
+                    institution_name = CASE WHEN %s IN ('VERIFIED', 'OUT_OF_SCOPE') THEN %s ELSE institution_name END,
+                    homepage_url = CASE WHEN %s IN ('VERIFIED', 'OUT_OF_SCOPE') THEN %s ELSE homepage_url END,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
@@ -2136,9 +3218,10 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     FACULTY_VERIFICATION_VERSION,
                     float(result.get("confidence") or 0),
                     status,
-                    status, status, status, status,
                     status, result.get("source_domain"),
                     result.get("appointment_year"),
+                    result.get("appointment_start_date"),
+                    result.get("appointment_date_precision"),
                     result.get("career_stage"),
                     status, institution_name,
                     status, institution_id,
@@ -2147,14 +3230,18 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                     professor_id,
                 ),
             )
-            evidence_results = [result, *list(result.get("alternative_evidence") or [])]
+            evidence_results = _identity_evidence_rows(result)
             saved_urls: set[str] = set()
             for evidence_result in evidence_results:
                 source_url = str(evidence_result.get("source_url") or "").strip()
                 if not source_url or source_url in saved_urls:
                     continue
                 saved_urls.add(source_url)
-                evidence_status = str(evidence_result.get("status") or status)
+                evidence_status = str(
+                    evidence_result.get("verification_status")
+                    or evidence_result.get("status")
+                    or status
+                )
                 evidence_method = str(
                     evidence_result.get("method") or method
                 )
@@ -2167,8 +3254,12 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                         professor_id, source_url, source_domain, observed_title,
                         observed_institution, evidence_text, verification_status,
                         confidence, decision_method, model_name, prompt_version,
-                        checked_at
+                        source_type, page_title, role_category, observed_employer,
+                        currentness, lookup_status, evidence_excerpt,
+                        extracted_text, http_status, supports_decision,
+                        scope_status, checked_at
                     ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                     )
                     ON CONFLICT (professor_id, source_url) DO UPDATE
@@ -2180,20 +3271,48 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
                         decision_method = EXCLUDED.decision_method,
                         model_name = EXCLUDED.model_name,
                         prompt_version = EXCLUDED.prompt_version,
+                        source_type = EXCLUDED.source_type,
+                        page_title = EXCLUDED.page_title,
+                        role_category = EXCLUDED.role_category,
+                        observed_employer = EXCLUDED.observed_employer,
+                        currentness = EXCLUDED.currentness,
+                        lookup_status = EXCLUDED.lookup_status,
+                        evidence_excerpt = EXCLUDED.evidence_excerpt,
+                        extracted_text = EXCLUDED.extracted_text,
+                        http_status = EXCLUDED.http_status,
+                        supports_decision = EXCLUDED.supports_decision,
+                        scope_status = EXCLUDED.scope_status,
                         checked_at = NOW()
                     """,
                     (
                         professor_id,
                         source_url,
                         evidence_result.get("source_domain") or "",
-                        evidence_result.get("title"),
+                        evidence_result.get("observed_title") or evidence_result.get("role") or (
+                            evidence_result.get("title") if evidence_result.get("supports_decision") else None
+                        ),
                         evidence_institution,
-                        evidence_result.get("evidence_text"),
+                        evidence_result.get("evidence_text") or evidence_result.get("evidence_excerpt"),
                         evidence_status,
                         float(evidence_result.get("confidence") or 0),
                         evidence_method,
                         evidence_result.get("model_name"),
                         evidence_result.get("prompt_version"),
+                        evidence_result.get("source_type") or "UNKNOWN",
+                        evidence_result.get("page_title"),
+                        evidence_result.get("role_category") or _role_category(
+                            evidence_result.get("observed_title") or evidence_result.get("role") or (
+                                evidence_result.get("title") if evidence_result.get("supports_decision") else None
+                            )
+                        ),
+                        evidence_result.get("observed_employer"),
+                        evidence_result.get("currentness") or "UNKNOWN",
+                        evidence_result.get("lookup_status") or "FOUND",
+                        evidence_result.get("evidence_excerpt"),
+                        str(evidence_result.get("extracted_text") or "")[:4000] or None,
+                        evidence_result.get("http_status"),
+                        bool(evidence_result.get("supports_decision")),
+                        evidence_result.get("scope_status") or "UNKNOWN",
                     ),
                 )
 
@@ -2202,6 +3321,7 @@ def verify_faculty_candidates(
     professor_ids: list[int],
     max_candidates: int | None = None,
     *, direct_only: bool = False, retry_after_seconds: int = 60,
+    cache_max_age_days: int = 30,
 ) -> dict[str, Any]:
     """Verify a bounded set and return only candidates allowed in public results."""
     if not professor_ids:
@@ -2281,59 +3401,27 @@ def verify_faculty_candidates(
         candidate = by_id.get(professor_id)
         if not candidate:
             continue
-        if candidate.get("faculty_status") == "CONFLICT":
-            continue  # Staff RETRY explicitly clears this status.
-        if recently_checked(candidate, now):
-            # Algorithm upgrades and other topics must not repeatedly recheck a
-            # completed decision. Old-version positives still stay non-public.
-            if candidate["faculty_status"] == "VERIFIED" and (
-                candidate.get("faculty_verification_method") == "manual_review"
-                or int(candidate.get("faculty_verification_version") or 0) >= FACULTY_VERIFICATION_VERSION
-            ):
+        manual_decision = candidate.get("faculty_verification_method") == "manual_review"
+        version_current = (
+            int(candidate.get("faculty_verification_version") or 0)
+            >= FACULTY_VERIFICATION_VERSION
+        )
+        if manual_decision:
+            if candidate.get("faculty_status") == "VERIFIED":
+                verified_ids.append(professor_id)
+            continue
+        if version_current and recently_checked(
+            candidate, now, max_age_days=cache_max_age_days
+        ):
+            if candidate.get("faculty_status") == "VERIFIED":
                 verified_ids.append(professor_id)
             continue
         if candidate.get("identity_retry_at") and candidate["identity_retry_at"] > now:
             deferred_delays.append(max(1, int((candidate["identity_retry_at"] - now).total_seconds())))
             continue
-        age_days = (
-            (now - candidate["faculty_checked_at"]).total_seconds() / 86_400
-            if candidate.get("faculty_checked_at") else None
-        )
-        refresh_is_current = (
-            candidate.get("next_identity_check_at") is not None
-            and candidate["next_identity_check_at"] > now
-        )
-        if (
-            candidate["faculty_status"] == "VERIFIED"
-            and (
-                candidate.get("faculty_verification_method") == "manual_review"
-                or int(candidate.get("faculty_verification_version") or 0)
-                    >= FACULTY_VERIFICATION_VERSION
-            )
-            and (
-                candidate.get("faculty_verification_method") == "manual_review"
-                or refresh_is_current
-                or (candidate.get("next_identity_check_at") is None
-                    and age_days is not None and age_days <= 90)
-            )
-        ):
-            verified_ids.append(professor_id)
-        elif (
-            candidate["faculty_status"] in {
-                "NOT_FACULTY", "UNVERIFIED", "CONFLICT", "MANUAL_REVIEW"
-            }
-            and int(candidate.get("faculty_verification_version") or 0) >= FACULTY_VERIFICATION_VERSION
-            and (
-                refresh_is_current
-                or (candidate.get("next_identity_check_at") is None
-                    and age_days is not None and age_days <= 30)
-            )
-        ):
-            continue
-        else:
-            candidate["_direct_only"] = direct_only
-            candidate["_search_retry_seconds"] = retry_after_seconds
-            pending.append(candidate)
+        candidate["_direct_only"] = direct_only
+        candidate["_search_retry_seconds"] = retry_after_seconds
+        pending.append(candidate)
 
     workers = setting_int("FACULTY_VERIFY_MAX_WORKERS", 3, 1, 6)
     checked = 0
@@ -2389,14 +3477,16 @@ def verify_faculty_candidates(
     return {
         "verified_ids": verified_ids,
         "checked": checked,
-        "evaluated": len(ordered_ids),
+        "evaluated": checked,
         "verified": len(verified_ids),
         "deferred": len(deferred_delays),
         "retry_after_seconds": min(deferred_delays) if deferred_delays else 0,
     }
 
 
-def get_cached_faculty_decisions(professor_ids: list[int]) -> dict[str, list[int]]:
+def get_cached_faculty_decisions(
+    professor_ids: list[int], *, max_age_days: int = 30
+) -> dict[str, list[int]]:
     """Return current positive and negative decisions without launching web checks."""
     ordered_ids = list(dict.fromkeys(int(value) for value in professor_ids))
     if not ordered_ids:
@@ -2407,25 +3497,15 @@ def get_cached_faculty_decisions(professor_ids: list[int]) -> dict[str, list[int
                 """
                 SELECT id, faculty_status, faculty_verification_version, faculty_verification_method FROM professors
                 WHERE id = ANY(%s)
-                  AND (faculty_status = 'CONFLICT' OR faculty_checked_at > NOW() - INTERVAL '30 days'
-                  OR (faculty_verification_version >= %s AND (
-                      (faculty_status = 'VERIFIED' AND (
-                           next_identity_check_at > NOW()
-                           OR (next_identity_check_at IS NULL
-                               AND faculty_checked_at >= NOW() - INTERVAL '90 days')
-                       ))
-                      OR
-                      (faculty_status IN (
-                           'NOT_FACULTY', 'UNVERIFIED', 'CONFLICT', 'MANUAL_REVIEW'
-                       )
-                       AND (
-                           next_identity_check_at > NOW()
-                           OR (next_identity_check_at IS NULL
-                               AND faculty_checked_at >= NOW() - INTERVAL '30 days')
-                       ))
-                  )))
+                  AND (
+                      faculty_verification_method = 'manual_review'
+                      OR (
+                          faculty_verification_version >= %s
+                          AND faculty_checked_at >= NOW() - (%s * INTERVAL '1 day')
+                      )
+                  )
                 """,
-                (ordered_ids, FACULTY_VERIFICATION_VERSION),
+                (ordered_ids, FACULTY_VERIFICATION_VERSION, max(1, int(max_age_days))),
             )
             rows = list(cursor.fetchall())
     decided = {int(row["id"]) for row in rows}
