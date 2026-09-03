@@ -39,4 +39,4 @@ before-*.sql
 /backups/
 data/college_scorecard/
 /reports/
-/tests/
+# Keep the repository test suite tracked so CI can run it.
