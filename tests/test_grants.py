@@ -18,11 +18,12 @@ class GrantMatchingTests(unittest.TestCase):
         )
         self.assertFalse(_institution_matches("Stanford University", "Harvard University"))
 
-    def test_grant_scan_is_scoped_to_current_research_domain(self) -> None:
+    def test_grant_scan_is_scoped_to_explicit_professor_ids(self) -> None:
         source = (PROJECT_DIR / "ingestion" / "check_grants.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("WHERE research_domain = %s", source)
+        self.assertIn("WHERE id = ANY(%s)", source)
+        self.assertNotIn("WHERE research_domain = %s", source)
 
 
 if __name__ == "__main__":

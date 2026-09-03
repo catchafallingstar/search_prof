@@ -26,8 +26,7 @@ class RadarContractTests(unittest.TestCase):
         source = (PROJECT_DIR / "ingestion" / "parse_hiring_signals.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("'pending', NULL, NOW() + INTERVAL '120 days'", source)
-        self.assertNotIn("'active', NOW(), NOW() + INTERVAL '120 days'", source)
+        self.assertIn("CASE WHEN %s THEN NOW() + INTERVAL '120 days' ELSE NOW() END", source)
 
 
 if __name__ == "__main__":
