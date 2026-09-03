@@ -603,21 +603,6 @@ CREATE TABLE IF NOT EXISTS fundings (
 ALTER TABLE fundings
     ADD COLUMN IF NOT EXISTS research_domains TEXT[] NOT NULL DEFAULT '{}';
 
--- Funding freshness is topic- and source-specific. A Chemistry NSF check must
--- not suppress a later Political Science ORCID/NIH check for the same person.
-CREATE TABLE IF NOT EXISTS professor_topic_grant_checks (
-    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
-    radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
-    source TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('CHECKED', 'NO_MATCH', 'NOT_APPLICABLE', 'SOURCE_UNAVAILABLE', 'DISABLED')),
-    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    next_check_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '30 days',
-    last_error TEXT,
-    PRIMARY KEY (professor_id, radar_topic_id, source)
-);
-CREATE INDEX IF NOT EXISTS professor_topic_grant_checks_due_idx
-    ON professor_topic_grant_checks (radar_topic_id, next_check_at);
-
 CREATE TABLE IF NOT EXISTS hiring_signals (
     id BIGSERIAL PRIMARY KEY,
     professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
@@ -694,6 +679,21 @@ CREATE TABLE IF NOT EXISTS radar_topics (
 );
 ALTER TABLE radar_topics
     ADD COLUMN IF NOT EXISTS discovery_version INTEGER NOT NULL DEFAULT 0;
+
+-- Funding freshness is topic- and source-specific. This must be declared
+-- after radar_topics so an empty database can apply the schema in one pass.
+CREATE TABLE IF NOT EXISTS professor_topic_grant_checks (
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('CHECKED', 'NO_MATCH', 'NOT_APPLICABLE', 'SOURCE_UNAVAILABLE', 'DISABLED')),
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    next_check_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '30 days',
+    last_error TEXT,
+    PRIMARY KEY (professor_id, radar_topic_id, source)
+);
+CREATE INDEX IF NOT EXISTS professor_topic_grant_checks_due_idx
+    ON professor_topic_grant_checks (radar_topic_id, next_check_at);
 
 -- Stable OpenAlex hierarchy nodes used by ScholarRadar. One user-facing
 -- research area can map to several domains, fields, subfields, or topics.
