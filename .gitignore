@@ -38,3 +38,5 @@ before-*.sql
 # Private configuration and code backups created during local maintenance.
 /backups/
 data/college_scorecard/
+/reports/
+/tests/
