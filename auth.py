@@ -85,10 +85,14 @@ def require_site_admin(owner_only: bool = False) -> tuple[dict[str, Any], dict[s
 def account_controls() -> None:
     if development_auth_enabled():
         identity = _development_identity()
-        st.warning(
-            f"Local development login: {identity['email']}. "
-            "DEV_AUTH_BYPASS must be disabled outside local development."
-        )
+        # The bypass supplies this exact identity; keep the warning scoped to
+        # that identity instead of displaying it for unrelated sessions.
+        configured_email = os.getenv("DEV_USER_EMAIL", "").strip().casefold()
+        if configured_email and identity["email"] == configured_email:
+            st.warning(
+                f"Local development login: {identity['email']}. "
+                "DEV_AUTH_BYPASS must be disabled outside local development."
+            )
     elif is_logged_in():
         left, right = st.columns([4, 1])
         left.caption(f"Signed in as {getattr(st.user, 'email', '')}")
