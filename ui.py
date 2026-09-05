@@ -23,12 +23,12 @@ SOURCE_LABELS = {
 
 
 def configure_page(title: str) -> None:
-    st.set_page_config(
-        page_title=f"{title} | ScholarRadar",
-        page_icon="🎯",
-        layout="wide",
-        initial_sidebar_state="collapsed",
-    )
+        st.set_page_config(
+                page_title=f"{title} | ScholarRadar",
+                page_icon="🎯",
+                layout="wide",
+                initial_sidebar_state="collapsed",
+        )
         base_css = """
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
