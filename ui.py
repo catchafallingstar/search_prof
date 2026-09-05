@@ -141,7 +141,24 @@ def configure_page(title: str) -> None:
                 input, textarea, select, [data-baseweb="select"] > div { background: #0b2a3a !important; color: #eaf6ff !important; border-color: #54708b !important; }
                 input::placeholder, textarea::placeholder { color: #9fb7c8 !important; }
                 input:focus, textarea:focus, [data-baseweb="select"] > div:focus-within { box-shadow: 0 0 0 3px rgba(160,200,230,.06) !important; border-color: var(--sr-maize) !important; }
-                .stButton > button, .stLinkButton > a { color: #edf5fb; }
+                /* Streamlit-specific selectors for stronger overrides */
+                [data-testid="stTextInput"] input,
+                [data-testid="stTextArea"] textarea,
+                [data-testid="stSelectbox"] div[role="combobox"],
+                .stTextInput input,
+                .stTextArea textarea,
+                .stSelectbox select,
+                .stMultiSelect div[role="listbox"] {
+                    background: #0b2a3a !important;
+                    color: #eaf6ff !important;
+                    border-color: #54708b !important;
+                }
+                [data-testid="stTextInput"] input::placeholder,
+                [data-testid="stTextArea"] textarea::placeholder {
+                    color: #9fb7c8 !important;
+                }
+                .stButton > button, .stLinkButton > a { color: #edf5fb; background: #0f3350; border-color: #173b59; }
+                .stButton > button[kind="primary"], .stFormSubmitButton > button { background: linear-gradient(180deg,#1b4b6a,#153748) !important; color: #fff !important; border-color: #173b59 !important; }
                 </style>
                 """
                 st.markdown(dark_css, unsafe_allow_html=True)
@@ -178,7 +195,6 @@ def navigation() -> None:
         theme_label = "🌙" if theme_now == "light" else "☀️"
         if theme_col.button(theme_label, key="nav_theme"):
             st.session_state["sr_theme"] = "dark" if theme_now == "light" else "light"
-            st.rerun()
 
         if contact.button("Contact", key="nav_contact", width="stretch"):
             st.switch_page("pages/7_Contact.py")
