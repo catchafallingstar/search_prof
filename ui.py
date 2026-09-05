@@ -127,6 +127,21 @@ def configure_page(title: str) -> None:
                 .sr-hero { border-bottom-color: rgba(255,255,255,.04); }
                 h1, h2, h3 { color: var(--sr-ink); }
                 .sr-hero::before, .sr-hero::after { display:none; }
+                .st-key-sr_nav { border-bottom-color: rgba(230, 239, 232, .18); }
+                .st-key-sr_nav button { border-color: #54708b; background: #102b43; color: #edf5fb; }
+                .st-key-sr_nav .sr-nav-link { border-color: #54708b; background: #102b43; color: #edf5fb; }
+                .st-key-sr_nav button:hover, .st-key-sr_nav button:focus-visible, .st-key-sr_nav .sr-nav-link:hover, .st-key-sr_nav .sr-nav-link:focus-visible { border-color: var(--sr-maize); background: #173b59; color: #ffffff; }
+                .st-key-nav_home button { border-color: transparent; background: transparent; color: #8fc8ff; }
+                .st-key-nav_home button:hover, .st-key-nav_home button:focus-visible { border-color: transparent; background: transparent; color: #ffffff; }
+                .sr-kicker { color: #62d2dd; }
+                .sr-hero h1, h1, h2, h3 { color: #ffffff; }
+                .sr-hero p, .sr-evidence { color: #c4d3e0; }
+                div[data-testid="stVerticalBlockBorderWrapper"], div[data-testid="stForm"] { background: #102b43; border-color: #54708b; }
+                label, [data-testid="stWidgetLabel"] p { color: #ffffff !important; }
+                input, textarea, select, [data-baseweb="select"] > div { background: #0b2a3a !important; color: #eaf6ff !important; border-color: #54708b !important; }
+                input::placeholder, textarea::placeholder { color: #9fb7c8 !important; }
+                input:focus, textarea:focus, [data-baseweb="select"] > div:focus-within { box-shadow: 0 0 0 3px rgba(160,200,230,.06) !important; border-color: var(--sr-maize) !important; }
+                .stButton > button, .stLinkButton > a { color: #edf5fb; }
                 </style>
                 """
                 st.markdown(dark_css, unsafe_allow_html=True)
@@ -163,7 +178,7 @@ def navigation() -> None:
         theme_label = "🌙" if theme_now == "light" else "☀️"
         if theme_col.button(theme_label, key="nav_theme"):
             st.session_state["sr_theme"] = "dark" if theme_now == "light" else "light"
-            st.experimental_rerun()
+            st.rerun()
 
         if contact.button("Contact", key="nav_contact", width="stretch"):
             st.switch_page("pages/7_Contact.py")
