@@ -29,156 +29,44 @@ def configure_page(title: str) -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
-    st.markdown(
-        """
+        base_css = """
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
-        # Theme overrides (dark/light) controlled by `st.session_state['sr_theme']`.
-        theme = st.session_state.get("sr_theme", "light")
-        if theme == "dark":
-                st.markdown(
-                        """
-                        <style>
-                        :root {
-                            --sr-blue: #a8d3ff;
-                            --sr-blue-strong: #9cd7ff;
-                            --sr-blue-soft: #062434;
-                            --sr-maize: #ffcb05;
-                            --sr-ink: #eaf6ff;
-                            --sr-muted: #9fb7c8;
-                            --sr-line: rgba(120,160,200,.12);
-                            --sr-surface: #07121a;
-                            --sr-cyan: #4fd4e6;
-                        }
-                        [data-testid="stAppViewContainer"] {
-                            background-color: #041423;
-                            background-image: radial-gradient(circle at 10% 10%, rgba(0,120,150,.06) 0, transparent 20rem),
-                                                                repeating-linear-gradient(135deg, rgba(255,255,255,0.02) 0 1px, transparent 1px 28px);
-                            color: var(--sr-ink);
-                        }
-                        .sr-hero { border-bottom-color: rgba(255,255,255,.04); }
-                        h1, h2, h3 { color: var(--sr-ink); }
-                        .sr-hero::before, .sr-hero::after { display:none; }
-                        </style>
-                        """,
-                        unsafe_allow_html=True,
-                )
-        else:
-                st.markdown(
-                        """
-                        <style>
-                        /* Light theme tech background tweak */
-                        [data-testid="stAppViewContainer"] {
-                            background-image: radial-gradient(circle at 88% -8%, rgba(215,235,251,.65) 0, transparent 28rem),
-                                                                repeating-linear-gradient(135deg, rgba(0,39,76,0.03) 0 1px, transparent 1px 28px);
-                        }
-                        </style>
-                        """,
-                        unsafe_allow_html=True,
-                )
         :root {
-          --sr-blue: #00274c;
-          --sr-blue-strong: #001b33;
-          --sr-blue-soft: #e8f1fa;
-          --sr-maize: #ffcb05;
-          --sr-ink: #152536;
-          --sr-muted: #506274;
-          --sr-line: #b8c7d5;
-          --sr-surface: #ffffff;
-          --sr-cyan: #007c91;
+            --sr-blue: #00274c;
+            --sr-blue-strong: #001b33;
+            --sr-blue-soft: #e8f1fa;
+            --sr-maize: #ffcb05;
+            --sr-ink: #152536;
+            --sr-muted: #506274;
+            --sr-line: #b8c7d5;
+            --sr-surface: #ffffff;
+            --sr-cyan: #007c91;
         }
-                [data-testid="stAppViewContainer"] {
-                    background-color: #f6f9fc;
-                    background-image: radial-gradient(circle at 88% -8%, rgba(215,235,251,.65) 0, transparent 28rem),
-                                                        repeating-linear-gradient(135deg, rgba(0,39,76,0.03) 0 1px, transparent 1px 28px);
-                    background-blend-mode: overlay, normal;
-                    color: var(--sr-ink);
-                }
+        [data-testid="stAppViewContainer"] {
+            background-color: #f6f9fc;
+            background-image: radial-gradient(circle at 88% -8%, #d7ebfb 0, transparent 27rem), #f6f9fc;
+            color: var(--sr-ink);
+        }
         [data-testid="stHeader"] { background: rgba(246,249,252,.92); }
         [data-testid="stSidebar"] { display: none; }
-        /* The app does not use Streamlit's sidebar, so its expand arrow would
-           open an invisible panel and then appear to vanish. */
         [data-testid="stExpandSidebarButton"] { display: none !important; }
-        /* Streamlit's fixed header is about 3.5rem tall. Keep the custom
-           navigation below it so the header cannot wash out or intercept it. */
         .block-container { max-width: 1200px; padding-top: 4.25rem; padding-bottom: 4rem; }
-        .st-key-sr_nav {
-          padding: .2rem 0 1rem;
-          margin-bottom: .25rem;
-          border-bottom: 1px solid var(--sr-line);
-        }
-        .st-key-sr_nav button {
-          min-height: 2.5rem;
-          border: 1px solid var(--sr-line);
-          border-radius: .45rem;
-          background: #ffffff;
-          color: var(--sr-blue);
-          font-weight: 600;
-          box-shadow: 0 1px 2px rgba(20, 40, 28, .04);
-          transition: border-color .15s ease, background-color .15s ease,
-                      transform .15s ease;
-        }
-        .st-key-sr_nav .sr-nav-link {
-          display: flex;
-          min-height: 2.5rem;
-          align-items: center;
-          justify-content: center;
-          border: 1px solid var(--sr-line);
-          border-radius: .45rem;
-          background: #ffffff;
-          color: var(--sr-blue);
-          font-weight: 600;
-          text-decoration: none;
-          box-shadow: 0 1px 2px rgba(20, 40, 28, .04);
-        }
-        .st-key-sr_nav .sr-nav-link:hover,
-        .st-key-sr_nav .sr-nav-link:focus-visible {
-          border-color: var(--sr-blue);
-          background: var(--sr-blue-soft);
-          color: var(--sr-blue-strong);
-        }
-        .st-key-sr_nav button:hover,
-        .st-key-sr_nav button:focus-visible {
-          border-color: var(--sr-blue);
-          background: var(--sr-blue-soft);
-          color: var(--sr-blue-strong);
-          transform: translateY(-1px);
-        }
-        .st-key-nav_home button {
-          justify-content: flex-start;
-          border-color: transparent;
-          background: transparent;
-          box-shadow: none;
-          font-size: 1.2rem;
-          font-weight: 750;
-          color: var(--sr-blue);
-          white-space: nowrap;
-        }
-        .st-key-nav_home button:hover,
-        .st-key-nav_home button:focus-visible {
-          border-color: transparent;
-          background: transparent;
-          color: var(--sr-blue-strong);
-          transform: none;
-        }
-                .sr-hero {
-                    position: relative; overflow: visible; text-align: center;
-                    padding: 4rem 1rem 2.15rem; border-bottom: 1px solid var(--sr-line);
-                }
-                /* Decorative curves removed for a cleaner, technical layout. */
-                .sr-hero .tech-grid {
-                    position: absolute; inset: 0; pointer-events: none; opacity: .18;
-                    background-image: linear-gradient(90deg, rgba(255,203,5,.02) 1px, transparent 1px), linear-gradient(rgba(0,39,76,.02) 1px, transparent 1px);
-                    background-size: 28px 28px, 28px 28px;
-                    mix-blend-mode: multiply;
-                }
+        .st-key-sr_nav { padding: .2rem 0 1rem; margin-bottom: .25rem; border-bottom: 1px solid var(--sr-line); }
+        .st-key-sr_nav button { min-height: 2.5rem; border: 1px solid var(--sr-line); border-radius: .45rem; background: #ffffff; color: var(--sr-blue); font-weight: 600; box-shadow: 0 1px 2px rgba(20, 40, 28, .04); transition: border-color .15s ease, background-color .15s ease, transform .15s ease; }
+        .st-key-sr_nav .sr-nav-link { display: flex; min-height: 2.5rem; align-items: center; justify-content: center; border: 1px solid var(--sr-line); border-radius: .45rem; background: #ffffff; color: var(--sr-blue); font-weight: 600; text-decoration: none; box-shadow: 0 1px 2px rgba(20, 40, 28, .04); }
+        .st-key-sr_nav .sr-nav-link:hover, .st-key-sr_nav .sr-nav-link:focus-visible { border-color: var(--sr-blue); background: var(--sr-blue-soft); color: var(--sr-blue-strong); }
+        .st-key-sr_nav button:hover, .st-key-sr_nav button:focus-visible { border-color: var(--sr-blue); background: var(--sr-blue-soft); color: var(--sr-blue-strong); transform: translateY(-1px); }
+        .st-key-nav_home button { justify-content: flex-start; border-color: transparent; background: transparent; box-shadow: none; font-size: 1.2rem; font-weight: 750; color: var(--sr-blue); white-space: nowrap; }
+        .st-key-nav_home button:hover, .st-key-nav_home button:focus-visible { border-color: transparent; background: transparent; color: var(--sr-blue-strong); transform: none; }
+        .sr-hero { position: relative; overflow: visible; text-align: center; padding: 4rem 1rem 2.15rem; border-bottom: 1px solid var(--sr-line); }
+        .sr-hero .tech-grid { position: absolute; inset: 0; pointer-events: none; opacity: .18; background-image: linear-gradient(90deg, rgba(255,203,5,.02) 1px, transparent 1px), linear-gradient(rgba(0,39,76,.02) 1px, transparent 1px); background-size: 28px 28px, 28px 28px; mix-blend-mode: multiply; }
         .sr-kicker { color: var(--sr-cyan); font-weight: 800; letter-spacing: .12em; font-size: .78rem; }
         .sr-hero .sr-logo { display:inline-flex; align-items:center; gap:.75rem; justify-content:center; }
         .sr-hero .sr-mark { width:48px; height:48px; display:inline-block; border-radius:8px; background: linear-gradient(180deg, var(--sr-blue) 0%, #003a6b 100%); box-shadow: 0 6px 18px rgba(0,39,76,.12); }
         .sr-hero h1 { font-family: 'Space Grotesk', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; max-width: 880px; margin: .6rem auto .6rem; color: var(--sr-blue); font-size: clamp(2.1rem, 5vw, 3.6rem); letter-spacing: -.02em; line-height: 1.05; font-weight:700; }
         .sr-title-accent { color: var(--sr-maize); font-weight:800; padding-left:.25rem; }
         .sr-hero p { max-width: 740px; margin: 0 auto; color: var(--sr-muted); font-size: 1.02rem; line-height: 1.45; }
-        .sr-hero p { max-width: 690px; margin: 0 auto; color: var(--sr-muted); font-size: 1.1rem; line-height: 1.55; }
         div[data-testid="stVerticalBlockBorderWrapper"] { background: var(--sr-surface); border-color: var(--sr-line); box-shadow: 0 8px 24px rgba(0,39,76,.06); }
         .sr-evidence { color: var(--sr-muted); font-size: .86rem; }
         h1, h2, h3 { color: var(--sr-blue); letter-spacing: -.02em; }
@@ -192,54 +80,67 @@ def configure_page(title: str) -> None:
         a { color: #005a9c; }
         :focus-visible { outline: 3px solid var(--sr-maize) !important; outline-offset: 3px; }
         @media (prefers-color-scheme: dark) {
-          [data-testid="stAppViewContainer"] { background: #071929; color: #edf5fb; }
-          [data-testid="stHeader"] { background: rgba(7,25,41,.92); }
-          .st-key-sr_nav { border-bottom-color: rgba(230, 239, 232, .18); }
-          .st-key-sr_nav button {
-            border-color: #54708b;
-            background: #102b43;
-            color: #edf5fb;
-          }
-          .st-key-sr_nav .sr-nav-link {
-            border-color: #54708b;
-            background: #102b43;
-            color: #edf5fb;
-          }
-          .st-key-sr_nav button:hover,
-          .st-key-sr_nav button:focus-visible,
-          .st-key-sr_nav .sr-nav-link:hover,
-          .st-key-sr_nav .sr-nav-link:focus-visible {
-            border-color: var(--sr-maize);
-            background: #173b59;
-            color: #ffffff;
-          }
-          .st-key-nav_home button {
-            border-color: transparent;
-            background: transparent;
-            color: #8fc8ff;
-          }
-          .st-key-nav_home button:hover,
-          .st-key-nav_home button:focus-visible {
-            border-color: transparent;
-            background: transparent;
-            color: #ffffff;
-          }
-          .sr-kicker { color: #62d2dd; }
-          .sr-hero h1, h1, h2, h3 { color: #ffffff; }
-          .sr-hero p, .sr-evidence { color: #c4d3e0; }
-          div[data-testid="stVerticalBlockBorderWrapper"], div[data-testid="stForm"] { background: #102b43; border-color: #54708b; }
-          label, [data-testid="stWidgetLabel"] p { color: #ffffff !important; }
+            [data-testid="stAppViewContainer"] { background: #071929; color: #edf5fb; }
+            [data-testid="stHeader"] { background: rgba(7,25,41,.92); }
+            .st-key-sr_nav { border-bottom-color: rgba(230, 239, 232, .18); }
+            .st-key-sr_nav button { border-color: #54708b; background: #102b43; color: #edf5fb; }
+            .st-key-sr_nav .sr-nav-link { border-color: #54708b; background: #102b43; color: #edf5fb; }
+            .st-key-sr_nav button:hover, .st-key-sr_nav button:focus-visible, .st-key-sr_nav .sr-nav-link:hover, .st-key-sr_nav .sr-nav-link:focus-visible { border-color: var(--sr-maize); background: #173b59; color: #ffffff; }
+            .st-key-nav_home button { border-color: transparent; background: transparent; color: #8fc8ff; }
+            .st-key-nav_home button:hover, .st-key-nav_home button:focus-visible { border-color: transparent; background: transparent; color: #ffffff; }
+            .sr-kicker { color: #62d2dd; }
+            .sr-hero h1, h1, h2, h3 { color: #ffffff; }
+            .sr-hero p, .sr-evidence { color: #c4d3e0; }
+            div[data-testid="stVerticalBlockBorderWrapper"], div[data-testid="stForm"] { background: #102b43; border-color: #54708b; }
+            label, [data-testid="stWidgetLabel"] p { color: #ffffff !important; }
         }
         @media (max-width: 760px) {
-          .block-container { padding-top: 4rem; }
-          .st-key-sr_nav [data-testid="stHorizontalBlock"] {
-            flex-wrap: wrap;
-          }
+            .block-container { padding-top: 4rem; }
+            .st-key-sr_nav [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
         }
         </style>
-        """,
-        unsafe_allow_html=True,
-    )
+        """
+        st.markdown(base_css, unsafe_allow_html=True)
+
+        # Theme overrides (dark/light)
+        theme = st.session_state.get("sr_theme", "light")
+        if theme == "dark":
+                dark_css = """
+                <style>
+                :root {
+                    --sr-blue: #a8d3ff;
+                    --sr-blue-strong: #9cd7ff;
+                    --sr-blue-soft: #062434;
+                    --sr-maize: #ffcb05;
+                    --sr-ink: #eaf6ff;
+                    --sr-muted: #9fb7c8;
+                    --sr-line: rgba(120,160,200,.12);
+                    --sr-surface: #07121a;
+                    --sr-cyan: #4fd4e6;
+                }
+                [data-testid="stAppViewContainer"] {
+                    background-color: #041423;
+                    background-image: radial-gradient(circle at 10% 10%, rgba(0,120,150,.06) 0, transparent 20rem),
+                                                        repeating-linear-gradient(135deg, rgba(255,255,255,0.02) 0 1px, transparent 1px 28px);
+                    color: var(--sr-ink);
+                }
+                .sr-hero { border-bottom-color: rgba(255,255,255,.04); }
+                h1, h2, h3 { color: var(--sr-ink); }
+                .sr-hero::before, .sr-hero::after { display:none; }
+                </style>
+                """
+                st.markdown(dark_css, unsafe_allow_html=True)
+        else:
+                light_override_css = """
+                <style>
+                /* Light theme tech background tweak */
+                [data-testid="stAppViewContainer"] {
+                    background-image: radial-gradient(circle at 88% -8%, rgba(215,235,251,.65) 0, transparent 28rem),
+                                                        repeating-linear-gradient(135deg, rgba(0,39,76,0.03) 0 1px, transparent 1px 28px);
+                }
+                </style>
+                """
+                st.markdown(light_override_css, unsafe_allow_html=True)
 
 
 def navigation() -> None:
