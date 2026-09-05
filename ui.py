@@ -176,32 +176,55 @@ def configure_page(title: str) -> None:
 
 
 def navigation() -> None:
-    with st.container(key="sr_nav"):
-        brand, browse, post, verify, policies, theme_col, contact, staff = st.columns(
-            [2.5, 1.1, 1.4, 1.2, 1.0, 0.6, 1.0, 1.0], vertical_alignment="center"
-        )
-        if brand.button("◉ ScholarRadar", key="nav_home", width="stretch"):
-            st.switch_page("app.py")
-        if browse.button("Browse", key="nav_browse", width="stretch"):
-            st.switch_page("app.py")
-        if post.button("Post an opening", key="nav_post", width="stretch"):
-            st.switch_page("pages/1_Post_an_opening.py")
-        if verify.button("Verification", key="nav_verify", width="stretch"):
-            st.switch_page("pages/2_Verification.py")
-        if policies.button("About data", key="nav_policies", width="stretch"):
-            st.switch_page("pages/6_Data_and_policies.py")
-        # Theme toggle (light/dark)
-        theme_now = st.session_state.get("sr_theme", "light")
-        theme_label = "🌙" if theme_now == "light" else "☀️"
-        if theme_col.button(theme_label, key="nav_theme"):
-            st.session_state["sr_theme"] = "dark" if theme_now == "light" else "light"
+    # Make navigation resilient: if Streamlit raises an unexpected error
+    # during layout (sometimes triggered on quick reruns), fall back to a
+    # simple HTML nav to avoid showing the red error page to users.
+    try:
+        with st.container(key="sr_nav"):
+            brand, browse, post, verify, policies, theme_col, contact, staff = st.columns(
+                [2.5, 1.1, 1.4, 1.2, 1.0, 0.6, 1.0, 1.0], vertical_alignment="center"
+            )
+            if brand.button("◉ ScholarRadar", key="nav_home", width="stretch"):
+                st.switch_page("app.py")
+            if browse.button("Browse", key="nav_browse", width="stretch"):
+                st.switch_page("app.py")
+            if post.button("Post an opening", key="nav_post", width="stretch"):
+                st.switch_page("pages/1_Post_an_opening.py")
+            if verify.button("Verification", key="nav_verify", width="stretch"):
+                st.switch_page("pages/2_Verification.py")
+            if policies.button("About data", key="nav_policies", width="stretch"):
+                st.switch_page("pages/6_Data_and_policies.py")
+            # Theme toggle (light/dark)
+            theme_now = st.session_state.get("sr_theme", "light")
+            theme_label = "🌙" if theme_now == "light" else "☀️"
+            if theme_col.button(theme_label, key="nav_theme"):
+                st.session_state["sr_theme"] = "dark" if theme_now == "light" else "light"
 
-        if contact.button("Contact", key="nav_contact", width="stretch"):
-            st.switch_page("pages/7_Contact.py")
-        staff.markdown(
-            '<a class="sr-nav-link" href="/Admin_review">Staff</a>',
+            if contact.button("Contact", key="nav_contact", width="stretch"):
+                st.switch_page("pages/7_Contact.py")
+            staff.markdown(
+                '<a class="sr-nav-link" href="/Admin_review">Staff</a>',
+                unsafe_allow_html=True,
+            )
+    except Exception:
+        # Fallback: render a minimal navigation bar using safe HTML and a
+        # lightweight theme toggle (separate button) so that the app won't
+        # crash when Streamlit's layout internals are in a transient state.
+        st.markdown(
+            """
+            <div style="display:flex;gap:12px;align-items:center;padding:8px 0;">
+              <a class="sr-nav-link" href="/" style="padding:6px 10px;border-radius:6px;background:rgba(255,255,255,0.04);color:inherit;text-decoration:none;">◉ ScholarRadar</a>
+              <a class="sr-nav-link" href="/app" style="padding:6px 10px;border-radius:6px;background:rgba(255,255,255,0.04);color:inherit;text-decoration:none;">Browse</a>
+              <a class="sr-nav-link" href="/pages/6_Data_and_policies.py" style="padding:6px 10px;border-radius:6px;background:rgba(255,255,255,0.04);color:inherit;text-decoration:none;">About data</a>
+              <a class="sr-nav-link" href="/pages/7_Contact.py" style="padding:6px 10px;border-radius:6px;background:rgba(255,255,255,0.04);color:inherit;text-decoration:none;">Contact</a>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
+        # Simple theme toggle button (safe, not inside complex column layout).
+        theme_now = st.session_state.get("sr_theme", "light")
+        if st.button("🌙" if theme_now == "light" else "☀️", key="nav_theme_fallback"):
+            st.session_state["sr_theme"] = "dark" if theme_now == "light" else "light"
 
 
 def demo_opportunities() -> list[dict[str, Any]]:
