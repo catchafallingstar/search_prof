@@ -12,50 +12,61 @@ configure_page("Data and policies")
 navigation()
 account_controls()
 
-st.title("About ScholarRadar data")
-st.write(
-    "ScholarRadar helps students find research-matched faculty and public recruiting "
-    "statements. It does not make admission or employment decisions."
-)
+st.title("About the data")
+st.write("Findings are matched from public researcher metadata and public web pages.")
 
-st.subheader("What the labels mean")
-st.markdown(
-    """
-- **Posted on ScholarRadar**: a role-verified faculty member or university representative submitted the opening, and a moderator approved it.
-- **Hiring signal found online**: ScholarRadar found recruiting language on a page attributed to that professor or laboratory. The original page is the source; the statement may be outdated.
-- **Possible opportunity**: research fit, an early-career appointment, or relevant funding may make outreach worthwhile, but hiring is not confirmed.
-- **Verified faculty**: an official university source supports the person's faculty identity. It does not prove that the person is hiring.
-"""
-)
+col1, col2, col3 = st.columns([1, 1, 1])
 
-st.subheader("Sources and limits")
-st.write(
-    "Research matches use public scholarly metadata, including OpenAlex. Faculty identity, "
-    "funding, and recruiting evidence come from linked public sources. A grant, title, or "
-    "paper does not by itself prove an opening. Always read the original source before contacting a lab."
-)
+with col1:
+        st.markdown(
+                """
+                <div style='display:flex;gap:.75rem;align-items:flex-start'>
+                    <svg width='44' height='44' viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg' aria-hidden='true'>
+                        <rect width='24' height='24' rx='4' fill='#00274c'/>
+                        <path d='M6 13h12M6 9h12M6 17h8' stroke='#ffcb05' stroke-width='1.4' stroke-linecap='round'/>
+                    </svg>
+                    <div>
+                        <strong>Sources & limits</strong>
+                        <div style='color:#506274'>We match public researcher metadata and web pages. Results point to original sources — read them before reaching out.</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+        )
 
-st.subheader("Privacy and acceptable use")
-st.write(
-    "ScholarRadar stores the account and submission information needed for sign-in, role "
-    "verification, moderation, security, and site operation. Do not submit sensitive personal "
-    "information, impersonate another person, scrape the service aggressively, or use the data "
-    "for spam, harassment, or automated mass outreach."
-)
+with col2:
+        st.markdown(
+                """
+                <div style='display:flex;gap:.75rem;align-items:flex-start'>
+                    <svg width='44' height='44' viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg' aria-hidden='true'>
+                        <rect width='24' height='24' rx='4' fill='#00274c'/>
+                        <path d='M8 12h8M8 16h8M12 8v8' stroke='#ffcb05' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/>
+                    </svg>
+                    <div>
+                        <strong>Privacy</strong>
+                        <div style='color:#506274'>We keep account and submission info for verification and moderation. Do not send sensitive personal data.</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+        )
 
-st.subheader("Corrections and removal requests")
-st.write(
-    "If a profile, source, or recruiting statement is inaccurate, include the person's name, "
-    "the ScholarRadar or source URL, and the correction you are requesting."
-)
-contact_email = setting("CONTACT_EMAIL").strip()
-if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", contact_email):
-    subject = quote("ScholarRadar correction or removal request")
-    st.link_button(
-        "Email a correction request",
-        f"mailto:{contact_email}?subject={subject}",
-        type="primary",
-    )
-    st.caption(f"Contact: {contact_email}")
-else:
-    st.warning("The public correction contact must be configured before launch.")
+with col3:
+        st.markdown(
+                """
+                <div style='display:flex;gap:.75rem;align-items:flex-start'>
+                    <svg width='44' height='44' viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg' aria-hidden='true'>
+                        <rect width='24' height='24' rx='4' fill='#00274c'/>
+                        <path d='M7 12h10M7 8h10M7 16h6' stroke='#ffcb05' stroke-width='1.4' stroke-linecap='round'/>
+                    </svg>
+                    <div>
+                        <strong>Corrections & removal</strong>
+                        <div style='color:#506274'>Want something changed or removed? Email <a href='mailto:phdfighting@gmail.com'>phdfighting@gmail.com</a> with the name and URL.</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+        )
+
+st.markdown("---")
+st.caption("If you need help with the site or want to report a problem, use the Contact page.")

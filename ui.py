@@ -32,6 +32,7 @@ def configure_page(title: str) -> None:
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
         :root {
           --sr-blue: #00274c;
           --sr-blue-strong: #001b33;
@@ -43,10 +44,13 @@ def configure_page(title: str) -> None:
           --sr-surface: #ffffff;
           --sr-cyan: #007c91;
         }
-        [data-testid="stAppViewContainer"] {
-          background: radial-gradient(circle at 88% -8%, #d7ebfb 0, transparent 27rem), #f6f9fc;
-          color: var(--sr-ink);
-        }
+                [data-testid="stAppViewContainer"] {
+                    background-color: #f6f9fc;
+                    background-image: radial-gradient(circle at 88% -8%, rgba(215,235,251,.65) 0, transparent 28rem),
+                                                        repeating-linear-gradient(135deg, rgba(0,39,76,0.03) 0 1px, transparent 1px 28px);
+                    background-blend-mode: overlay, normal;
+                    color: var(--sr-ink);
+                }
         [data-testid="stHeader"] { background: rgba(246,249,252,.92); }
         [data-testid="stSidebar"] { display: none; }
         /* The app does not use Streamlit's sidebar, so its expand arrow would
@@ -114,18 +118,23 @@ def configure_page(title: str) -> None:
           color: var(--sr-blue-strong);
           transform: none;
         }
-        .sr-hero {
-          position: relative; overflow: hidden; text-align: center;
-          padding: 4rem 1rem 2.15rem; border-bottom: 1px solid var(--sr-line);
-        }
-        .sr-hero::before, .sr-hero::after {
-          content: ""; position: absolute; width: 16rem; height: 16rem;
-          border: 1px solid rgba(0,39,76,.16); border-radius: 50%; pointer-events: none;
-        }
-        .sr-hero::before { left: -11rem; top: .25rem; }
-        .sr-hero::after { right: -10rem; bottom: -12rem; }
+                .sr-hero {
+                    position: relative; overflow: visible; text-align: center;
+                    padding: 4rem 1rem 2.15rem; border-bottom: 1px solid var(--sr-line);
+                }
+                /* Decorative curves removed for a cleaner, technical layout. */
+                .sr-hero .tech-grid {
+                    position: absolute; inset: 0; pointer-events: none; opacity: .18;
+                    background-image: linear-gradient(90deg, rgba(255,203,5,.02) 1px, transparent 1px), linear-gradient(rgba(0,39,76,.02) 1px, transparent 1px);
+                    background-size: 28px 28px, 28px 28px;
+                    mix-blend-mode: multiply;
+                }
         .sr-kicker { color: var(--sr-cyan); font-weight: 800; letter-spacing: .12em; font-size: .78rem; }
-        .sr-hero h1 { max-width: 830px; margin: .6rem auto .9rem; color: var(--sr-blue); font-size: clamp(2.5rem, 5vw, 4.35rem); letter-spacing: -.04em; line-height: 1.02; }
+        .sr-hero .sr-logo { display:inline-flex; align-items:center; gap:.75rem; justify-content:center; }
+        .sr-hero .sr-mark { width:48px; height:48px; display:inline-block; border-radius:8px; background: linear-gradient(180deg, var(--sr-blue) 0%, #003a6b 100%); box-shadow: 0 6px 18px rgba(0,39,76,.12); }
+        .sr-hero h1 { font-family: 'Space Grotesk', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; max-width: 880px; margin: .6rem auto .6rem; color: var(--sr-blue); font-size: clamp(2.1rem, 5vw, 3.6rem); letter-spacing: -.02em; line-height: 1.05; font-weight:700; }
+        .sr-title-accent { color: var(--sr-maize); font-weight:800; padding-left:.25rem; }
+        .sr-hero p { max-width: 740px; margin: 0 auto; color: var(--sr-muted); font-size: 1.02rem; line-height: 1.45; }
         .sr-hero p { max-width: 690px; margin: 0 auto; color: var(--sr-muted); font-size: 1.1rem; line-height: 1.55; }
         div[data-testid="stVerticalBlockBorderWrapper"] { background: var(--sr-surface); border-color: var(--sr-line); box-shadow: 0 8px 24px rgba(0,39,76,.06); }
         .sr-evidence { color: var(--sr-muted); font-size: .86rem; }
@@ -192,19 +201,21 @@ def configure_page(title: str) -> None:
 
 def navigation() -> None:
     with st.container(key="sr_nav"):
-        brand, browse, post, verify, policies, staff = st.columns(
-            [2.5, 1.2, 1.6, 1.4, 1.4, 1.1], vertical_alignment="center"
+        brand, browse, post, verify, policies, contact, staff = st.columns(
+            [2.5, 1.1, 1.4, 1.2, 1.2, 1.0, 1.1], vertical_alignment="center"
         )
         if brand.button("◉ ScholarRadar", key="nav_home", width="stretch"):
             st.switch_page("app.py")
         if browse.button("Browse", key="nav_browse", width="stretch"):
             st.switch_page("app.py")
-        if post.button("Post an opening", key="nav_post", width="stretch"):
+        if post.button("Add entry", key="nav_post", width="stretch"):
             st.switch_page("pages/1_Post_an_opening.py")
         if verify.button("Verification", key="nav_verify", width="stretch"):
             st.switch_page("pages/2_Verification.py")
         if policies.button("About data", key="nav_policies", width="stretch"):
             st.switch_page("pages/6_Data_and_policies.py")
+        if contact.button("Contact", key="nav_contact", width="stretch"):
+            st.switch_page("pages/7_Contact.py")
         staff.markdown(
             '<a class="sr-nav-link" href="/Admin_review">Staff</a>',
             unsafe_allow_html=True,

@@ -29,14 +29,20 @@ navigation()
 account_controls()
 
 st.markdown(
-    """
-    <section class="sr-hero">
-      <div class="sr-kicker">OPPORTUNITY-FIRST PhD SEARCH</div>
-      <h1>Find labs that are actively looking for people like you</h1>
-      <p>Search verified faculty, posted openings, and hiring statements found online.</p>
-    </section>
-    """,
-    unsafe_allow_html=True,
+        """
+        <section class="sr-hero" role="banner" aria-label="ScholarRadar hero">
+            <div class="sr-logo" aria-hidden="true">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
+                    <circle cx="12" cy="12" r="10" fill="#00274c" />
+                    <path d="M12 6v6l4 2" stroke="#ffcb05" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                    <circle cx="12" cy="12" r="2" fill="#ffcb05" />
+                </svg>
+            </div>
+            <h1>ScholarRadar<span class="sr-title-accent"> — Active Opportunities</span></h1>
+            <p>Find labs actively recruiting PhD students and postdocs — verified openings and public signals.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
 )
 
 saved_search = st.session_state.get(
@@ -279,7 +285,7 @@ def render_radar_panel(
                 None,
             ),
         ]
-        for categories, heading, explanation in category_sections:
+        for idx, (categories, heading, explanation) in enumerate(category_sections):
             rows = [
                 row
                 for row in radar_professors
@@ -287,7 +293,10 @@ def render_radar_panel(
             ]
             if not rows:
                 continue
-            st.markdown(f"#### {heading} ({len(rows)})")
+            st.markdown(
+                f'<h3 class="sr-section-heading" id="section-{idx}" aria-level="3">{heading} ({len(rows)})</h3>',
+                unsafe_allow_html=True,
+            )
             if explanation:
                 st.caption(explanation)
             columns = st.columns(2)
