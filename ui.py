@@ -33,6 +33,49 @@ def configure_page(title: str) -> None:
         """
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
+        # Theme overrides (dark/light) controlled by `st.session_state['sr_theme']`.
+        theme = st.session_state.get("sr_theme", "light")
+        if theme == "dark":
+                st.markdown(
+                        """
+                        <style>
+                        :root {
+                            --sr-blue: #a8d3ff;
+                            --sr-blue-strong: #9cd7ff;
+                            --sr-blue-soft: #062434;
+                            --sr-maize: #ffcb05;
+                            --sr-ink: #eaf6ff;
+                            --sr-muted: #9fb7c8;
+                            --sr-line: rgba(120,160,200,.12);
+                            --sr-surface: #07121a;
+                            --sr-cyan: #4fd4e6;
+                        }
+                        [data-testid="stAppViewContainer"] {
+                            background-color: #041423;
+                            background-image: radial-gradient(circle at 10% 10%, rgba(0,120,150,.06) 0, transparent 20rem),
+                                                                repeating-linear-gradient(135deg, rgba(255,255,255,0.02) 0 1px, transparent 1px 28px);
+                            color: var(--sr-ink);
+                        }
+                        .sr-hero { border-bottom-color: rgba(255,255,255,.04); }
+                        h1, h2, h3 { color: var(--sr-ink); }
+                        .sr-hero::before, .sr-hero::after { display:none; }
+                        </style>
+                        """,
+                        unsafe_allow_html=True,
+                )
+        else:
+                st.markdown(
+                        """
+                        <style>
+                        /* Light theme tech background tweak */
+                        [data-testid="stAppViewContainer"] {
+                            background-image: radial-gradient(circle at 88% -8%, rgba(215,235,251,.65) 0, transparent 28rem),
+                                                                repeating-linear-gradient(135deg, rgba(0,39,76,0.03) 0 1px, transparent 1px 28px);
+                        }
+                        </style>
+                        """,
+                        unsafe_allow_html=True,
+                )
         :root {
           --sr-blue: #00274c;
           --sr-blue-strong: #001b33;
@@ -201,19 +244,26 @@ def configure_page(title: str) -> None:
 
 def navigation() -> None:
     with st.container(key="sr_nav"):
-        brand, browse, post, verify, policies, contact, staff = st.columns(
-            [2.5, 1.1, 1.4, 1.2, 1.2, 1.0, 1.1], vertical_alignment="center"
+        brand, browse, post, verify, policies, theme_col, contact, staff = st.columns(
+            [2.5, 1.1, 1.4, 1.2, 1.0, 0.6, 1.0, 1.0], vertical_alignment="center"
         )
         if brand.button("◉ ScholarRadar", key="nav_home", width="stretch"):
             st.switch_page("app.py")
         if browse.button("Browse", key="nav_browse", width="stretch"):
             st.switch_page("app.py")
-        if post.button("Add entry", key="nav_post", width="stretch"):
+        if post.button("Post an opening", key="nav_post", width="stretch"):
             st.switch_page("pages/1_Post_an_opening.py")
         if verify.button("Verification", key="nav_verify", width="stretch"):
             st.switch_page("pages/2_Verification.py")
         if policies.button("About data", key="nav_policies", width="stretch"):
             st.switch_page("pages/6_Data_and_policies.py")
+        # Theme toggle (light/dark)
+        theme_now = st.session_state.get("sr_theme", "light")
+        theme_label = "🌙" if theme_now == "light" else "☀️"
+        if theme_col.button(theme_label, key="nav_theme"):
+            st.session_state["sr_theme"] = "dark" if theme_now == "light" else "light"
+            st.experimental_rerun()
+
         if contact.button("Contact", key="nav_contact", width="stretch"):
             st.switch_page("pages/7_Contact.py")
         staff.markdown(

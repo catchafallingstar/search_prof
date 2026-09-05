@@ -38,8 +38,8 @@ st.markdown(
                     <circle cx="12" cy="12" r="2" fill="#ffcb05" />
                 </svg>
             </div>
-            <h1>ScholarRadar<span class="sr-title-accent"> — Active Opportunities</span></h1>
-            <p>Find labs actively recruiting PhD students and postdocs — verified openings and public signals.</p>
+            <h1>ScholarRadar<span class="sr-title-accent"> — Active Openings</span></h1>
+            <p>Verified faculty openings and public hiring signals.</p>
         </section>
         """,
         unsafe_allow_html=True,
