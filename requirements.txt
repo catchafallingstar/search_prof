@@ -10,3 +10,7 @@ Pillow>=11,<13
 ddgs>=9,<10
 Flask>=2.0,<3
 Flask-Cors>=3.0,<4
+SQLAlchemy
+psycopg2-binary
+Flask>=2.0,<3
+Flask-Cors>=3.0,<4
