@@ -1277,14 +1277,57 @@ def _explicit_role_currentness(text: str) -> str:
     return "CURRENT"
 
 
+def _primary_faculty_appointment_context(
+    context: str, role: re.Match | None
+) -> str:
+    if role is None:
+        return ""
+    role_context = context[role.start():role.end() + 320]
+    return re.split(
+        r"\band\s+(?:an?\s+)?(?:adjunct|assistant|associate|full|visiting|clinical|research)?\s*professor\b",
+        role_context,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+
+
+def _role_institution_continuity(
+    expected_institution: str, context: str, role: re.Match | None
+) -> bool:
+    """Require the institution inside the candidate's current faculty clause."""
+    primary_appointment = _primary_faculty_appointment_context(context, role)
+    return bool(
+        expected_institution
+        and primary_appointment
+        and _institution_continuity(expected_institution, "", primary_appointment)
+    )
+
+
 def _non_us_faculty_claim(context: str, url: str, role: re.Match | None) -> bool:
     domain = _edu_domain(url) or _host_domain(url)
     if re.search(r"\.(?:edu|ac)\.(?!us$)[a-z]{2}$", domain, re.I):
         return True
     if role is None:
         return False
-    role_context = context[max(0, role.start() - 80):role.end() + 240]
-    return bool(NON_US_LOCATION_PATTERN.search(role_context))
+    # Scope belongs to the appointment attached to this title. A biography can
+    # list a US primary professorship followed by a separate overseas adjunct
+    # appointment; the latter must not relabel the former.
+    primary_appointment = _primary_faculty_appointment_context(context, role)
+    if re.search(r"\b(?:USA|U\.S\.A\.|United States)\b", primary_appointment, re.I):
+        return False
+    return bool(NON_US_LOCATION_PATTERN.search(primary_appointment))
+
+
+def _explicit_transition_corroborates(
+    expected_institution: str, context: str, title_match: re.Match | None
+) -> bool:
+    """Accept an exact-name official profile that explicitly documents a move."""
+    return bool(
+        title_match
+        and expected_institution
+        and NEW_FACULTY_PATTERN.search(context)
+        and _institution_continuity(expected_institution, "", context)
+    )
 
 
 def _linkedin_headline(name: str, result: dict[str, Any]) -> str:
@@ -1348,7 +1391,10 @@ def _linkedin_identity_linked(
         folded = fold_name_text(clue)
         if folded and folded in summary:
             return True
-    field = next((str(paper.get("matched_query") or "") for paper in candidate.get("recent_papers") or []), "")
+    field = next(
+        (str(paper.get("matched_query") or "") for paper in candidate.get("recent_papers") or []),
+        str(candidate.get("_research_area") or ""),
+    )
     field_tokens = {token for token in name_tokens(field) if len(token) >= 5}
     if field_tokens and len(field_tokens.intersection(set(summary.split()))) >= min(2, len(field_tokens)):
         return True
@@ -1934,6 +1980,13 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
         and role_is_person_specific
         and _paper_identity_link(candidate, page_text, "")
     )
+    explicit_transition_corroborated = bool(
+        role_is_person_specific
+        and not same_current_institution
+        and _explicit_transition_corroborates(
+            expected_institution, context, title_match
+        )
+    )
     appointment_date, appointment_precision = _extract_appointment_date(context)
     latest_paper_year = max(
         (int(paper.get('publication_year') or 0) for paper in candidate.get('recent_papers') or []),
@@ -1947,7 +2000,8 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
         and (not latest_paper_year or appointment_date.year >= latest_paper_year)
     )
     if title_match and role_is_person_specific and (
-        same_current_institution or paper_corroborated or move_corroborated or dated_move_corroborated
+        same_current_institution or paper_corroborated or move_corroborated
+        or dated_move_corroborated or explicit_transition_corroborated
     ):
         appointment_year = _extract_appointment_year(context)
         return {
@@ -1967,6 +2021,8 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
                     else (
                         "official_directory_dated_move"
                         if dated_move_corroborated and not same_current_institution
+                        else "official_directory_explicit_transition"
+                        if explicit_transition_corroborated
                         else "official_directory"
                     )
                 )
@@ -1982,7 +2038,13 @@ def _inspect_faculty_result(candidate: dict[str, Any], result: dict[str, Any]) -
                     "OpenAlex affiliation records at both the previous and current "
                     "institutions."
                     if move_corroborated
-                    else evidence_context
+                    else (
+                        "The exact-name official faculty profile explicitly documents "
+                        "a new appointment and connects the person to the imported "
+                        "prior institution."
+                        if explicit_transition_corroborated
+                        else evidence_context
+                    )
                 )
             ),
             "appointment_year": appointment_year,
@@ -2139,7 +2201,16 @@ def _inspect_researcher_profile_result(candidate, result):
     organization_owned_profile = bool(
         title_match and host_key and len(host_key) >= 5 and host_key in employer_key
     )
-    identity_linked = paper_linked or official_link or career_continuity
+    role_institution_linked = bool(
+        title_match
+        and profile_identity
+        and result.get("_known_profile")
+        and _role_institution_continuity(institution, context, title_match)
+    )
+    identity_linked = (
+        paper_linked or official_link or career_continuity
+        or role_institution_linked
+    )
     common = {
         "source_url": url,
         "source_domain": host,
@@ -2256,7 +2327,7 @@ def _inspect_researcher_profile_result(candidate, result):
                     "evidence_text": f"Paper/imported university: {institution}. Researcher page states a faculty role at {observed[0]} and contains a matching paper. Staff review is required; automatic retries stop."}
     # Personal-page positives require a university attached to the role, not
     # merely the old institution appearing somewhere in the page.
-    continuity = (len(observed) == 1 and _institution_similarity(institution, observed[0]) >= 0.5) or bool(
+    continuity = role_institution_linked or (len(observed) == 1 and _institution_similarity(institution, observed[0]) >= 0.5) or bool(
         negative_match and not title_match and not observed and
         _institution_continuity(institution, '', context) and identity_linked)
     if title_match and current_nonfaculty and continuity and identity_linked:
@@ -2371,8 +2442,11 @@ def _verify_faculty_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     audit_log.emit('identity_affiliation', university=institution,
                    evidence=(audit or {}).get('affiliation_evidence', []))
     audit_log.remaining_seconds()
-    field = next((str(paper.get("matched_query") or "").strip()
-                  for paper in candidate.get("recent_papers") or [] if paper.get("matched_query")), "")
+    field = next(
+        (str(paper.get("matched_query") or "").strip()
+         for paper in candidate.get("recent_papers") or [] if paper.get("matched_query")),
+        str(candidate.get("_research_area") or "").strip(),
+    )
     # Known profile URLs and bounded evidence are checked before web search.
     institution_queries: list[str] = []
     institution_domain = str(candidate.get("institution_domain") or "").strip()
@@ -3320,7 +3394,10 @@ def _save_result(candidate: dict[str, Any], result: dict[str, Any]) -> None:
 def verify_faculty_candidates(
     professor_ids: list[int],
     max_candidates: int | None = None,
-    *, direct_only: bool = False, retry_after_seconds: int = 60,
+    *,
+    research_area: str = "",
+    direct_only: bool = False,
+    retry_after_seconds: int = 60,
     cache_max_age_days: int = 30,
 ) -> dict[str, Any]:
     """Verify a bounded set and return only candidates allowed in public results."""
@@ -3420,6 +3497,8 @@ def verify_faculty_candidates(
             deferred_delays.append(max(1, int((candidate["identity_retry_at"] - now).total_seconds())))
             continue
         candidate["_direct_only"] = direct_only
+        if research_area.strip():
+            candidate["_research_area"] = research_area.strip()
         candidate["_search_retry_seconds"] = retry_after_seconds
         pending.append(candidate)
 

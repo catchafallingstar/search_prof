@@ -56,6 +56,9 @@ INSTITUTIONS = (
     ('American University', 'american.edu', ()),
     ('University of Colorado Boulder', 'colorado.edu', ('University of Colorado at Boulder',)),
     ('Drexel University', 'drexel.edu', ()),
+    ('Texas A&M University', 'tamu.edu',
+     ('Texas A&M University-College Station',
+      'Texas A&M University, College Station')),
 )
 
 # Explicit parent/campus continuity used only for affiliation matching. These
