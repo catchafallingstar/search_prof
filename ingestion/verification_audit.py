@@ -6,6 +6,7 @@ import json
 import time
 from urllib.parse import urlparse
 from settings import setting_bool
+from ingestion.event_log import write_event
 
 CURRENT = ContextVar('faculty_verification_audit', default=None)
 
@@ -44,9 +45,9 @@ def emit(event, **details):
     if audit is None or not setting_bool('FACULTY_IDENTITY_VERBOSE_LOG', True):
         return
     # JSON encoding prevents untrusted snippets injecting fake terminal lines.
-    print(json.dumps({'timestamp': datetime.now(timezone.utc).isoformat(),
+    write_event({'timestamp': datetime.now(timezone.utc).isoformat(),
                       'event': event, 'candidate': audit.get('candidate_name'),
-                      'field': audit.get('field'), **details}, ensure_ascii=True, default=str), flush=True)
+                      'field': audit.get('field'), **details})
 
 
 def finish(audit, decision):

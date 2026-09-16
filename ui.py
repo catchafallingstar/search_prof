@@ -296,7 +296,6 @@ _NON_INSTITUTIONAL_PROFILE_HOSTS = {
     "google.com",
     "linkedin.com",
     "medium.com",
-    "orcid.org",
     "researchgate.net",
     "scholar.google.com",
     "twitter.com",
@@ -410,6 +409,20 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
             year = f" ({row['latest_paper_year']})" if row.get("latest_paper_year") else ""
             st.write(f"**Recent matching paper:** {row['latest_paper_title']}{year}")
             st.caption(f"Matching papers: {row.get('matching_papers') or 0}")
+        elif row.get("evidence_basis") == "RESEARCH_INTEREST":
+            interests = str(row.get("interest_summary") or "").strip()
+            st.write("**Possible research areas · Low confidence:**")
+            for interest in [value.strip() for value in interests.split("•") if value.strip()]:
+                st.write(f"- {interest}")
+            st.caption(
+                "No direct interest found. Possible research areas created by AI; "
+                "no papers found. These suggestions are unverified."
+                if row.get("interests_ai_generated") else
+                "No papers found. Possible research areas based on the professor’s website."
+            )
+            source = str(row.get("interest_source_url") or "")
+            if is_http_url(source) and not row.get("interests_ai_generated"):
+                st.link_button("View research-interest source", source, width="stretch")
         if row.get("grant_title"):
             st.write(f"**Active grant:** {row['grant_title']} — {row.get('funder') or 'public funder'}")
         elif row.get("grant_sources_checked"):
@@ -435,32 +448,49 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
             st.caption("Hiring: not checked yet")
 
         gpa_policy = str(row.get("lab_gpa_policy") or "not_stated")
-        if row.get("hiring_refresh_needed") or row.get("hiring_check_pending"):
-            st.write("**Lab GPA:** Checking public pages…")
+        lab_gpa_status = str(row.get("lab_gpa_check_status") or "NOT_CHECKED")
+        if lab_gpa_status == "SOURCE_UNAVAILABLE":
+            st.write("**Lab GPA policy:** Official page could not be checked")
         elif gpa_policy == "no_lab_cutoff":
-            st.write("**Lab GPA:** No lab minimum stated by the source")
+            st.write("**Lab GPA policy:** The lab explicitly states that it has no GPA cutoff")
         elif gpa_policy == "holistic_review":
-            st.write("**Lab GPA:** Holistic review stated by the source")
+            st.write("**Lab GPA policy:** Holistic review stated by the lab")
         elif gpa_policy == "minimum" and row.get("lab_gpa_minimum") is not None:
-            st.write(f"**Lab GPA:** Minimum {float(row['lab_gpa_minimum']):.2f}")
+            st.write(f"**Lab GPA policy:** Minimum {float(row['lab_gpa_minimum']):.2f}")
         elif gpa_policy == "exceptions_considered":
-            st.write("**Lab GPA:** Exceptions may be considered")
-        elif row.get("gpa_last_checked_at"):
-            st.write("**Lab GPA:** Not stated on the pages checked")
+            st.write("**Lab GPA policy:** Exceptions may be considered")
+        elif lab_gpa_status == "NOT_STATED":
+            st.write("**Lab GPA policy:** Not stated on the professor’s lab or faculty pages")
         else:
-            st.write("**Lab GPA:** Not checked yet")
+            st.write("**Lab GPA policy:** Not checked yet")
         if row.get("lab_gpa_evidence_text"):
             st.caption(f"GPA evidence: {row['lab_gpa_evidence_text']}")
-        if row.get("program_gpa_minimum") is not None:
-            st.write(f"**Graduate-program minimum found:** {float(row['program_gpa_minimum']):.2f}.")
+        program_policy = str(row.get("program_gpa_policy") or "NOT_CHECKED")
+        program_minimum = row.get("official_program_gpa_minimum")
+        if program_policy == "HARD_MINIMUM" and program_minimum is not None:
+            st.write(f"**Graduate-program requirement:** Minimum GPA {float(program_minimum):.2f}")
+        elif program_policy == "RECOMMENDED" and program_minimum is not None:
+            st.write(f"**Graduate-program guidance:** GPA {float(program_minimum):.2f} recommended")
+        elif program_policy == "NO_FORMAL_MINIMUM":
+            st.write("**Graduate-program requirement:** Official page states no formal GPA minimum")
+        elif program_policy == "HOLISTIC_REVIEW":
+            st.write("**Graduate-program requirement:** Official page describes holistic review")
+        elif program_policy == "NOT_STATED":
+            st.write("**Graduate-program requirement:** Not stated on the official admission page checked")
+        elif program_policy == "SOURCE_UNAVAILABLE":
+            st.write("**Graduate-program requirement:** Official admission source unavailable")
+        else:
+            st.write("**Graduate-program requirement:** Not checked yet")
+        if row.get("program_gpa_evidence_text"):
+            st.caption(f"Program GPA evidence: {row['program_gpa_evidence_text']}")
         links = [
             ("Open source page", row.get("hiring_source_url")),
             ("Check GPA source", row.get("lab_gpa_source_url")),
+            ("Official program GPA source", row.get("official_program_gpa_source_url")),
             ("Official faculty page", row.get("faculty_source_url")),
             ("View active grant", row.get("grant_url")),
             ("Professor/lab page", row.get("homepage_url")),
             ("Recent paper", row.get("latest_paper_url")),
-            ("OpenAlex profile", row.get("openalex_id")),
         ]
         for label, url in links:
             if is_http_url(str(url or "")):

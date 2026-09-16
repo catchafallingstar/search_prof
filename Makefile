@@ -1,14 +1,17 @@
-.PHONY: help setup start worker worker-once rebuild-topics topic-status seed-topics seed-catalog production-check test db-up db-down db-logs search-up search-logs search-test schema backup owner radar
+.PHONY: help setup start worker worker-once initialize-universities reset-university-data rebuild-topics topic-status seed-topics seed-catalog backfill-classification production-check test db-up db-down db-logs search-up search-logs search-test schema backup owner
 
 help:
 	@echo "ScholarRadar local commands"
 	@echo "  make setup    Install Python packages, start PostgreSQL, apply schema, create owner, test"
 	@echo "  make start    Start PostgreSQL, the worker, Streamlit (SearXNG only when enabled)"
 	@echo "  make worker   Run a standalone worker (do not combine with make start locally)"
+	@echo "  make initialize-universities  Queue the first university discovery batch"
+	@echo "  make reset-university-data  Clear derived academic data after a backup"
 	@echo "  make rebuild-topics  Queue outdated topics for exact-evidence rebuilding"
 	@echo "  make topic-status    Show version and exact-evidence rebuild progress"
 	@echo "  make seed-catalog    List the controlled research-area catalog"
 	@echo "  make seed-topics     Queue the next 20 low-priority catalog jobs"
+	@echo "  make backfill-classification  Queue existing papers for abstract/category processing"
 	@echo "  make production-check  Check launch-critical configuration and services"
 	@echo "  make test     Run unit, database, and Streamlit smoke tests"
 	@echo "  make db-up    Start local PostgreSQL"
@@ -32,6 +35,12 @@ worker:
 worker-once:
 	.venv/bin/python -m scripts.run_worker --once
 
+initialize-universities:
+	.venv/bin/python -m scripts.initialize_university_pipeline --limit 20
+
+reset-university-data:
+	.venv/bin/python -m scripts.reset_university_pipeline --execute --confirm RESET_UNIVERSITY_PIPELINE
+
 rebuild-topics:
 	.venv/bin/python -m scripts.rebuild_topics
 
@@ -43,6 +52,9 @@ seed-catalog:
 
 seed-topics:
 	.venv/bin/python -m scripts.seed_topics --queue --limit 20
+
+backfill-classification:
+	.venv/bin/python -m scripts.backfill_research_classification
 
 production-check:
 	.venv/bin/python -m scripts.check_production
@@ -76,6 +88,3 @@ backup:
 
 owner:
 	.venv/bin/python -m scripts.bootstrap_owner
-
-radar:
-	.venv/bin/python -m scripts.run_radar "$(AREA)"

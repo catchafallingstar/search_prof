@@ -28,7 +28,7 @@ def text_url_leads(text):
 
 
 NON_PROFILE_HOSTS = (
-    'researchgate.net', 'semanticscholar.org', 'openalex.org', 'dblp.org', 'dblp.uni-trier.de',
+    'researchgate.net', 'semanticscholar.org', 'dblp.org', 'dblp.uni-trier.de',
     'acm.org', 'ieee.org', 'springer.com', 'sciencedirect.com', 'wikipedia.org',
     'youtube.com', 'facebook.com', 'x.com', 'twitter.com', 'amazon.com', 'rsc.org',
     'ratemyprofessors.com', 'myprofessorreviews.com', 'myprofreviews.com', 'bokus.com', 'bnf.fr',

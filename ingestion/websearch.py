@@ -212,15 +212,23 @@ def _brave_search(
 
 
 def _fallback_search(query: str, max_results: int) -> list[dict[str, Any]]:
-    """Use DDGS without holding a process-wide lock during the network call."""
+    """Use the free DDGS provider without holding a process-wide lock during the network call."""
     proxy_url = setting("ROTATING_PROXY_URL")
     kwargs: dict[str, object] = {
         "timeout": setting_int("SEARCH_PROVIDER_TIMEOUT_SECONDS", 8, 3, 30)
     }
     if proxy_url:
         kwargs["proxy"] = proxy_url
+    # ``auto`` remains entirely inside the DDGS library; it does not call this
+    # application's paid SearchAPI, Parallel, Brave, or Tavily providers. It
+    # lets DDGS choose a currently responsive free backend when DuckDuckGo is
+    # empty or temporarily unavailable. Set DDGS_BACKEND=duckduckgo to require
+    # DuckDuckGo only.
+    backend = setting("DDGS_BACKEND").strip() or "auto"
+    client = DDGS(**kwargs)
+    client.threads = 1
     try:
-        items = list(DDGS(**kwargs).text(query, max_results=max_results, backend="duckduckgo"))
+        items = list(client.text(query, max_results=max_results, backend=backend))
     except Exception as error:
         # DDGS raises an exception for some valid zero-result queries. A narrow
         # professor search returning nothing is not an upstream outage and must
@@ -333,6 +341,9 @@ def _parallel_search(query: str, max_results: int, api_key: str) -> list[dict[st
 
 
 def _provider_names() -> list[str]:
+    # Paid providers require an explicit opt-in; stored API keys are not consent.
+    if setting_bool("SEARCH_FREE_ONLY", True):
+        return ["ddgs"]
     configured = [
         value.strip().casefold()
         for value in setting("SEARCH_PROVIDERS").split(",")
@@ -392,16 +403,35 @@ def search_provider_runtime_state() -> dict[str, Any]:
     blocked = {provider: max(_persistent_block_remaining(provider), int(capacity[provider]["retry_after_seconds"]))
                for provider in providers}
     available = [provider for provider, seconds in blocked.items() if seconds <= 0]
+    # Normal pacing is healthy capacity: identity jobs may enter the provider
+    # queue and wait. Quotas, database failures and upstream cooldowns are not.
+    waitable = [
+        provider for provider in providers
+        if capacity[provider].get('reason') == 'Waiting for the next search slot'
+        and 0 < blocked[provider] <= 120
+        and _persistent_block_remaining(provider) <= 0
+    ]
     waits = [seconds for seconds in blocked.values() if seconds > 0]
     return {
         "providers": providers,
         "capacity": capacity,
         "available": available,
+        "waitable": waitable,
         "blocked": {
             provider: seconds for provider, seconds in blocked.items() if seconds > 0
         },
         "retry_after_seconds": min(waits) if waits else 0,
     }
+
+
+def identity_search_can_run(state: dict[str, Any]) -> bool:
+    """Start search-capable jobs only when a provider slot is available.
+
+    Pacing is handled by the durable queue.  Treating a future slot as runnable
+    causes every queued enrichment job to start, discover the same wait, and
+    either defer or incorrectly finish without having searched.
+    """
+    return bool(state.get("available"))
 
 
 def configured_search_providers() -> list[dict[str, str]]:
@@ -414,6 +444,8 @@ def configured_search_providers() -> list[dict[str, str]]:
 
 
 def _provider_limit(provider: str) -> int:
+    if provider == 'ddgs':
+        return 1
     return setting_int(f"{provider.upper()}_MAX_CONCURRENCY", 1, 1, 8)
 
 
@@ -574,13 +606,36 @@ def _run_provider(
         "tavily": lambda: _tavily_search(query, max_results, setting("TAVILY_API_KEY").strip()),
     }
     semaphore = _provider_semaphore(provider)
-    if not semaphore.acquire(blocking=False):
-        raise SearchProviderUnavailable(f"{provider} is serving another candidate", 2)
+    # Candidate verification intentionally overlaps page inspection with the
+    # next candidate's search.  A busy one-at-a-time provider is therefore
+    # normal pipeline backpressure, not an upstream outage.  Wait for its slot
+    # instead of deferring the whole candidate as SOURCE_WAIT.
+    acquire_timeout = setting_int(
+        "SEARCH_PROVIDER_QUEUE_TIMEOUT_SECONDS", 300, 5, 600
+    )
+    from ingestion.verification_audit import CURRENT, remaining_seconds, emit, IdentityPassLimit
+    if CURRENT.get() is not None:
+        acquire_timeout = max(0, min(acquire_timeout, remaining_seconds() - 1))
+    if not semaphore.acquire(timeout=acquire_timeout):
+        raise SearchProviderUnavailable(
+            f"{provider} search queue did not become available", 2
+        )
     try:
         try:
             # Another thread or job may have blocked this provider while this
             # request waited for its concurrency slot.
             _assert_provider_available(provider)
+            # Wait for normal pacing while holding this process's provider slot.
+            # Quotas and upstream cooldowns still defer to their real reset time.
+            capacity = provider_capacity(provider)
+            delay = capacity.get("retry_after_seconds", 0)
+            if (capacity.get('reason') == 'Waiting for the next search slot'
+                    and CURRENT.get() is not None and 0 < delay <= 120 and remaining_seconds() > delay + 1):
+                emit("identity_search_pacing", provider=provider, seconds=delay)
+                deadline = time.monotonic() + delay + 0.05
+                while time.monotonic() < deadline:
+                    time.sleep(min(1, deadline - time.monotonic()))
+                remaining_seconds()
             if provider == "tavily":
                 check_tavily_quota()
             elif provider == "searchapi":
@@ -608,6 +663,8 @@ def _run_provider(
             raise SearchProviderUnavailable(str(error), error.retry_after_seconds) from error
         except SearchProviderUnavailable:
             raise
+        except IdentityPassLimit:
+            raise
         except Exception as error:
             # Record the cooldown before releasing the provider semaphore.
             # Waiting threads will then stop at their second availability
@@ -625,7 +682,7 @@ def _run_provider(
 def _cache_key(query: str, max_results: int) -> str:
     normalized = " ".join(query.casefold().split())
     # A newly enabled provider must not inherit a different provider's empty query.
-    pool = ",".join(_provider_names()) + "|" + _provider_strategy()
+    pool = ",".join(_provider_names()) + "|" + _provider_strategy() + "|" + (setting('DDGS_BACKEND').strip() or 'auto')
     return hashlib.sha256(f"{pool}|{normalized}|{max_results}".encode("utf-8")).hexdigest()
 
 
@@ -836,6 +893,5 @@ def search_web(query: str, max_results: int = 3) -> list[dict[str, Any]]:
     # Existing cached responses remain reusable; other search callers still cache.
     from ingestion.verification_audit import CURRENT
     identity_audit = CURRENT.get()
-    if identity_audit is None or identity_audit.get('version', 1) < 2:
-        _write_cache(query, max_results, results, used)
+    _write_cache(query, max_results, results, used)
     return results

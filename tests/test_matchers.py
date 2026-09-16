@@ -12,6 +12,22 @@ class HiringMatcherTests(unittest.TestCase):
         text = "I am not accepting PhD students this year."
         self.assertFalse(is_valid_signal_text(text))
 
+    def test_rejects_not_taking_students(self) -> None:
+        text = "My group is full and I am not taking new PhD students."
+        self.assertFalse(is_valid_signal_text(text))
+
+    def test_rejects_welcome_for_existing_student(self) -> None:
+        text = "We are thrilled to welcome Jane Doe as a graduate student to our lab."
+        self.assertFalse(is_valid_signal_text(text))
+
+    def test_rejects_administrative_recruit_and_retain_language(self) -> None:
+        text = "Advise, mentor, and help recruit and retain undergraduate and graduate students."
+        self.assertFalse(is_valid_signal_text(text))
+
+    def test_rejects_conditional_future_recruiting(self) -> None:
+        text = "Once funding stabilizes, I will recruit more PhD students."
+        self.assertFalse(is_valid_signal_text(text))
+
     def test_extracts_roles_and_funding(self) -> None:
         roles, funded = extract_roles_and_funding("Seeking a PhD and postdoc, funded by NSF CAREER.")
         self.assertEqual(roles, ["Postdoc", "PhD"])
@@ -24,4 +40,3 @@ class HiringMatcherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

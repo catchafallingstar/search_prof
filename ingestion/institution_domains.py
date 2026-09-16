@@ -2,7 +2,7 @@
 
 This deliberately small seed catalog complements institutions.primary_domain.
 Add full names/aliases, never substring matches (Central Missouri != Missouri).
-No external requests or OpenAlex credits are needed to use these locators.
+No external search requests are needed to use these locators.
 """
 import re
 import unicodedata
@@ -17,6 +17,9 @@ OFFSHORE_SOURCE_PATTERN = (r'^https?://([a-z0-9-]+\.)*('
 
 # canonical institution, official domain, supported exact aliases
 INSTITUTIONS = (
+    ('Columbia University', 'columbia.edu', ('Columbia University in the City of New York',)),
+    ('Virginia Tech', 'vt.edu', ('Virginia Polytechnic Institute and State University',)),
+    ('University of South Carolina-Columbia', 'sc.edu', ('University of South Carolina',)),
     ('Morgan State University', 'morgan.edu', ()),
     ('Stanford University', 'stanford.edu', ()),
     ('Michigan State University', 'msu.edu', ()),
@@ -51,7 +54,18 @@ INSTITUTIONS = (
     ('Rochester Institute of Technology', 'rit.edu', ()),
     ('Lehigh University', 'lehigh.edu', ()),
     ('Western Illinois University', 'wiu.edu', ()),
-    ('Massachusetts Institute of Technology', 'mit.edu', ()),
+    ('Massachusetts Institute of Technology', 'mit.edu', ('MIT - Massachusetts Institute of Technology', 'MIT')),
+    ('University at Albany', 'albany.edu', ('University at Albany, State University of New York', 'SUNY Albany')),
+    ('Florida International University', 'fiu.edu', ('Florida International University in Miami, FL',)),
+    ('Rutgers University', 'rutgers.edu', ('Rutgers, The State University of New Jersey', 'Rutgers University, The State University of New Jersey')),
+    ('University of Pittsburgh', 'pitt.edu', ('University of Pittsburgh-Pittsburgh Campus',)),
+    ('University of Alabama', 'ua.edu', ('The University of Alabama',)),
+    ('North Carolina State University', 'ncsu.edu', ('North Carolina State University at Raleigh',)),
+    ('University of Oklahoma', 'ou.edu', ('University of Oklahoma-Norman Campus',)),
+    ('Purdue University', 'purdue.edu', ('Purdue University-Main Campus', 'Purdue University West Lafayette',)),
+    ('Wichita State University', 'wichita.edu', ('Wichita State University - Kansas',)),
+    ('State University of New York at New Paltz', 'newpaltz.edu', ('The State University of New York at New Paltz', 'SUNY New Paltz')),
+    ('University of Maryland, College Park', 'umd.edu', ('University of Maryland', 'University of Maryland-College Park')),
     ('Georgia Institute of Technology', 'gatech.edu', ('Georgia Tech',)),
     ('American University', 'american.edu', ()),
     ('University of Colorado Boulder', 'colorado.edu', ('University of Colorado at Boulder',)),
@@ -64,6 +78,7 @@ INSTITUTIONS = (
 # Explicit parent/campus continuity used only for affiliation matching. These
 # names remain distinct canonical display names.
 AFFILIATION_EQUIVALENTS = (
+    ('Pennsylvania State University', 'Pennsylvania State University-Penn State Hazleton'),
     ('University of Hawaiʻi at Mānoa', 'University of Hawaii System'),
 )
 
@@ -150,9 +165,15 @@ def canonical_institution(name):
 
 def institutions_equivalent(left, right):
     """Match canonical identities without guessing ambiguous abbreviations."""
+    if key(left) and key(left) == key(right):
+        return True
+    if frozenset((key(left), key(right))) in {
+        frozenset((key(a), key(b))) for a, b in AFFILIATION_EQUIVALENTS
+    }:
+        return True
     left_record, right_record = record_for_name(left), record_for_name(right)
     if left_record or right_record:
-        return bool(left_record and right_record and left_record[0] == right_record[0])
+        return bool(left_record and right_record and key(left_record[0]) == key(right_record[0]))
     left_key, right_key = key(left), key(right)
     if not left_key or not right_key:
         return False
@@ -162,15 +183,9 @@ def institutions_equivalent(left, right):
         frozenset((key(a), key(b))) for a, b in AFFILIATION_EQUIVALENTS
     }:
         return True
-    ignored = {'and', 'at', 'college', 'of', 'school', 'system', 'the', 'university'}
-    left_tokens = {token for token in left_key.split() if token not in ignored}
-    right_tokens = {token for token in right_key.split() if token not in ignored}
-    # A single shared place name is unsafe: University of Washington is not
-    # Washington University in St. Louis; Michigan is not Michigan State.
-    if min(len(left_tokens), len(right_tokens)) < 2:
-        return False
-    union = left_tokens | right_tokens
-    return bool(union and len(left_tokens & right_tokens) / len(union) >= 0.8)
+    # Similar words are not an institution identity. Unknown aliases need an
+    # explicit registry entry; campuses sharing a parent must remain distinct.
+    return False
 
 
 def academic_domain_hint(value):

@@ -1,867 +1,318 @@
 from datetime import datetime, timedelta, timezone
+import json
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import streamlit as st
 
 from auth import account_controls, require_site_admin
 from db import database_is_ready
-from ingestion.websearch import configured_search_providers, search_provider_runtime_state
-from ingestion.verification_audit import safe_source_link
+from ingestion.websearch import search_provider_runtime_state
 from radar_store import (
-    cancel_radar_job,
-    fetch_live_indexing_status,
-    fetch_identity_search_waits,
-    list_radar_operations,
-    recover_stalled_radar_jobs,
-    request_topic_index,
-    review_faculty_identity,
-    retry_radar_job,
-    retry_unresolved_identities,
+    cancel_radar_job, fetch_live_indexing_status, list_radar_operations,
+    recover_stalled_radar_jobs, request_topic_index, retry_radar_job,
+    save_publication_review_candidate, reject_publication_candidate,
+    requeue_unresolved_publication_reviews,
+    save_roster_review_record,
 )
-from settings import setting_bool, setting_int
-from ui import configure_page, is_official_institution_url, navigation
-
+from ui import configure_page, navigation
 
 JOB_LABELS = {
-    "DISCOVER_CANDIDATES": "Find matching researchers",
-    "VERIFY_FACULTY": "Verify faculty identities",
-    "REFRESH_FACULTY": "Recheck faculty identity",
-    "CHECK_GRANTS": "Check grants",
+    "DISCOVER_FACULTY_DIRECTORIES": "Find official faculty pages",
+    "CRAWL_FACULTY_DIRECTORY": "Import approved faculty roster",
+    "MATCH_FACULTY_PUBLICATIONS": "Match faculty publications",
+    "QWEN_REVIEW_PUBLICATION": "Review publication identity with Qwen",
+    "ENRICH_CLASSIFY_PAPER": "Resolve abstract and classify paper",
+    "INDEX_ROSTER_TOPIC": "Match paper evidence to research area",
     "CHECK_HIRING": "Check hiring pages",
-    "ENRICH_PROFESSORS": "Check grants and hiring pages",
-    "REINDEX_RESEARCH": "Update research area",
-}
-
-STATUS_LABELS = {
-    "queued": "Waiting",
-    "running": "Working now",
-    "stalled": "May be stuck",
-    "failed": "Needs attention",
-    "completed": "Finished",
-    "cancelled": "Stopped",
-}
-
-IDENTITY_STATUS_LABELS = {
-    "VERIFIED": "Faculty confirmed",
-    "NOT_FACULTY": "Not an eligible professor",
-    "OUT_OF_SCOPE": "Faculty outside the US-only scope",
-    "CONFLICT": "Identity conflict",
-    "MANUAL_REVIEW": "Needs staff confirmation",
-    "UNVERIFIED": "Not enough evidence",
-}
-
-IDENTITY_METHOD_LABELS = {
-    "official_directory": "Automatic rules",
-    "official_directory_openalex_history": "Official page + affiliation history",
-    "official_directory_publication_link": "Official page + matching publication",
-    "researcher_profile_publication_link": "Researcher page + matching publication",
-    "attributed_current_nonfaculty_profile": "Current nonfaculty role on exact-name profile",
-    "linkedin_no_faculty_headline": "LinkedIn headline + no faculty profile",
-    "k12_organization_no_faculty_profile": "K–12 organization + no university faculty profile",
-    "completed_three_query_no_faculty_profile": "Three searches found no faculty profile",
-    "personal_current_faculty_claim": "Personal faculty claim awaiting official confirmation",
-    "non_us_faculty_profile": "Faculty profile outside US scope",
-    "current_research_institute_faculty_profile": "Current research-institute faculty profile",
-    "official_non_appointment_page": "Official guest/event page - not an appointment",
-    "automatic_search": "Automatic search",
-    "gemini_assisted": "Gemini-assisted extraction",
-    "manual_review": "Staff override",
-}
-
-ACTIVITY_STAGE_LABELS = {
-    "DISCOVER_CANDIDATES": "Extract candidates",
-    "REINDEX_RESEARCH": "Update candidates",
-    "VERIFY_FACULTY": "Verify identity",
-    "REFRESH_FACULTY": "Recheck identity",
     "CHECK_GRANTS": "Check grants",
-    "CHECK_HIRING": "Check hiring signal",
-    "ENRICH_PROFESSORS": "Check grants and hiring",
-}
-
-ACTIVITY_RESULT_LABELS = {
-    "VERIFIED": "Faculty identity verified",
-    "NOT_FACULTY": "Not an eligible professor",
-    "OUT_OF_SCOPE": "Faculty outside the US-only scope",
-    "UNVERIFIED": "Not enough evidence",
-    "CONFLICT": "Conflicting identity evidence",
-    "MANUAL_REVIEW": "Needs staff review",
-    "PRESENT": "Hiring statement found",
-    "NOT_FOUND": "No matching record found",
-    "SOURCE_UNAVAILABLE": "Source unavailable",
-    "NOT_CHECKED": "Not checked",
-    "FOUND": "Relevant grant found",
+    "CHECK_PROGRAM_GPA": "Check graduate-program GPA",
 }
 
 
-def _format_device_time(value) -> str:
+def _local_time(value) -> str:
     if value is None:
         return "Time unavailable"
     try:
-        timezone_name = str(st.context.timezone or "").strip()
-    except Exception:
-        timezone_name = ""
-    try:
-        target_timezone = ZoneInfo(timezone_name) if timezone_name else None
-    except ZoneInfoNotFoundError:
-        target_timezone = None
-    if target_timezone is None:
-        try:
-            offset_minutes = int(st.context.timezone_offset)
-            target_timezone = timezone(-timedelta(minutes=offset_minutes))
-        except (AttributeError, TypeError, ValueError):
-            target_timezone = timezone.utc
+        name = str(st.context.timezone or "").strip()
+        zone = ZoneInfo(name) if name else timezone.utc
+    except (AttributeError, ZoneInfoNotFoundError):
+        zone = timezone.utc
     aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    return aware.astimezone(target_timezone).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return aware.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def render_identity_context(identity: dict) -> None:
-    """Show the research and source trail needed to distinguish namesakes."""
-    audit = identity.get('identity_search_audit') or {}
-    if audit:
-        st.markdown('**Latest identity search**')
-        st.caption(f"Outcome: {audit.get('outcome', 'Unknown')} · Searched university: {audit.get('search_university') or audit.get('imported_university') or 'Not available'}")
-        st.write(audit.get('reason') or 'No final decision recorded.')
-        expanded_audit = audit.get('version', 1) >= 2
-        if expanded_audit:
-            st.caption(f"{audit.get('links_collected', 0)} links collected · {len(audit.get('results', []))} sources saved")
-            if audit.get('failure_code'):
-                st.caption('Check outcome: ' + audit['failure_code'].replace('_', ' ').capitalize())
-            if audit.get('stopping_reason'):
-                st.caption(audit['stopping_reason'])
-        with st.expander('Saved identity sources and page checks' if expanded_audit else 'Search results and page checks (first 10 links)'):
-            st.caption('Snippets are search-engine excerpts, not confirmed current roles. These diagnostics are staff-only.')
-            for query in audit.get('queries', []):
-                st.code(query.get('query', ''), language=None)
-                st.caption(f"Returned {query.get('returned', 0)} links")
-                if query.get('error'):
-                    st.caption('Search did not complete: ' + query['error'])
-            for rank, result in enumerate(audit.get('results', [])[:100 if expanded_audit else 10], 1):
-                st.write(f"{rank}. {result.get('title') or 'Untitled result'}")
-                url = result.get('url') or ''
-                if safe_source_link(url):
-                    st.link_button('Open source', url)
-                st.text(result.get('snippet') or 'No snippet returned.')
-                if result.get('snippet_hint'):
-                    st.warning(result['snippet_hint'])
-                st.caption(result.get('inspection') or 'Not inspected in this pass')
-                if result.get('discovered_from'):
-                    st.text('Linked from: ' + result['discovered_from'])
-            st.markdown('**Inspected pages**')
-            for page in audit.get('pages', []):
-                st.text(f"{page.get('url')}\n{page.get('status')}: {page.get('reason')}")
-                if page.get('http_status'):
-                    st.caption(f"HTTP {page['http_status']} · {page.get('response_bytes', '?')} bytes · {page.get('content_type', '')}")
-                if page.get('title'):
-                    st.text('Page title: ' + page['title'])
-                if page.get('name_context') or page.get('text_excerpt'):
-                    st.text(page.get('name_context') or page['text_excerpt'])
-                if page.get('rendering_hint'):
-                    st.caption(page['rendering_hint'])
-            for retrieval in audit.get('retrieval_events', []):
-                if retrieval.get('outcome') != 'NO_USEFUL_RESULTS':
-                    continue
-                st.caption(f"{retrieval.get('provider')}: answered, but returned no useful name-matching results")
-                st.code(retrieval.get('query', ''), language=None)
-                for sample in retrieval.get('sample', []):
-                    st.text(f"{sample.get('title')}\n{sample.get('url')}\n{sample.get('snippet')}")
-            if not audit.get('results'):
-                st.caption('No search results were collected in this pass. Known-page or affiliation checks may have run first.')
-    st.markdown("**Candidate context**")
-    topics = [str(value) for value in identity.get("matching_topics") or [] if value]
-    if topics:
-        st.write(f"Current search matches: {', '.join(topics)}")
-    else:
-        st.warning(
-            "This person is not currently included in public search results. "
-            "The record is kept here only for identity review."
-        )
-    st.write(
-        "Imported institution (may be historical): "
-        f"{identity.get('institution_name') or 'Not available'}"
-    )
-    openalex_url = str(identity.get("openalex_id") or "").strip()
-    if openalex_url.startswith(("https://", "http://")):
-        st.link_button("Open OpenAlex author record", openalex_url)
-
-    position_labels = {
-        "first": "First author",
-        "middle": "Middle author",
-        "last": "Last author",
-    }
-    topic_papers = list(identity.get("topic_paper_evidence") or [])
-    st.markdown("**Papers supporting current search matches**")
-    if topic_papers:
-        supporting_ids = {
-            str(paper.get("openalex_id") or "") for paper in topic_papers
-        }
-        st.dataframe(
-            [
-                {
-                    "Research area": paper.get("research_area"),
-                    "Paper": paper.get("title") or "Untitled paper",
-                    "Year": paper.get("publication_year"),
-                    "Matched phrase": paper.get("matched_query"),
-                    "Relevance": paper.get("relevance_score"),
-                    "Source": str(
-                        paper.get("doi") or paper.get("openalex_id") or ""
-                    ).strip(),
-                }
-                for paper in topic_papers
-            ],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Paper": st.column_config.TextColumn(width="large"),
-                "Source": st.column_config.LinkColumn(display_text="Open"),
-            },
-        )
-    else:
-        supporting_ids = set()
-        st.info(
-            "No current topic-specific paper evidence is stored. Older records "
-            "will gain this evidence after that research area is reindexed."
-        )
-
-    papers = [
-        paper
-        for paper in identity.get("identity_papers") or []
-        if str(paper.get("openalex_id") or "") not in supporting_ids
-    ]
-    st.markdown("**Other recent papers for identity checking**")
-    if papers:
-        st.dataframe(
-            [
-                {
-                    "Paper": paper.get("title") or "Untitled paper",
-                    "Year": paper.get("publication_year"),
-                    "Authorship": position_labels.get(
-                        str(paper.get("author_position") or "").casefold(),
-                        paper.get("author_position") or "Not recorded",
-                    ),
-                    "Source": str(
-                        paper.get("doi") or paper.get("openalex_id") or ""
-                    ).strip(),
-                }
-                for paper in papers
-            ],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Paper": st.column_config.TextColumn(width="large"),
-                "Source": st.column_config.LinkColumn(display_text="Open"),
-            },
-        )
-    else:
-        st.caption("No additional papers are stored for identity checking.")
-
-    historical_topics = [
-        str(value) for value in identity.get("historical_topics") or [] if value
-    ]
-    if historical_topics:
-        with st.expander("Older search matches no longer shown publicly"):
-            st.write(", ".join(historical_topics))
-
-    evidence_rows = list(identity.get("identity_evidence") or [])
-    if evidence_rows:
-        st.markdown("**Saved identity sources**")
-        st.dataframe(
-            [
-                {
-                    "Source type": str(row.get("source_type") or "Unknown").replace("_", " ").title(),
-                    "Page says": " · ".join(
-                        value
-                        for value in (
-                            row.get("observed_title"),
-                            row.get("observed_employer") or row.get("observed_institution"),
-                        )
-                        if value
-                    ) or "Identity found",
-                    "When": row.get("currentness") or "Unknown",
-                    "Lookup": str(row.get("lookup_status") or "Unknown").replace("_", " ").title(),
-                    "Result": IDENTITY_STATUS_LABELS.get(
-                        row.get("verification_status"),
-                        row.get("verification_status") or "Unresolved",
-                    ),
-                    "Checked": row.get("checked_at"),
-                    "Evidence": row.get("evidence_excerpt") or row.get("evidence_text") or "—",
-                    "Source": row.get("source_url"),
-                }
-                for row in evidence_rows
-            ],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Source": st.column_config.LinkColumn(display_text="Open"),
-            },
-        )
-
-
-def render_identity_editor(
-    identity: dict,
-    owner_user_id: int,
-    *,
-    key_prefix: str,
-    default_action: str = "Keep automatic decision",
-) -> None:
-    method = str(
-        identity.get("decision_method")
-        or identity.get("faculty_verification_method")
-        or "automatic_search"
-    )
-    st.caption(
-        f"Decision: {IDENTITY_STATUS_LABELS.get(identity['faculty_status'], identity['faculty_status'])}"
-        f" · Method: {IDENTITY_METHOD_LABELS.get(method, method)}"
-    )
-    if method == "gemini_assisted":
-        st.warning(
-            "Gemini helped extract the evidence. ScholarRadar validated the quoted "
-            "text and source, but this remains an automatic decision that you can override."
-        )
-    elif identity["faculty_status"] in {"CONFLICT", "MANUAL_REVIEW"}:
-        st.warning("This person is hidden from public results until the identity is resolved.")
-    elif (
-        identity["faculty_status"] == "NOT_FACULTY"
-        and float(identity.get("faculty_confidence") or 0) < 0.8
-    ):
-        st.warning(
-            "Possibly not faculty. The targeted searches completed without finding "
-            "a current faculty profile. Please correct this decision if the evidence is incomplete."
-        )
-    render_identity_context(identity)
-    reason = identity.get("review_reason") or identity.get("decision_reason")
-    if reason:
-        st.write(reason)
-    if identity.get("faculty_source_url"):
-        st.link_button("Open evidence page", identity["faculty_source_url"])
-
-    with st.form(f"{key_prefix}_{identity['id']}"):
-        institution_name = st.text_input(
-            "Current institution (staff correction)",
-            value=identity.get("institution_name") or "",
-        )
-        faculty_title = st.text_input(
-            "Faculty title", value=identity.get("faculty_title") or ""
-        )
-        source_url = st.text_input(
-            "Current official faculty page",
-            value=identity.get("faculty_source_url") or "",
-        )
-        actions = [
-            "Keep automatic decision",
-            "Mark as needs more evidence",
-            "Confirm faculty identity",
-            "Mark as not faculty",
-        ]
-        action_index = actions.index(default_action) if default_action in actions else 0
-        action = st.selectbox("Staff action", actions, index=action_index)
-        save = st.form_submit_button("Save staff action", type="primary")
-    if not save:
-        return
-    if action == "Keep automatic decision":
-        st.info("No change was made.")
-        return
-    decision = {
-        "Confirm faculty identity": "VERIFIED",
-        "Mark as needs more evidence": "RETRY",
-        "Mark as not faculty": "NOT_FACULTY",
-    }[action]
-    if decision == "VERIFIED" and not is_official_institution_url(source_url):
-        st.error("Use an official university page before confirming faculty status.")
-        return
-    review_faculty_identity(
-        owner_user_id,
-        int(identity["id"]),
-        decision,
-        institution_name=institution_name,
-        faculty_title=faculty_title,
-        source_url=source_url,
-    )
-    st.success("Staff decision saved. It now takes priority over automatic checks.")
-    st.rerun()
-
-
-configure_page("Professor database")
+configure_page("Radar control")
 navigation()
 account_controls()
-
-st.title("Professor database")
-st.write("Add research areas and review work that needs your attention.")
+st.title("Radar control")
+st.write("Monitor the university-first faculty index and resolve evidence problems.")
 if not database_is_ready():
     st.error("The database is not ready.")
     st.stop()
-
 user, admin = require_site_admin()
 if admin["admin_role"] != "owner":
     st.error("Only the site owner can manage indexing operations.")
     st.stop()
-st.caption("Owner access")
 
 
 @st.fragment(run_every="5s")
-def render_live_activity() -> None:
-    live = fetch_live_indexing_status(int(user["id"]))
-    worker = live.get("worker") or {}
-    totals = live.get("totals") or {}
-    queue_counts = live.get("queue_counts") or {}
-    unique_candidates = int(totals.get("unique_candidates") or 0)
-    remaining = int(totals.get("pending_identities") or 0)
-    checked = max(0, unique_candidates - remaining)
+def live_panel() -> None:
+    live = fetch_live_indexing_status(int(user["id"]), recent_limit=10)
+    operations = list_radar_operations(int(user["id"]), limit=250)
+    counts = {str(row["status"]): int(row["count"]) for row in operations["job_counts"]}
+    columns = st.columns(2)
+    columns[0].metric("Background running", counts.get("running", 0))
+    columns[1].metric("Jobs waiting", counts.get("queued", 0))
+    quality = operations.get("quality_counts") or {}
+    quality_columns = st.columns(4)
+    quality_columns[0].metric("Faculty approved", int(quality.get("approved_faculty") or 0))
+    quality_columns[1].metric("Needs staff review", int(quality.get("needs_staff_review") or 0))
+    quality_columns[2].metric("Automatically rejected", int(quality.get("automatically_rejected") or 0))
+    quality_columns[3].metric("Technical failures", int(quality.get("technical_failures") or 0))
 
-    st.subheader("Live indexing activity")
-    search_state = search_provider_runtime_state()
-    if not search_state["available"]:
-        next_search = datetime.now(timezone.utc) + timedelta(seconds=search_state["retry_after_seconds"])
-        st.info(f"Web-search identities are waiting. Next capacity check: {_format_device_time(next_search)}. Known pages and grants can still run.")
-    with st.expander("Search API capacity"):
-        for provider, capacity in search_state.get("capacity", {}).items():
-            st.write(f"{provider}: {capacity.get('reason') or 'Ready'}")
-            st.caption(f"Attempts today: {capacity.get('requests_today', 0)} · Total tracked attempts: {capacity.get('requests_total', 0)}")
-            if capacity.get("remote_checked_at"):
-                remaining = capacity.get("remote_remaining")
-                st.caption(f"Provider allowance: {remaining if remaining is not None else 'unavailable'} · Observed {_format_device_time(capacity['remote_checked_at'])}")
-    waits = fetch_identity_search_waits(int(user["id"]))
-    if waits:
-        st.caption(f"{waits[0]['total_waiting']} identities waiting for web search. Known-page checks can continue.")
-        with st.expander("Next web-search retries"):
-            for item in waits:
-                st.write(f"{item['name']} · Retry after {_format_device_time(item['identity_retry_at'])}")
-                st.caption(item.get("identity_retry_reason") or "Waiting for a search slot")
+    st.subheader("Live activity")
+    worker = live.get("worker") or {}
     if worker:
         progress = worker.get("progress") or {}
-        current_stage = str(
-            progress.get("live_stage") or worker.get("job_type") or ""
-        )
-        task = ACTIVITY_STAGE_LABELS.get(current_stage, current_stage or "Background work")
-        subject = (
-            worker.get("requested_query")
-            or worker.get("professor_name")
-            or "shared professor index"
-        )
-        st.success(f"Working now: {task} — {subject}")
-        st.caption(
-            str(progress.get("live_detail") or "Processing the current background task.")
-            + " This panel refreshes every five seconds."
-        )
-        current_professors = list(progress.get("live_professors") or [])
-        if current_professors:
-            with st.container(border=True):
-                st.markdown("**Current professor batch**")
-                for professor in current_professors:
-                    st.write(
-                        f"• {professor.get('name') or 'Unknown person'} — "
-                        f"imported institution: "
-                        f"{professor.get('institution_name') or 'not available'}"
-                    )
-                    if professor.get("homepage_url"):
-                        st.caption(f"Imported page: {professor['homepage_url']}")
+        stage = str(progress.get("live_stage") or worker.get("job_type") or "Background work")
+        subject = (worker.get("professor_name") or progress.get("member_name")
+                   or worker.get("institution_name") or worker.get("requested_query")
+                   or "Shared index")
+        st.success(f"Working now: {JOB_LABELS.get(stage, stage)} — {subject}")
+        st.write(progress.get("live_detail") or "Processing the current task.")
+        if progress.get("paper_title"):
+            st.write(f"Paper: {progress['paper_title']}")
+        if progress.get("source_url") or worker.get("directory_url"):
+            st.caption(f"Source: {progress.get('source_url') or worker.get('directory_url')}")
     else:
-        st.warning("No active worker has checked in during the last two minutes.")
+        st.info("No worker is active. Waiting jobs remain queued until `make start` or `make worker` runs.")
 
-    metrics = st.columns(4)
-    metrics[0].metric("Candidates collected", f"{unique_candidates:,}")
-    metrics[1].metric("Identity checks complete", f"{checked:,}")
-    metrics[2].metric("Still to check", f"{remaining:,}")
-    metrics[3].metric(
-        "Verified faculty",
-        f"{int(totals.get('verified_faculty') or 0):,}",
-    )
-    if unique_candidates:
-        st.progress(
-            min(1.0, checked / unique_candidates),
-            text=f"Identity review coverage: {checked:,} of {unique_candidates:,}",
-        )
+    state = search_provider_runtime_state()
+    if not state["available"]:
+        retry_at = datetime.now(timezone.utc) + timedelta(seconds=state["retry_after_seconds"])
+        st.caption("Directory-recovery searches are waiting for the shared search slot. "
+                   f"Next capacity check: {_local_time(retry_at)}.")
 
-    since_start = int(totals.get("checked_since_worker_start") or 0)
-    verified_since_start = int(totals.get("verified_since_worker_start") or 0)
-    waiting = int(queue_counts.get("queued") or 0)
-    running = int(queue_counts.get("running") or 0)
-    st.caption(
-        f"This worker run checked {since_start:,} unique identities and confirmed "
-        f"{verified_since_start:,} faculty. {running} verification task is active; "
-        f"{waiting} are waiting their turn."
-    )
-
-    providers = list(live.get("providers") or [])
-    primary_provider = providers[0] if providers else None
-    if primary_provider and primary_provider.get("status") == "healthy":
-        st.caption(
-            f"Search provider healthy · Last successful search: "
-            f"{primary_provider.get('last_success_at')}"
-        )
-    elif primary_provider:
-        st.warning(
-            f"Search provider {primary_provider.get('status') or 'unavailable'}: "
-            f"{primary_provider.get('last_error') or 'waiting to retry'}"
-        )
-
-    recent = list(live.get("activity_logs") or [])
-    st.markdown("**Most recent activity (20)**")
-    if recent:
-        for entry in recent[:20]:
-            stage = ACTIVITY_STAGE_LABELS.get(
-                str(entry.get("stage") or ""),
-                str(entry.get("stage") or "Background work"),
+    st.markdown("**Recent activity**")
+    recent = list(live.get("activity_logs") or [])[:10]
+    if not recent:
+        st.caption("No completed activity yet.")
+    for entry in recent:
+        with st.container(border=True):
+            stage = JOB_LABELS.get(str(entry.get("stage") or ""), str(entry.get("stage") or "Background work"))
+            subject = entry.get("name") or entry.get("institution_name") or "Shared index"
+            st.markdown(f"**{_local_time(entry.get('activity_at'))} · {stage} · {subject}**")
+            areas = entry.get("research_areas") or []
+            interest_step = next((step for step in reversed(entry.get("audit_steps") or [])
+                                  if step.get("step") == "RESEARCH_INTERESTS"), {})
+            if interest_step.get("interests"):
+                areas = interest_step["interests"]
+            area_text = ", ".join(areas) if areas else (
+                "Not established" if str(entry.get("stage") or "") in {
+                    "MATCH_FACULTY_PUBLICATIONS", "QWEN_REVIEW_PUBLICATION"
+                } else "Not linked"
             )
-            result = ACTIVITY_RESULT_LABELS.get(
-                str(entry.get("result_status") or ""),
-                str(entry.get("result_status") or "Completed"),
-            )
-            if entry.get('failure_code'):
-                result = {
-                    'SOURCE_BLOCKED': 'Source blocked the check',
-                    'SOURCE_UNAVAILABLE': 'Source unavailable',
-                    'NO_USEFUL_PROFILE': 'No useful profile found',
-                    'MISSING_AFFILIATION': 'University not established',
-                    'CHECK_LIMIT': 'Check limit reached',
-                    'IDENTITY_EVIDENCE_INCOMPLETE': 'Identity evidence incomplete',
-                    'NO_READABLE_CONTENT': 'No readable page content',
-                    'UNSUPPORTED_CONTENT': 'Page format could not be read',
-                }.get(entry['failure_code'], entry['failure_code'].replace('_', ' ').capitalize())
-            activity_at = entry.get("activity_at")
-            time_label = _format_device_time(activity_at)
-            fields = ", ".join(entry.get("research_areas") or []) or "Not linked"
-            with st.container(border=True):
-                st.markdown(
-                    f"**{time_label} · {stage} · "
-                    f"{entry.get('name') or 'Unknown professor'}**"
-                )
+            st.caption(f"Research area: {area_text} · "
+                       f"University: {entry.get('institution_name') or 'Not available'}")
+            if interest_step.get("interests"):
                 st.caption(
-                    f"Field: {fields} · Imported institution: "
-                    f"{entry.get('institution_name') or 'not available'}"
+                    "Very low confidence · No direct interest found; possible research area created by AI."
+                    if interest_step.get("evidence_method") == "AI_SUGGESTION" else
+                    "Low confidence · No papers found; possible research areas based on the professor’s website."
                 )
-                page_facts = " · ".join(
-                    str(value)
-                    for value in (
-                        entry.get("observed_title"),
-                        entry.get("observed_institution"),
+            if entry.get("evidence_text"):
+                st.write(f"Paper/evidence: {str(entry['evidence_text'])[:500]}")
+            st.write(f"Result: {entry.get('result_status') or 'Finished successfully'}")
+            if entry.get("result_detail"):
+                st.caption(str(entry["result_detail"])[:500])
+            if entry.get("source_url"):
+                st.caption(f"Source: {entry['source_url']}")
+            for step in entry.get("audit_steps") or []:
+                label = str(step.get("step") or "Step").replace("_", " ").title()
+                status = str(step.get("status") or "UNKNOWN").replace("_", " ")
+                details = []
+                if step.get("papers_found") is not None:
+                    details.append(f"papers: {step['papers_found']}")
+                if step.get("results_returned") is not None:
+                    details.append(f"results: {step['results_returned']}")
+                if step.get("scholar_candidates") is not None:
+                    details.append(f"Scholar profiles: {step['scholar_candidates']}")
+                if step.get("saved_candidates") is not None:
+                    details.append(f"saved candidates: {step['saved_candidates']}")
+                if step.get("papers_imported") is not None:
+                    details.append(f"imported: {step['papers_imported']}")
+                if step.get("deterministic_decision"):
+                    details.append(f"decision: {step['deterministic_decision']}")
+                if step.get("decision_signals"):
+                    details.append(
+                        "signals: " + ", ".join(step["decision_signals"])
                     )
-                    if value
-                )
-                if page_facts:
-                    st.write(f"Page identified: {page_facts}")
-                evidence = str(entry.get("evidence_text") or "").strip()
-                if evidence:
-                    st.write(f"Evidence: {evidence[:500]}")
-                st.write(f"Result: {result}")
-                result_detail = str(entry.get("result_detail") or "").strip()
-                if result_detail and result_detail != evidence:
-                    st.caption(result_detail[:500])
-                if entry.get("source_url"):
-                    st.caption(f"Source: {entry['source_url']}")
-    else:
-        st.info("No completed indexing activity has been recorded yet.")
+                if step.get("interests"):
+                    details.append(
+                        "fields: " + ", ".join(str(value) for value in step["interests"])
+                    )
+                if step.get("source_url"):
+                    details.append(str(step["source_url"]))
+                if step.get("reason"):
+                    details.append(str(step["reason"]))
+                suffix = f" · {' · '.join(details)}" if details else ""
+                st.caption(f"• {label}: {status}{suffix}")
 
 
-render_live_activity()
-
-with st.form("schedule_topic"):
-    research_area = st.text_input(
-        "Research area",
-        placeholder="Adversarial machine learning, robotics, neuroscience…",
-    )
-    schedule = st.form_submit_button("Add or update", type="primary")
-
-if schedule:
-    try:
-        topic, job = request_topic_index(
-            research_area,
-            requested_by=int(user["id"]),
-            desired_results=100,
-        )
-        if job and job.get("reused"):
-            st.info("This research area is already being updated.")
-        elif job:
-            st.success("Added to the work queue.")
-        else:
-            st.success("This research area is current.")
-        st.caption(
-            f"Current coverage: {int(topic.get('verified_count') or 0)} verified "
-            f"from {int(topic.get('candidates_seen') or 0)} candidates."
-        )
-    except Exception as error:
-        st.error(str(error))
-
-operations = list_radar_operations(int(user["id"]))
-counts = {row["status"]: int(row["count"]) for row in operations["job_counts"]}
-metric_columns = st.columns(6)
-for column, status in zip(
-    metric_columns,
-    ["queued", "running", "stalled", "failed", "completed", "cancelled"],
-):
-    column.metric(STATUS_LABELS[status], counts.get(status, 0))
-st.caption("These numbers count background tasks, not professors.")
-if counts.get("stalled", 0):
-    st.warning(
-        "A task is overdue. If the worker is active, it will stop and retry the "
-        "task automatically. If the worker is offline, restart it below."
-    )
-    if st.button("Recover overdue tasks"):
-        recovered = recover_stalled_radar_jobs(int(user["id"]))
-        if recovered:
-            st.success(f"Recovered {recovered} abandoned task(s).")
-            st.rerun()
-        else:
-            st.info(
-                "No abandoned task was recovered. An active worker still owns "
-                "the task, so it is safer to let its timeout finish."
-            )
-
-st.subheader("Background worker")
-if operations["workers"]:
-    healthy_workers = [row for row in operations["workers"] if row["healthy"]]
-    latest_worker = operations["workers"][0]
-    if healthy_workers:
-        st.success("Active")
-        st.caption(f"Last check-in: {latest_worker['last_seen_at']}")
-    else:
-        st.error(
-            "Offline. Stored results still work, but new indexing cannot continue."
-        )
-        st.code("# Local site and worker\nmake start\n\n# Standalone worker only\nmake worker")
-        st.caption(
-            "For a hosted site, restart the separate worker service in its hosting dashboard."
-        )
-else:
-    st.error("No worker has connected. Start it in a terminal.")
-    st.code("# Local site and worker\nmake start\n\n# Standalone worker only\nmake worker")
-    st.caption(
-        "For a hosted site, start the separate worker service in its hosting dashboard."
-    )
-
-blocked_providers = [
-    row for row in operations.get("search_providers", [])
-    if row.get("actively_blocked")
-]
-blocked_openalex = [
-    row for row in blocked_providers
-    if str(row.get("provider_name") or "").casefold() == "openalex"
-]
-blocked_identity_search = [
-    row for row in blocked_providers
-    if str(row.get("provider_name") or "").casefold() in {
-        item["provider"] for item in configured_search_providers()
-    }
-]
-if blocked_openalex:
-    next_retry = max(row["blocked_until"] for row in blocked_openalex)
-    st.warning(
-        "Research discovery is paused because OpenAlex reached its current "
-        "request limit. Saved candidates and results are safe. Discovery will "
-        f"retry automatically after {next_retry}."
-    )
-if blocked_identity_search:
-    next_retry = max(row["blocked_until"] for row in blocked_identity_search)
-    st.warning(
-        "Web-search fallback is paused. Known faculty pages and saved evidence "
-        "can still be checked. Existing results and queued identities are safe. "
-        "Search-dependent checks retry after "
-        f"{next_retry}."
-    )
+live_panel()
 
 st.subheader("Research areas")
+with st.form("schedule_topic"):
+    area = st.text_input("Add or refresh a research area")
+    submitted = st.form_submit_button("Queue research-area index")
+if submitted and area.strip():
+    _, job = request_topic_index(area.strip(), requested_by=int(user["id"]))
+    st.success("Research-area indexing is queued." if job else "This research area is current.")
+    st.rerun()
+
+operations = list_radar_operations(int(user["id"]), limit=250)
 if operations["topics"]:
-    st.caption(
-        "Candidates come from relevant papers. Exact evidence counts verified "
-        "faculty with a saved supporting paper. Hiring checked means checked in "
-        "the last 24 hours; it does not mean a position was found."
-    )
-    topic_rows = [
-        {
-            "Research area": row["requested_query"],
-            "Stage": row["coverage_stage"],
-            "Candidates": row["candidates_seen"],
-            "Verified faculty": row["verified_count"],
-            "Exact evidence": row["exact_evidence_professors"],
-            "Hiring checked": row["fresh_hiring_checked"],
-            "Problems": row["problem_count"],
-            "Last updated": row["last_indexed_at"],
-        }
-        for row in operations["topics"]
-    ]
-    st.dataframe(topic_rows, width="stretch", hide_index=True)
+    st.dataframe([{
+        "Research area": row["requested_query"], "Stage": row["coverage_stage"],
+        "Faculty matches": row["verified_count"], "Papers": row["papers_found"],
+        "Problems": row["problem_count"], "Last updated": row["last_indexed_at"],
+    } for row in operations["topics"]], width="stretch", hide_index=True)
 else:
     st.info("No research areas have been requested yet.")
 
-st.subheader("Work queue")
-if operations["jobs"]:
-    active_jobs = [
-        row for row in operations["jobs"]
-        if row["status"] in {"queued", "running", "stalled", "failed"}
-    ]
-    if active_jobs:
-        job_rows = [
-            {
-                "Task": JOB_LABELS.get(row["job_type"], row["job_type"]),
-                "Research area": row.get("requested_query") or "—",
-                "Professor": row.get("professor_name") or "—",
-                "Status": STATUS_LABELS.get(row["status"], row["status"]),
-                "Attempts": f"{row['attempts']} / {row['max_attempts']}",
-                "Problem": row.get("last_error"),
-            }
-            for row in active_jobs
-        ]
-        st.dataframe(job_rows, width="stretch", hide_index=True)
-    else:
-        st.success("No current task needs attention.")
-    action_columns = st.columns(2)
-    failed_jobs = [row for row in operations["jobs"] if row["status"] == "failed"]
-    cancellable_jobs = [
-        row for row in operations["jobs"]
-        if row["status"] in {"queued", "failed"}
-    ]
-    with action_columns[0]:
-        if failed_jobs:
-            retry_job = st.selectbox(
-                "Task to retry",
-                failed_jobs,
-                format_func=lambda row: (
-                    f"{JOB_LABELS.get(row['job_type'], row['job_type'])} · "
-                    f"{row.get('requested_query') or row.get('professor_name') or 'General'}"
-                ),
-                key="retry_job_id",
-            )
-            if st.button("Retry task"):
-                retry_radar_job(int(user["id"]), int(retry_job["id"]))
-                st.rerun()
-    with action_columns[1]:
-        if cancellable_jobs:
-            cancel_job = st.selectbox(
-                "Task to stop",
-                cancellable_jobs,
-                format_func=lambda row: (
-                    f"{JOB_LABELS.get(row['job_type'], row['job_type'])} · "
-                    f"{row.get('requested_query') or row.get('professor_name') or 'General'}"
-                ),
-                key="cancel_job_id",
-            )
-            if st.button("Stop task"):
-                cancel_radar_job(int(user["id"]), int(cancel_job["id"]))
-                st.rerun()
-else:
-    st.info("No indexing jobs have been recorded yet.")
-
-st.subheader(f"Ambiguous identities ({len(operations['identity_review'])})")
-if operations["identity_review"]:
-    st.caption(
-        "These identities need staff review and remain hidden. University conflicts "
-        "are not retried automatically. Request another check only when you want to override that pause."
-    )
-    if st.button("Request another check for these identities"):
-        queued_identities = retry_unresolved_identities(int(user["id"]), limit=100)
-        st.success(f"Queued {queued_identities} identities for another automatic check.")
+st.subheader("Needs staff attention")
+failed = [job for job in operations["jobs"] if job["status"] in {"failed", "stalled"}]
+if failed:
+    st.markdown("**Failed or stalled jobs**")
+    st.dataframe([{
+        "Task": JOB_LABELS.get(row["job_type"], row["job_type"]),
+        "University": row.get("institution_name") or "—",
+        "Professor": row.get("professor_name") or "—",
+        "Problem": row.get("last_error") or "Worker heartbeat expired",
+    } for row in failed], width="stretch", hide_index=True)
+    selected = st.selectbox("Failed task", failed, format_func=lambda row: f"#{row['id']} {JOB_LABELS.get(row['job_type'], row['job_type'])}")
+    left, right = st.columns(2)
+    if left.button("Retry selected task"):
+        retry_radar_job(int(user["id"]), int(selected["id"]))
         st.rerun()
-    identity_limit = int(st.session_state.get("identity_review_limit", 10))
-    visible_identities = operations["identity_review"][:identity_limit]
-    for identity in visible_identities:
-        status_label = {
-            "CONFLICT": "University or identity conflict",
-            "MANUAL_REVIEW": "Needs confirmation",
-        }.get(identity["faculty_status"], identity["faculty_status"])
-        with st.expander(f"{identity['name']} · {status_label}"):
-            render_identity_editor(
-                identity,
-                int(user["id"]),
-                key_prefix="identity_review",
-                default_action="Mark as needs more evidence",
-            )
-    if identity_limit < len(operations["identity_review"]):
-        if st.button("Show 10 more identity reviews"):
-            st.session_state["identity_review_limit"] = identity_limit + 10
-            st.rerun()
+    if right.button("Stop selected task"):
+        cancel_radar_job(int(user["id"]), int(selected["id"]))
+        st.rerun()
 else:
-    st.success("No faculty identity currently requires manual review.")
+    st.success("No failed or stalled background jobs.")
 
-st.subheader("Recent automatic identity decisions")
-st.caption(
-    "These decisions do not require routine staff approval. Review or override one "
-    "only when its evidence appears wrong. Staff overrides take priority."
-)
-ai_used = int(operations["identity_ai_usage"].get("request_count") or 0)
-ai_limit = setting_int("GEMINI_IDENTITY_DAILY_LIMIT", 25, 0, 500)
-if setting_bool("GEMINI_IDENTITY_ENABLED", False):
-    st.caption(f"Gemini fallback usage today: {ai_used} of {ai_limit} app-limited calls.")
-else:
-    st.caption("Gemini fallback is disabled; the rule-based verifier is still active.")
-
-automatic_decisions = operations["identity_decisions"]
-if automatic_decisions:
-    category = st.selectbox(
-        "Show automatic decisions",
-        ["All", "Faculty confirmed", "Not eligible", "Outside US scope", "Unresolved"],
-    )
-    category_statuses = {
-        "All": {"VERIFIED", "NOT_FACULTY", "OUT_OF_SCOPE", "CONFLICT", "MANUAL_REVIEW", "UNVERIFIED"},
-        "Faculty confirmed": {"VERIFIED"},
-        "Not eligible": {"NOT_FACULTY"},
-        "Outside US scope": {"OUT_OF_SCOPE"},
-        "Unresolved": {"CONFLICT", "MANUAL_REVIEW", "UNVERIFIED"},
+if operations["directory_issues"]:
+    st.markdown("**Faculty pages needing review**")
+    st.dataframe(operations["directory_issues"], width="stretch", hide_index=True)
+if operations["faculty_page_issues"]:
+    st.markdown("**Faculty pages requiring a decision**")
+    st.caption("Only genuinely ambiguous pages appear here. Rejected pages and temporary fetch retries are handled automatically.")
+    reason_labels = {
+        "NO_FACULTY_SCOPE_HEADING": "The page contains people but does not establish a faculty-directory scope.",
+        "NO_REPEATED_ATTRIBUTABLE_FACULTY_CARDS": "The page may be a directory, but its person records could not be separated safely.",
+        "NO_PROFILE_HOSTS": "The extracted people do not have usable profile links.",
+        "NO_CANONICAL_ORGANIZATIONAL_SCOPE": "The page is not clearly owned by a university, college, school, department, or program.",
     }
-    visible_decisions = [
-        row for row in automatic_decisions
-        if row["faculty_status"] in category_statuses[category]
-    ]
-    decision_rows = [
-        {
-            "Professor": row["name"],
-            "Decision": IDENTITY_STATUS_LABELS.get(
-                row["faculty_status"], row["faculty_status"]
-            ),
-            "Institution": row.get("institution_name") or "—",
-            "Title": row.get("faculty_title") or "—",
-            "Method": IDENTITY_METHOD_LABELS.get(
-                row.get("decision_method")
-                or row.get("faculty_verification_method")
-                or "automatic_search",
-                row.get("decision_method")
-                or row.get("faculty_verification_method")
-                or "Automatic",
-            ),
-            "Checked": row.get("faculty_checked_at"),
-        }
-        for row in visible_decisions
-    ]
-    st.dataframe(decision_rows, width="stretch", hide_index=True)
-    if visible_decisions:
-        selected_identity = st.selectbox(
-            "Review or edit one person",
-            visible_decisions,
-            format_func=lambda row: (
-                f"{row['name']} · "
-                f"{IDENTITY_STATUS_LABELS.get(row['faculty_status'], row['faculty_status'])}"
-            ),
+    st.dataframe([{
+        "University": row["institution_name"],
+        "Page": row.get("final_url") or row.get("candidate_url"),
+        "Why review is needed": reason_labels.get(
+            str(row.get("classification_reason") or ""),
+            str(row.get("classification_reason") or "The page type is uncertain."),
+        ),
+        "Found by": "Official site" if row.get("discovery_method") == "OFFICIAL_NAVIGATION" else "Search recovery",
+    } for row in operations["faculty_page_issues"]], width="stretch", hide_index=True)
+if operations["roster_member_issues"]:
+    st.markdown("**Roster entries that failed individual-profile validation**")
+    st.caption("These staged entries are not canonical professors and receive no publication or enrichment jobs.")
+    st.dataframe([{
+        **row,
+        "profile_evidence": json.dumps(
+            row.get("profile_evidence") or {}, ensure_ascii=False, default=str
+        ),
+    } for row in operations["roster_member_issues"]], width="stretch", hide_index=True)
+    cases = {int(row['id']): row for row in operations['roster_member_issues']}
+    case_id = st.selectbox('Roster person to review', list(cases),
+                          format_func=lambda key: f"{cases[key]['displayed_name']} — {cases[key]['institution_name']} (#{key})")
+    case = cases[case_id]
+    edits = case.get('staff_overrides') or {}
+    st.dataframe([case], width='stretch', hide_index=True)
+    with st.form(f'edit_roster_{case_id}'):
+        name = st.text_input('Name', value=edits.get('name', case.get('displayed_name') or ''))
+        title = st.text_input('Role title', value=edits.get('title', case.get('displayed_title') or ''))
+        profile = st.text_input('Official profile URL', value=edits.get('profile_url', case.get('profile_url') or ''))
+        email = st.text_input('Email', value=edits.get('email', case.get('email') or ''))
+        office = st.text_input('Office', value=edits.get('office_address', case.get('office_address') or ''))
+        save_roster = st.form_submit_button('Save corrections and revalidate')
+    if save_roster:
+        try:
+            save_roster_review_record(int(user['id']), case_id,
+                dict(name=name, title=title, profile_url=profile, email=email, office_address=office))
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+if operations["publication_identity_issues"]:
+    st.markdown("**Publication sources needing review**")
+    st.caption("Faculty approval is independent. Scholar papers are attached only after name plus an independent identity signal agree.")
+    st.dataframe([{
+        "Professor": row.get("name"),
+        "University": row.get("institution_name"),
+        "Faculty": "Approved" if row.get("faculty_status") == "VERIFIED" else row.get("faculty_status"),
+        "Role": row.get("faculty_title") or "Not stated",
+        "Publications": row.get("publication_identity_status") or "NOT_CHECKED",
+        "Why review is needed": row.get("reason"),
+        "Evidence": row.get("evidence"),
+    } for row in operations["publication_identity_issues"]], width="stretch", hide_index=True)
+    publication_issue = st.selectbox(
+        "Publication identity case",
+        operations["publication_identity_issues"],
+        format_func=lambda row: (
+            f"{row.get('name') or 'Unknown'} — "
+            f"{row.get('institution_name') or 'Unknown university'}"
+        ),
+    )
+    st.dataframe([{**publication_issue, 'evidence': json.dumps(publication_issue.get('evidence') or {}, default=str)}], hide_index=True)
+    with st.form(f"edit_publication_identity_case_{publication_issue['id']}_{publication_issue['professor_id']}"):
+        st.write(f"Faculty role: {publication_issue.get('faculty_title') or 'Not stated'}")
+        scholar_url = st.text_input(
+            "Google Scholar profile candidate",
+            value=str(publication_issue.get("candidate_url") or ""),
+            help="Saving this URL does not approve it or attach papers. Qwen and deterministic checks run first.",
         )
-        with st.expander("Evidence and staff override"):
-            render_identity_editor(
-                selected_identity,
-                int(user["id"]),
-                key_prefix="automatic_identity",
+        save_candidate = st.form_submit_button("Save candidate and queue review")
+        reject_candidate = st.form_submit_button("Reject this candidate")
+    if save_candidate:
+        try:
+            save_publication_review_candidate(
+                int(user["id"]), int(publication_issue["professor_id"]), scholar_url
             )
-else:
-    st.info("No automatic identity decisions have been recorded yet.")
-
-st.subheader("Hiring-page checks")
-hiring = operations["hiring_metrics"]
-hiring_columns = st.columns(4)
-hiring_columns[0].metric("Statement found", int(hiring.get("present") or 0))
-hiring_columns[1].metric("None found", int(hiring.get("not_found") or 0))
-hiring_columns[2].metric("Page unavailable", int(hiring.get("unavailable") or 0))
-hiring_columns[3].metric("Needs checking", int(hiring.get("stale_or_unchecked") or 0))
-st.caption("None found does not mean the professor is not hiring.")
+            st.success("Candidate saved. Qwen review is queued and may take up to five minutes.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+    if reject_candidate:
+        if not scholar_url.strip():
+            st.error("There is no candidate URL to reject.")
+        else:
+            reject_publication_candidate(
+                int(user["id"]), int(publication_issue["professor_id"]), scholar_url
+            )
+            st.success("Candidate rejected. The professor remains verified, without attached papers.")
+            st.rerun()
+    if st.button("Queue all unresolved publication reviews"):
+        queued = requeue_unresolved_publication_reviews(int(user["id"]))
+        st.success(f"Queued {queued} unresolved publication review job(s).")
+        st.rerun()
 if operations["hiring_issues"]:
-    issue_rows = [
-        {
-            "Professor": row["name"],
-            "Institution": row["institution_name"],
-            "Last checked": row["public_hiring_checked_at"],
-            "Failures": row["public_hiring_failure_count"],
-            "Next check": row["public_hiring_next_check_at"],
-        }
-        for row in operations["hiring_issues"]
-    ]
-    st.dataframe(issue_rows, width="stretch", hide_index=True)
-else:
-    st.success("No repeated hiring-source failures are recorded.")
+    st.markdown("**Hiring pages unavailable**")
+    st.dataframe(operations["hiring_issues"], width="stretch", hide_index=True)
+if not any((failed, operations["directory_issues"], operations["faculty_page_issues"],
+            operations["roster_member_issues"], operations["publication_identity_issues"],
+            operations["hiring_issues"])):
+    st.success("Nothing currently requires staff review.")
 
-with st.expander("Advanced task history"):
-    st.dataframe(operations["jobs"], width="stretch", hide_index=True)
-    st.dataframe(operations["workers"], width="stretch", hide_index=True)
+if any(row["status"] == "stalled" for row in operations["jobs"]):
+    if st.button("Recover abandoned jobs"):
+        count = recover_stalled_radar_jobs(int(user["id"]))
+        st.success(f"Recovered {count} job(s).")
+        st.rerun()

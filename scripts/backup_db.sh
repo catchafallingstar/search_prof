@@ -15,7 +15,10 @@ backup_path="$backup_dir/scholarradar-$(date -u +%Y%m%dT%H%M%SZ).dump"
 
 docker compose up -d postgres >/dev/null
 umask 077
-docker compose exec -T postgres pg_dump \
+docker compose exec -T \
+  -e PGPASSWORD="$POSTGRES_PASSWORD" postgres pg_dump \
+  --host host.docker.internal \
+  --port "$POSTGRES_PORT" \
   --username "$POSTGRES_USER" \
   --dbname "$POSTGRES_DB" \
   --format custom \

@@ -27,6 +27,8 @@ _LATIN_FALLBACKS = str.maketrans({
     "ß": "ss",
 })
 _APOSTROPHES = str.maketrans("", "", "'’ʻ`ʼ")
+_HONORIFICS = {"dr", "prof", "professor", "mr", "mrs", "ms"}
+_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "phd", "md", "pe"}
 
 
 def fold_name_text(value: str) -> str:
@@ -55,3 +57,37 @@ def name_tokens(value: str) -> list[str]:
         for token in re.findall(r"[^\W_]+", fold_name_text(value).casefold(), re.UNICODE)
         if len(token) > 1
     ]
+
+
+def canonical_name_key(value: str) -> str:
+    """Return an order-aware identity key that preserves initials.
+
+    Display punctuation, spaces, accents and hyphens do not define a person.
+    A comma is treated as an explicit ``surname, given`` ordering signal.  We
+    intentionally do not reverse an unpunctuated name because guessing whether
+    ``Li Wei`` is family-name-first can merge two different people.
+
+    Examples::
+
+        M.Z. Naser   -> mznaser
+        M. Z. Naser  -> mznaser
+        Naser, M.Z.  -> mznaser
+        Smith-Jones  -> smithjones
+        Smith Jones  -> smithjones
+    """
+    folded = fold_name_text(str(value or "")).casefold().strip()
+    if not folded:
+        return ""
+    if "," in folded:
+        family, remainder = folded.split(",", 1)
+        remainder_tokens = re.findall(r"[^\W_]+", remainder, re.UNICODE)
+        if remainder_tokens and all(token in _SUFFIXES for token in remainder_tokens):
+            folded = family
+        else:
+            folded = f"{remainder} {family}"
+    tokens = re.findall(r"[^\W_]+", folded, re.UNICODE)
+    while tokens and tokens[0] in _HONORIFICS:
+        tokens.pop(0)
+    while tokens and tokens[-1] in _SUFFIXES:
+        tokens.pop()
+    return "".join(tokens)

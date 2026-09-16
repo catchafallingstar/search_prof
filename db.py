@@ -474,7 +474,7 @@ def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
                     rrp.latest_paper_year, rrp.latest_paper_url,
                     rrp.grant_sources_checked, rrp.public_sources_checked,
                     p.name AS professor_name, p.institution_name,
-                    p.research_domain, p.homepage_url, p.openalex_id, p.career_stage,
+                    p.research_domain, p.homepage_url, p.career_stage,
                     p.faculty_status, p.faculty_title, p.faculty_source_url,
                     p.faculty_verified_at, p.official_institution_domain,
                     COALESCE(f.active_grants, 0) AS active_grants,
@@ -558,7 +558,7 @@ def fetch_radar_prospects(run_id: int) -> list[dict[str, Any]]:
                   AND p.faculty_status = 'VERIFIED'
                   AND (
                       p.faculty_verification_method = 'manual_review'
-                      OR p.faculty_verification_version >= 8
+                      OR p.faculty_verification_version >= 19
                   )
                 ORDER BY
                     CASE

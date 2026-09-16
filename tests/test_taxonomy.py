@@ -1,10 +1,10 @@
 import unittest
 
-from ingestion.taxonomy import _topic_relevance, phrase_covers_query
+from ingestion.topic_language import _topic_relevance, phrase_covers_query
 
 
 class TaxonomyRelevanceTests(unittest.TestCase):
-    def test_rejects_unrelated_openalex_fuzzy_result(self) -> None:
+    def test_rejects_unrelated_fuzzy_result(self) -> None:
         topic = {
             "display_name": "Innovative Educational Techniques",
             "keywords": ["Artificial Intelligence", "Border Security"],

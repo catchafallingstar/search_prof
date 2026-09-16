@@ -9,14 +9,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from db import _require_active_admin, get_db_connection
-from identity_schedule import minimum_recheck_sql, direct_identity_sql
 from settings import setting, setting_int
 from ingestion.institution_domains import OFFSHORE_SOURCE_PATTERN
 
 
-FACULTY_VERIFICATION_VERSION = 18
-MIN_PUBLIC_FACULTY_VERIFICATION_VERSION = 8
-RADAR_DISCOVERY_VERSION = 4
+FACULTY_VERIFICATION_VERSION = 20
+MIN_PUBLIC_FACULTY_VERIFICATION_VERSION = 20
+RADAR_DISCOVERY_VERSION = 6
 
 
 def _target_country_code() -> str:
@@ -94,15 +93,21 @@ def ensure_radar_topic(
 def enqueue_radar_job(
     job_type: str,
     *,
+    institution_id: int | None = None,
     radar_topic_id: int | None = None,
     professor_id: int | None = None,
+    faculty_directory_id: int | None = None,
+    paper_id: int | None = None,
     requested_by: int | None = None,
     priority: int = 50,
     max_attempts: int = 5,
 ) -> dict[str, Any]:
     # A professor's hiring-page refresh is shared across all topics and users.
     dedupe_topic = "-" if job_type == "CHECK_HIRING" and professor_id else (radar_topic_id or "-")
-    dedupe = f"{job_type}:{dedupe_topic}:{professor_id or '-'}"
+    dedupe = (
+        f"{job_type}:{institution_id or '-'}:{dedupe_topic}:"
+        f"{professor_id or '-'}:{faculty_directory_id or '-'}:{paper_id or '-'}"
+    )
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (dedupe,))
@@ -140,14 +145,16 @@ def enqueue_radar_job(
             cursor.execute(
                 """
                 INSERT INTO radar_jobs (
-                    radar_topic_id, professor_id, requested_by, job_type,
-                    dedupe_key, priority, max_attempts
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    institution_id, radar_topic_id, professor_id, faculty_directory_id,
+                    paper_id, requested_by, job_type, dedupe_key, priority, max_attempts
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (
-                    radar_topic_id,
+                    institution_id, radar_topic_id,
                     professor_id,
+                    faculty_directory_id,
+                    paper_id,
                     requested_by,
                     job_type,
                     dedupe,
@@ -163,54 +170,22 @@ def request_topic_index(
     requested_by: int | None = None,
     desired_results: int = 100,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Record demand and ensure exactly one useful indexing job is active."""
+    """Record demand and index only the trusted, locally rostered population."""
     topic = ensure_radar_topic(query, desired_results)
-    imported_legacy_results = 0
-    if int(topic.get("candidates_seen") or 0) == 0:
-        imported_legacy_results = import_latest_run_into_topic(
-            int(topic["id"]), str(topic["requested_query"])
-        )
-        topic = fetch_radar_topic_by_id(int(topic["id"])) or topic
     job: dict[str, Any] | None = None
-    if imported_legacy_results or int(topic.get("candidates_seen") or 0) == 0:
-        # Old foreground scans only retained their final verified slice. Keep
-        # those immediately useful results, but still build the full shared
-        # candidate index in the background.
-        job = enqueue_radar_job(
-            "DISCOVER_CANDIDATES",
-            radar_topic_id=int(topic["id"]),
-            requested_by=requested_by,
-            priority=90,
+    if (
+        int(topic.get("discovery_version") or 0) < RADAR_DISCOVERY_VERSION
+        or topic.get("last_indexed_at") is None
+        or (
+        topic.get("next_refresh_at") is None
+        or topic["next_refresh_at"] <= datetime.now(timezone.utc)
         )
-    elif int(topic.get("discovery_version") or 0) < RADAR_DISCOVERY_VERSION:
-        # Upgrade an older cached topic only when it is requested. This avoids
-        # launching a mass external reindex immediately after deployment.
+    ):
         job = enqueue_radar_job(
-            "REINDEX_RESEARCH",
+            "INDEX_ROSTER_TOPIC",
             radar_topic_id=int(topic["id"]),
             requested_by=requested_by,
             priority=95,
-        )
-    elif (
-        int(topic.get("verified_count") or 0) < int(topic["desired_results"])
-        and not bool(topic.get("sources_exhausted"))
-    ):
-        job = enqueue_radar_job(
-            "VERIFY_FACULTY",
-            radar_topic_id=int(topic["id"]),
-            requested_by=requested_by,
-            priority=85,
-            max_attempts=20,
-        )
-    elif (
-        topic.get("next_refresh_at") is None
-        or topic["next_refresh_at"] <= datetime.now(timezone.utc)
-    ):
-        job = enqueue_radar_job(
-            "REINDEX_RESEARCH",
-            radar_topic_id=int(topic["id"]),
-            requested_by=requested_by,
-            priority=60,
         )
     return topic, job
 
@@ -251,7 +226,7 @@ def fetch_topic_rebuild_status(limit: int = 250) -> list[dict[str, Any]]:
                     SELECT job.id, job.status, job.priority
                     FROM radar_jobs job
                     WHERE job.radar_topic_id = topic.id
-                      AND job.job_type = 'REINDEX_RESEARCH'
+                      AND job.job_type = 'INDEX_ROSTER_TOPIC'
                       AND job.status IN ('queued', 'running')
                     ORDER BY job.id DESC
                     LIMIT 1
@@ -306,7 +281,7 @@ def queue_outdated_topic_rebuilds(
     jobs: list[dict[str, Any]] = []
     for topic in outdated:
         job = enqueue_radar_job(
-            "REINDEX_RESEARCH",
+            "INDEX_ROSTER_TOPIC",
             radar_topic_id=int(topic["id"]),
             priority=priority,
             max_attempts=10,
@@ -360,23 +335,19 @@ def queue_seed_topics(
             desired_results,
             enforce_hourly_limit=False,
         )
-        if int(topic.get("candidates_seen") or 0) == 0:
-            job_type = "DISCOVER_CANDIDATES"
-        elif int(topic.get("discovery_version") or 0) < RADAR_DISCOVERY_VERSION:
-            job_type = "REINDEX_RESEARCH"
-        elif (
-            int(topic.get("verified_count") or 0) < int(topic["desired_results"])
-            and not bool(topic.get("sources_exhausted"))
+        if (
+            int(topic.get("discovery_version") or 0) >= RADAR_DISCOVERY_VERSION
+            and topic.get("next_refresh_at") is not None
+            and topic["next_refresh_at"] > datetime.now(timezone.utc)
         ):
-            job_type = "VERIFY_FACULTY"
-        else:
             skipped.append(name)
             continue
+        job_type = "INDEX_ROSTER_TOPIC"
         job = enqueue_radar_job(
             job_type,
             radar_topic_id=int(topic["id"]),
             priority=priority,
-            max_attempts=20 if job_type == "VERIFY_FACULTY" else 10,
+            max_attempts=10,
         )
         is_new = not bool(job.get("reused"))
         new_jobs += int(is_new)
@@ -651,14 +622,12 @@ def save_topic_candidates(
                         """
                         INSERT INTO radar_topic_professor_papers (
                             radar_topic_id, professor_id, paper_id,
-                            relevance_score, matched_query,
-                            matched_openalex_node_id, is_current_match
-                        ) VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                            relevance_score, matched_query, is_current_match
+                        ) VALUES (%s, %s, %s, %s, %s, TRUE)
                         ON CONFLICT (radar_topic_id, professor_id, paper_id)
                         DO UPDATE SET
                             relevance_score = EXCLUDED.relevance_score,
                             matched_query = EXCLUDED.matched_query,
-                            matched_openalex_node_id = EXCLUDED.matched_openalex_node_id,
                             is_current_match = TRUE,
                             last_matched_at = NOW()
                         """,
@@ -668,7 +637,6 @@ def save_topic_candidates(
                             int(evidence["paper_id"]),
                             float(evidence.get("relevance_score") or 0),
                             str(evidence.get("matched_query") or ""),
-                            evidence.get("matched_openalex_node_id"),
                         ),
                     )
 
@@ -676,58 +644,8 @@ def save_topic_candidates(
 def save_topic_taxonomy_mappings(
     radar_topic_id: int, mappings: list[dict[str, Any]]
 ) -> None:
-    with get_db_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM radar_topic_openalex_nodes WHERE radar_topic_id = %s",
-                (radar_topic_id,),
-            )
-            for mapping in mappings:
-                node_id = str(mapping.get("openalex_id") or "").strip()
-                if not node_id:
-                    continue
-                cursor.execute(
-                    """
-                    INSERT INTO openalex_research_nodes (
-                        openalex_id, node_type, display_name, description, parent_id
-                    ) VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (openalex_id) DO UPDATE SET
-                        node_type = EXCLUDED.node_type,
-                        display_name = EXCLUDED.display_name,
-                        description = COALESCE(
-                            NULLIF(EXCLUDED.description, ''),
-                            openalex_research_nodes.description
-                        ),
-                        parent_id = COALESCE(
-                            EXCLUDED.parent_id, openalex_research_nodes.parent_id
-                        ),
-                        updated_at = NOW()
-                    """,
-                    (
-                        node_id,
-                        str(mapping.get("node_type") or "topic"),
-                        str(mapping.get("display_name") or node_id),
-                        str(mapping.get("description") or ""),
-                        mapping.get("parent_id"),
-                    ),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO radar_topic_openalex_nodes (
-                        radar_topic_id, openalex_node_id, weight, mapping_method
-                    ) VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (radar_topic_id, openalex_node_id) DO UPDATE SET
-                        weight = EXCLUDED.weight,
-                        mapping_method = EXCLUDED.mapping_method,
-                        reviewed_at = NOW()
-                    """,
-                    (
-                        radar_topic_id,
-                        node_id,
-                        float(mapping.get("weight") or 0),
-                        str(mapping.get("mapping_method") or "automatic"),
-                    ),
-                )
+    """Retained API shim: topic evidence now comes only from paper text."""
+    return None
 
 
 def update_topic_after_discovery(
@@ -954,16 +872,6 @@ def fetch_topic_enrichment_ids(
                   AND check_row.source = 'NIH_REP'
                   AND check_row.next_check_at > NOW()
             )
-            OR (
-                p.orcid_id IS NOT NULL AND p.orcid_id <> ''
-                AND NOT EXISTS (
-                    SELECT 1 FROM professor_topic_grant_checks check_row
-                    WHERE check_row.professor_id = p.id
-                      AND check_row.radar_topic_id = rtp.radar_topic_id
-                      AND check_row.source = 'ORCID'
-                      AND check_row.next_check_at > NOW()
-                )
-            )
         )
     """ if source_kind == "grants" else f"""
         (
@@ -1123,6 +1031,7 @@ def fetch_indexed_professors(
     signal_filters = [
         "candidate_signal.professor_id = p.id",
         "candidate_signal.attribution_status = 'VERIFIED'",
+        "candidate_signal.check_status = 'PRESENT'",
         "candidate_signal.freshness_status IN ('CURRENT', 'UPCOMING', 'UNDATED')",
         "(candidate_signal.expires_at IS NULL OR candidate_signal.expires_at > NOW())",
     ]
@@ -1135,6 +1044,20 @@ def fetch_indexed_professors(
         "rtp.radar_topic_id = %s",
         "rtp.is_current_match = TRUE",
         "p.faculty_status = 'VERIFIED'",
+        "p.data_origin IN ('OFFICIAL_DIRECTORY', 'OFFICIAL_PROFILE', 'MANUAL_REVIEW')",
+        "p.employment_status IN ('ACTIVE_CONFIRMED', 'EMERITUS_CONFIRMED')",
+        """(EXISTS (
+                 SELECT 1 FROM faculty_directory_memberships membership
+                 JOIN faculty_directories directory ON directory.id = membership.directory_id
+                 WHERE membership.professor_id = p.id
+                   AND membership.currently_listed = TRUE AND directory.active = TRUE
+             ) OR EXISTS (
+                 SELECT 1 FROM faculty_verification_evidence evidence
+                 WHERE evidence.professor_id = p.id
+                   AND evidence.supports_decision = TRUE
+                   AND evidence.currentness = 'CURRENT'
+                   AND evidence.verification_status = 'VERIFIED'
+             ))""",
         "institution_record.country_code = %s",
     ]
     professor_params: list[Any] = [int(topic["id"]), _target_country_code()]
@@ -1155,6 +1078,15 @@ def fetch_indexed_professors(
                     rtp.professor_id, rtp.result_rank, rtp.research_score,
                     rtp.matching_papers, rtp.latest_paper_title,
                     rtp.latest_paper_year, rtp.latest_paper_url,
+                    rtp.evidence_basis, rtp.interest_summary,
+                    rtp.interest_source_url,
+                    EXISTS (SELECT 1 FROM professor_research_interests interest
+                            WHERE interest.professor_id=p.id
+                              AND interest.evidence_method='AI_SUGGESTION') AS interests_ai_generated,
+                    prc.expertise_score,
+                    prc.current_activity_score,
+                    prc.status AS research_activity_status,
+                    prc.recent_matching_paper_count,
                     (gc.last_checked_at IS NOT NULL) AS grant_sources_checked,
                     (p.public_hiring_checked_at IS NOT NULL) AS public_sources_checked,
                     p.public_hiring_checked_at, gc.last_checked_at AS grant_checked_at,
@@ -1164,6 +1096,13 @@ def fetch_indexed_professors(
                     p.lab_gpa_policy, p.lab_gpa_evidence_text,
                     p.lab_gpa_source_url, p.lab_gpa_minimum, p.program_gpa_minimum,
                     p.program_gpa_source_url, p.gpa_last_checked_at,
+                    p.lab_gpa_check_status,
+                    program_gpa.policy AS program_gpa_policy,
+                    program_gpa.minimum_gpa AS official_program_gpa_minimum,
+                    program_gpa.evidence_text AS program_gpa_evidence_text,
+                    program_gpa.source_url AS official_program_gpa_source_url,
+                    program_gpa.check_status AS program_gpa_check_status,
+                    program_gpa.checked_at AS program_gpa_checked_at,
                     (
                         p.public_hiring_check_status = 'NOT_CHECKED'
                         OR p.public_hiring_checked_at IS NULL
@@ -1183,7 +1122,7 @@ def fetch_indexed_professors(
                           )
                     ) AS hiring_check_pending,
                     p.name AS professor_name, p.institution_name,
-                    p.research_domain, p.homepage_url, p.openalex_id, p.career_stage,
+                    p.research_domain, p.homepage_url, p.career_stage,
                     p.faculty_status, p.faculty_title, p.faculty_source_url,
                     p.faculty_verified_at, p.official_institution_domain,
                     COALESCE(f.active_grants, 0) AS active_grants,
@@ -1222,7 +1161,7 @@ def fetch_indexed_professors(
                     END AS result_category,
                     LEAST(
                         100,
-                        rtp.research_score
+                        COALESCE(prc.current_activity_score, rtp.research_score)
                         + CASE
                             WHEN o.id IS NOT NULL
                                  AND o.source_kind IN ('verified_post', 'university_post') THEN 50
@@ -1240,6 +1179,9 @@ def fetch_indexed_professors(
                 FROM radar_topic_professors rtp
                 JOIN radar_topics topic ON topic.id = rtp.radar_topic_id
                 JOIN professors p ON p.id = rtp.professor_id
+                LEFT JOIN professor_research_categories prc
+                  ON prc.professor_id=p.id
+                 AND prc.category_id=topic.research_category_id
                 JOIN institutions institution_record
                   ON institution_record.id = p.institution_id
                 LEFT JOIN LATERAL (
@@ -1284,6 +1226,20 @@ def fetch_indexed_professors(
                              candidate_signal.observed_at DESC
                     LIMIT 1
                 ) hs ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT requirement.*
+                    FROM program_admission_requirements requirement
+                    WHERE requirement.institution_id = p.institution_id
+                      AND requirement.degree_type = 'PhD'
+                      AND requirement.department_key IN (
+                          LOWER(BTRIM(regexp_replace(COALESCE(p.department, ''), '\\s+', ' ', 'g'))), ''
+                      )
+                    ORDER BY
+                        (requirement.department_key =
+                            LOWER(BTRIM(regexp_replace(COALESCE(p.department, ''), '\\s+', ' ', 'g')))) DESC,
+                        requirement.checked_at DESC NULLS LAST
+                    LIMIT 1
+                ) program_gpa ON TRUE
                 WHERE {professor_where}
                   AND (
                       p.faculty_verification_method = 'manual_review'
@@ -1351,30 +1307,32 @@ def claim_next_radar_job(
                     WHERE status = 'queued' AND available_at <= NOW()
                       AND attempts < max_attempts
                       AND NOT (job_type = ANY(%s::TEXT[]))
-                      AND (%s OR job_type NOT IN ('VERIFY_FACULTY', 'REFRESH_FACULTY')
-                           OR EXISTS (
-                               SELECT 1 FROM professors p
-                               JOIN institutions i ON i.id = p.institution_id
-                               WHERE {direct_identity_sql()}
-                                 AND {minimum_recheck_sql()}
-                                 AND p.faculty_verification_method IS DISTINCT FROM 'manual_review'
-                                 AND (p.identity_retry_at IS NULL OR p.identity_retry_at <= NOW())
-                                 AND (p.faculty_verification_version < %s
-                                      OR p.next_identity_check_at IS NULL OR p.next_identity_check_at <= NOW())
-                                 AND i.country_code = %s
-                                 AND ((job_type = 'REFRESH_FACULTY' AND p.id = radar_jobs.professor_id)
-                                      OR (job_type = 'VERIFY_FACULTY' AND EXISTS (
-                                          SELECT 1 FROM radar_topic_professors rtp
-                                          WHERE rtp.professor_id = p.id AND rtp.radar_topic_id = radar_jobs.radar_topic_id
-                                            AND rtp.is_current_match = TRUE
-                                      )))
-                           ))
+                      -- Leave every search-capable enrichment job queued during
+                      -- the shared DDGS pacing window.  Otherwise the worker
+                      -- claims each job only for it to discover the same busy
+                      -- search slot and defer again.  Jobs that cannot consume
+                      -- a web-search slot remain eligible while DDGS cools down.
+                      AND (%s OR job_type NOT IN (
+                          'DISCOVER_FACULTY_DIRECTORIES',
+                          'CHECK_PROGRAM_GPA', 'CHECK_HIRING'
+                      ))
+                      -- A single local model serves all workers.  Leave later
+                      -- reviews queued while one Qwen job is running.
+                      AND (
+                          job_type <> 'QWEN_REVIEW_PUBLICATION'
+                          OR NOT EXISTS (
+                              SELECT 1 FROM radar_jobs active_qwen
+                              WHERE active_qwen.job_type='QWEN_REVIEW_PUBLICATION'
+                                AND active_qwen.status='running'
+                          )
+                      )
                     ORDER BY priority DESC, available_at, created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE radar_jobs job
                 SET status = 'running', attempts = attempts + 1,
+                    outcome_status = 'PENDING',
                     locked_at = NOW(), locked_by = %s,
                     started_at = NOW(), completed_at = NULL,
                     last_error = NULL, updated_at = NOW()
@@ -1382,24 +1340,29 @@ def claim_next_radar_job(
                 WHERE job.id = candidate.id
                 RETURNING job.*
                 """,
-                (list(excluded_job_types or []), search_ready, FACULTY_VERIFICATION_VERSION,
-                 _target_country_code(), worker_id),
+                (list(excluded_job_types or []), search_ready, worker_id),
             )
             return cursor.fetchone()
 
 
-def complete_radar_job(job_id: int, result: dict[str, Any] | None = None) -> None:
+def complete_radar_job(
+    job_id: int,
+    result: dict[str, Any] | None = None,
+    *,
+    outcome_status: str = "SUCCEEDED",
+) -> None:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE radar_jobs
-                SET status = 'completed', completed_at = NOW(), updated_at = NOW(),
+                SET status = 'completed', outcome_status = %s,
+                    completed_at = NOW(), updated_at = NOW(),
                     locked_at = NULL, locked_by = NULL, last_error = NULL,
-                    result_json = %s::jsonb
+                    result_json = COALESCE(result_json, '{}'::jsonb) || %s::jsonb
                 WHERE id = %s
                 """,
-                (json.dumps(result or {}), job_id),
+                (outcome_status, json.dumps(result or {}), job_id),
             )
 
 
@@ -1414,6 +1377,7 @@ def reschedule_radar_job(
                 """
                 UPDATE radar_jobs
                 SET status = 'queued', attempts = 0,
+                    outcome_status = 'PENDING',
                     available_at = NOW() + (%s * INTERVAL '1 second'),
                     locked_at = NULL, locked_by = NULL, started_at = NULL,
                     last_error = NULL, updated_at = NOW(),
@@ -1489,6 +1453,7 @@ def update_radar_job_progress(
     stage: str,
     professor_ids: list[int] | None = None,
     detail: str = "",
+    **metadata: Any,
 ) -> None:
     """Persist the current batch so staff can see work without terminal access."""
     ordered_ids = list(dict.fromkeys(int(value) for value in professor_ids or []))
@@ -1511,6 +1476,7 @@ def update_radar_job_progress(
                 "live_detail": detail,
                 "live_professors": professors,
                 "live_updated_at": datetime.now(timezone.utc).isoformat(),
+                **{key: value for key, value in metadata.items() if value is not None},
             }
             cursor.execute(
                 """
@@ -1538,6 +1504,39 @@ def stop_worker_heartbeat(worker_id: str) -> None:
 
 def enqueue_due_maintenance(limit: int = 20) -> int:
     queued = 0
+    # Stage 1: discover approved official faculty directories from the US
+    # institution registry. This is the only path that creates new people.
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT i.id
+                   FROM institutions i
+                   WHERE i.country_code = 'US'
+                     AND i.organization_type = 'HIGHER_EDUCATION'
+                     AND NULLIF(i.primary_domain, '') IS NOT NULL
+                     AND i.operating_status IS DISTINCT FROM 'INACTIVE'
+                     AND (i.faculty_discovery_next_at IS NULL
+                          OR i.faculty_discovery_next_at <= NOW())
+                     AND NOT EXISTS (
+                         SELECT 1 FROM radar_jobs job
+                         WHERE job.institution_id = i.id
+                           AND job.job_type = 'DISCOVER_FACULTY_DIRECTORIES'
+                           AND job.status IN ('queued', 'running')
+                     )
+                   ORDER BY i.faculty_discovery_checked_at NULLS FIRST, i.id
+                   LIMIT %s""",
+                (max(1, min(100, int(limit))),),
+            )
+            institution_ids = [int(row["id"]) for row in cursor.fetchall()]
+    for institution_id in institution_ids:
+        job = enqueue_radar_job(
+            "DISCOVER_FACULTY_DIRECTORIES",
+            institution_id=institution_id,
+            priority=70,
+            max_attempts=20,
+        )
+        queued += int(not job.get("reused"))
+
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1560,7 +1559,182 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
             topic_ids = [int(row["id"]) for row in cursor.fetchall()]
     for radar_topic_id in topic_ids:
         job = enqueue_radar_job(
-            "REINDEX_RESEARCH", radar_topic_id=radar_topic_id, priority=30
+            "INDEX_ROSTER_TOPIC", radar_topic_id=radar_topic_id, priority=30
+        )
+        queued += int(not job.get("reused"))
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id FROM faculty_directories directory
+                WHERE active = TRUE AND validation_status = 'APPROVED'
+                  AND (last_success_at IS NULL OR last_success_at <= NOW() - INTERVAL '30 days')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM radar_jobs active_job
+                      WHERE active_job.faculty_directory_id = directory.id
+                        AND active_job.status IN ('queued', 'running')
+                  )
+                ORDER BY last_success_at NULLS FIRST, id
+                LIMIT %s
+                """,
+                (max(1, min(100, int(limit))),),
+            )
+            directory_ids = [int(row["id"]) for row in cursor.fetchall()]
+    for directory_id in directory_ids:
+        job = enqueue_radar_job(
+            "CRAWL_FACULTY_DIRECTORY",
+            faculty_directory_id=directory_id,
+            priority=90,
+            max_attempts=5,
+        )
+        queued += int(not job.get("reused"))
+
+    # Stage 3: official publication pages first; Scholar is a recovery source.
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT p.id
+                   FROM professors p
+                   WHERE p.faculty_status = 'VERIFIED'
+                     AND p.data_origin = 'OFFICIAL_DIRECTORY'
+                     AND p.canonical_rank IN (
+                         'ASSISTANT_PROFESSOR','ASSOCIATE_PROFESSOR','PROFESSOR'
+                     )
+                     AND p.faculty_title !~* '\\m(adjunct|affiliate|affiliated|visiting|emeritus|emerita|part[- ]time|lecturer|instructor)\\M'
+                     AND EXISTS (
+                         SELECT 1 FROM roster_member_candidates candidate
+                         WHERE candidate.professor_id = p.id
+                           AND candidate.validation_status IN ('PROFILE_VERIFIED', 'ROSTER_VERIFIED')
+                     )
+                     AND (
+                         p.publication_status = 'NOT_CHECKED'
+                         OR (p.publication_discovery_version < 6
+                             AND NOT EXISTS (SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id))
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM radar_jobs job
+                         WHERE job.professor_id = p.id
+                           AND job.job_type = 'MATCH_FACULTY_PUBLICATIONS'
+                           AND job.status IN ('queued', 'running')
+                     )
+                   ORDER BY p.roster_verified_at NULLS FIRST, p.id
+                   LIMIT %s""",
+                (max(1, min(100, int(limit))),),
+            )
+            publication_ids = [int(row["id"]) for row in cursor.fetchall()]
+    for professor_id in publication_ids:
+        job = enqueue_radar_job(
+            "MATCH_FACULTY_PUBLICATIONS",
+            professor_id=professor_id,
+            priority=80,
+            max_attempts=8,
+        )
+        queued += int(not job.get("reused"))
+
+    # Stage 3b: resolve abstracts from known DOI/source URLs and classify each
+    # paper once. This never performs a general person or paper web search.
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT paper.id
+                   FROM papers paper
+                   WHERE (
+                       paper.abstract_status='NOT_CHECKED'
+                       OR (paper.abstract_status='SOURCE_UNAVAILABLE'
+                           AND paper.abstract_checked_at <= NOW() - INTERVAL '7 days')
+                       OR paper.classification_version < 1
+                   )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM radar_jobs job
+                       WHERE job.paper_id=paper.id
+                         AND job.job_type='ENRICH_CLASSIFY_PAPER'
+                         AND job.status IN ('queued','running')
+                     )
+                   ORDER BY paper.abstract_checked_at NULLS FIRST, paper.id
+                   LIMIT %s""",
+                (max(1, min(100, int(limit))),),
+            )
+            paper_ids = [int(row["id"]) for row in cursor.fetchall()]
+    for paper_id in paper_ids:
+        job = enqueue_radar_job(
+            "ENRICH_CLASSIFY_PAPER", paper_id=paper_id,
+            priority=45, max_attempts=3,
+        )
+        queued += int(not job.get("reused"))
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT p.id FROM professors p
+                   WHERE p.data_origin = 'OFFICIAL_DIRECTORY'
+                     AND p.employment_status IN ('ACTIVE_CONFIRMED', 'EMERITUS_CONFIRMED')
+                     AND EXISTS (
+                         SELECT 1 FROM roster_member_candidates candidate
+                         WHERE candidate.professor_id = p.id
+                           AND candidate.validation_status IN ('PROFILE_VERIFIED', 'ROSTER_VERIFIED')
+                     )
+                     AND EXISTS (
+                             SELECT 1 FROM faculty_directory_memberships membership
+                             JOIN faculty_directories directory ON directory.id = membership.directory_id
+                             WHERE membership.professor_id = p.id
+                               AND membership.currently_listed = TRUE
+                               AND directory.active = TRUE
+                               AND directory.validation_status = 'APPROVED'
+                         )
+                     AND (p.public_hiring_next_check_at IS NULL
+                          OR p.public_hiring_next_check_at <= NOW())
+                     AND NOT EXISTS (
+                         SELECT 1 FROM radar_jobs job
+                         WHERE job.professor_id = p.id AND job.job_type = 'CHECK_HIRING'
+                           AND job.status IN ('queued', 'running')
+                     )
+                   ORDER BY p.public_hiring_next_check_at NULLS FIRST, p.id
+                   LIMIT %s""",
+                (max(1, min(100, int(limit))),),
+            )
+            hiring_ids = [int(row["id"]) for row in cursor.fetchall()]
+    for professor_id in hiring_ids:
+        job = enqueue_radar_job(
+            "CHECK_HIRING", professor_id=professor_id, priority=35, max_attempts=5
+        )
+        queued += int(not job.get("reused"))
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT DISTINCT ON (p.institution_id, COALESCE(p.department, '')) p.id
+                   FROM professors p
+                   LEFT JOIN program_admission_requirements requirement
+                     ON requirement.institution_id = p.institution_id
+                    AND requirement.department_key = LOWER(BTRIM(COALESCE(p.department, '')))
+                    AND requirement.degree_type = 'PhD'
+                   WHERE p.data_origin = 'OFFICIAL_DIRECTORY'
+                     AND p.employment_status = 'ACTIVE_CONFIRMED'
+                     AND EXISTS (
+                         SELECT 1 FROM roster_member_candidates candidate
+                         WHERE candidate.professor_id = p.id
+                           AND candidate.validation_status IN ('PROFILE_VERIFIED', 'ROSTER_VERIFIED')
+                     )
+                     AND EXISTS (
+                             SELECT 1 FROM faculty_directory_memberships membership
+                             JOIN faculty_directories directory ON directory.id = membership.directory_id
+                             WHERE membership.professor_id = p.id
+                               AND membership.currently_listed = TRUE
+                               AND directory.active = TRUE
+                               AND directory.validation_status = 'APPROVED'
+                         )
+                     AND (requirement.next_check_at IS NULL OR requirement.next_check_at <= NOW())
+                     AND NOT EXISTS (
+                         SELECT 1 FROM radar_jobs job
+                         WHERE job.professor_id = p.id AND job.job_type = 'CHECK_PROGRAM_GPA'
+                           AND job.status IN ('queued', 'running')
+                     )
+                   ORDER BY p.institution_id, COALESCE(p.department, ''), p.id
+                   LIMIT %s""",
+                (max(1, min(100, int(limit))),),
+            )
+            gpa_ids = [int(row["id"]) for row in cursor.fetchall()]
+    for professor_id in gpa_ids:
+        job = enqueue_radar_job(
+            "CHECK_PROGRAM_GPA", professor_id=professor_id, priority=25, max_attempts=5
         )
         queued += int(not job.get("reused"))
     return queued
@@ -1588,7 +1762,7 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
     cursor.execute(
         """
         WITH ranked_papers AS (
-            SELECT pp.professor_id, paper.openalex_id, paper.title,
+            SELECT pp.professor_id, paper.source_url, paper.title,
                    paper.publication_year, paper.doi, pp.author_position,
                    ROW_NUMBER() OVER (
                        PARTITION BY pp.professor_id
@@ -1600,7 +1774,7 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
             JOIN papers paper ON paper.id = pp.paper_id
             WHERE pp.professor_id = ANY(%s)
         )
-        SELECT professor_id, openalex_id, title, publication_year, doi,
+        SELECT professor_id, source_url, title, publication_year, doi,
                author_position
         FROM ranked_papers
         WHERE evidence_rank <= 5
@@ -1610,7 +1784,7 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
     )
     for paper in cursor.fetchall():
         context = {
-            "openalex_id": paper["openalex_id"],
+            "source_url": paper["source_url"],
             "title": paper["title"],
             "publication_year": paper["publication_year"],
             "doi": paper["doi"],
@@ -1640,7 +1814,7 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
         """
         WITH ranked_topic_papers AS (
             SELECT evidence.professor_id, topic.requested_query,
-                   paper.openalex_id, paper.title, paper.publication_year,
+                   paper.source_url, paper.title, paper.publication_year,
                    paper.doi, pp.author_position, evidence.relevance_score,
                    evidence.matched_query,
                    ROW_NUMBER() OVER (
@@ -1662,7 +1836,7 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
             WHERE evidence.professor_id = ANY(%s)
               AND evidence.is_current_match = TRUE
         )
-        SELECT professor_id, requested_query, openalex_id, title,
+        SELECT professor_id, requested_query, source_url, title,
                publication_year, doi, author_position, relevance_score,
                matched_query
         FROM ranked_topic_papers
@@ -1674,7 +1848,7 @@ def _attach_identity_review_context(cursor: Any, identities: list[dict[str, Any]
     for paper in cursor.fetchall():
         context = {
             "research_area": paper["requested_query"],
-            "openalex_id": paper["openalex_id"],
+            "source_url": paper["source_url"],
             "title": paper["title"],
             "publication_year": paper["publication_year"],
             "doi": paper["doi"],
@@ -1764,11 +1938,21 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                        worker.last_seen_at, worker.current_job_id,
                        job.job_type, job.started_at AS job_started_at,
                        job.result_json AS progress,
-                       topic.requested_query, professor.name AS professor_name
+                       topic.requested_query, professor.name AS professor_name,
+                       institution.name AS institution_name,
+                       directory.directory_url, paper.title AS paper_title
                 FROM radar_worker_heartbeats worker
                 LEFT JOIN radar_jobs job ON job.id = worker.current_job_id
                 LEFT JOIN radar_topics topic ON topic.id = job.radar_topic_id
                 LEFT JOIN professors professor ON professor.id = job.professor_id
+                LEFT JOIN faculty_directories directory
+                  ON directory.id = job.faculty_directory_id
+                LEFT JOIN papers paper ON paper.id = job.paper_id
+                LEFT JOIN institutions institution
+                  ON institution.id = COALESCE(
+                      job.institution_id, directory.institution_id,
+                      professor.institution_id
+                  )
                 WHERE worker.stopped_at IS NULL
                   AND worker.last_seen_at > NOW() - INTERVAL '2 minutes'
                 ORDER BY worker.last_seen_at DESC
@@ -1827,7 +2011,7 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
 
             cursor.execute(
                 """
-                SELECT 'VERIFY_FACULTY' AS stage, professor.id AS professor_id,
+                SELECT 'CRAWL_FACULTY_DIRECTORY' AS stage, professor.id AS professor_id,
                        professor.name, professor.institution_name,
                        professor.faculty_checked_at AS activity_at,
                        professor.faculty_status AS result_status,
@@ -1922,6 +2106,65 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
 
             cursor.execute(
                 """
+                SELECT job.job_type AS stage, professor.id AS professor_id,
+                       COALESCE(professor.name, paper.title,
+                                job.result_json->>'member_name') AS name,
+                       institution.name AS institution_name,
+                       COALESCE(job.completed_at, job.updated_at) AS activity_at,
+                       CASE
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
+                              AND job.job_type IN (
+                                'MATCH_FACULTY_PUBLICATIONS','QWEN_REVIEW_PUBLICATION'
+                              )
+                           THEN 'Publication identity verified — papers imported'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
+                           THEN 'Approved'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='REVIEW_REQUIRED' THEN 'Needs staff review'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='REJECTED' THEN 'Rejected safely'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='NO_CHANGE' THEN 'Checked — no new evidence'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='NO_PUBLICATIONS_FOUND' THEN 'Faculty approved — no verified publication source'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='SOURCE_UNAVAILABLE' THEN 'Source temporarily unavailable'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='SUCCEEDED' THEN 'Finished successfully'
+                         ELSE UPPER(job.status)
+                       END AS result_status,
+                       COALESCE(job.result_json->>'live_detail', job.last_error,
+                                job.result_json::TEXT) AS result_detail,
+                       job.last_error AS failure_code,
+                       COALESCE(job.result_json->>'source_url', directory.directory_url)
+                           AS source_url,
+                       NULL::TEXT AS observed_title,
+                       NULL::TEXT AS observed_institution,
+                       job.result_json->>'paper_title' AS evidence_text,
+                       job.result_json->'steps' AS audit_steps,
+                       ARRAY_REMOVE(ARRAY[topic.requested_query], NULL) AS research_areas
+                FROM radar_jobs job
+                LEFT JOIN professors professor ON professor.id = job.professor_id
+                LEFT JOIN papers paper ON paper.id = job.paper_id
+                LEFT JOIN faculty_directories directory
+                  ON directory.id = job.faculty_directory_id
+                LEFT JOIN institutions institution
+                  ON institution.id = COALESCE(
+                      job.institution_id, directory.institution_id,
+                      professor.institution_id
+                  )
+                LEFT JOIN radar_topics topic ON topic.id = job.radar_topic_id
+                WHERE job.status IN ('completed', 'failed')
+                  AND job.job_type IN (
+                      'DISCOVER_FACULTY_DIRECTORIES',
+                      'MATCH_FACULTY_PUBLICATIONS', 'QWEN_REVIEW_PUBLICATION',
+                      'ENRICH_CLASSIFY_PAPER',
+                      'INDEX_ROSTER_TOPIC',
+                      'CHECK_PROGRAM_GPA'
+                  )
+                ORDER BY COALESCE(job.completed_at, job.updated_at) DESC
+                LIMIT %s
+                """,
+                (max(1, min(50, int(recent_limit))),),
+            )
+            activity_logs.extend(cursor.fetchall())
+
+            cursor.execute(
+                """
                 SELECT 'CHECK_GRANTS' AS stage, professor.id AS professor_id,
                        professor.name, professor.institution_name,
                        professor.grant_checked_at AS activity_at,
@@ -1974,8 +2217,6 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                 """
                 SELECT status, COUNT(*) AS count
                 FROM radar_jobs
-                WHERE job_type IN ('VERIFY_FACULTY', 'REFRESH_FACULTY')
-                  AND status IN ('queued', 'running')
                 GROUP BY status
                 """
             )
@@ -2027,6 +2268,54 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
             job_counts = list(cursor.fetchall())
             cursor.execute(
                 """
+                SELECT
+                    (SELECT COUNT(*) FROM professors
+                     WHERE faculty_status='VERIFIED'
+                       AND data_origin='OFFICIAL_DIRECTORY') AS approved_faculty,
+                    (
+                      (SELECT COUNT(*) FROM faculty_directories
+                       WHERE validation_status='NEEDS_REVIEW')
+                      + (SELECT COUNT(*) FROM faculty_page_candidates
+                         WHERE classification_status='UNCERTAIN_REQUIRES_REVIEW')
+                      + (SELECT COUNT(*) FROM roster_member_candidates
+                         WHERE validation_status NOT IN
+                           ('PENDING','PROFILE_VERIFIED','ROSTER_VERIFIED',
+                            'REJECTED','NOT_A_PERSON','HISTORICAL_PROFILE',
+                            'NOT_GROUP_LEADING_FACULTY'))
+                      + (SELECT COUNT(*) FROM professor_identity_review_queue
+                         WHERE status='PENDING')
+                    ) AS needs_staff_review,
+                    (
+                      (SELECT COUNT(*) FROM faculty_page_candidates
+                       WHERE classification_status='NOT_A_ROSTER')
+                      + (SELECT COUNT(*) FROM roster_member_candidates
+                         WHERE validation_status IN
+                           ('REJECTED','NOT_A_PERSON','HISTORICAL_PROFILE',
+                            'NOT_GROUP_LEADING_FACULTY'))
+                    ) AS automatically_rejected,
+                    (SELECT COUNT(*) FROM radar_jobs
+                     WHERE status='failed'
+                        OR (status='running' AND locked_at < NOW() - INTERVAL '6 minutes'))
+                        AS technical_failures,
+                    (SELECT COUNT(*) FROM professors p
+                     WHERE p.publication_status IN ('OFFICIAL_PUBLICATIONS_FOUND','SCHOLAR_VERIFIED'))
+                        AS publication_sources_verified,
+                    (SELECT COUNT(*) FROM professors p
+                     WHERE p.publication_status='REVIEW_REQUIRED')
+                        AS publication_sources_unresolved,
+                    (SELECT COUNT(DISTINCT professor_id) FROM professor_papers)
+                        AS faculty_with_publications,
+                    (SELECT COUNT(*) FROM professors p
+                     WHERE p.faculty_status='VERIFIED'
+                       AND p.data_origin='OFFICIAL_DIRECTORY'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id
+                       )) AS faculty_without_publications
+                """
+            )
+            quality_counts = cursor.fetchone() or {}
+            cursor.execute(
+                """
                 SELECT job.id, job.job_type,
                        CASE
                            WHEN job.status = 'running'
@@ -2043,10 +2332,19 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                        job.attempts, job.max_attempts, job.available_at,
                        job.started_at, job.completed_at, job.last_error,
                        topic.requested_query, p.name AS professor_name,
+                       institution.name AS institution_name,
+                       directory.directory_url,
                        job.created_at
                 FROM radar_jobs job
                 LEFT JOIN radar_topics topic ON topic.id = job.radar_topic_id
                 LEFT JOIN professors p ON p.id = job.professor_id
+                LEFT JOIN faculty_directories directory
+                  ON directory.id = job.faculty_directory_id
+                LEFT JOIN institutions institution
+                  ON institution.id = COALESCE(
+                      job.institution_id, directory.institution_id,
+                      p.institution_id
+                  )
                 ORDER BY
                     CASE
                         WHEN job.status = 'running'
@@ -2158,13 +2456,15 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                     )
                 )
                 job_type = str(topic.get("active_job_type") or "")
-                if job_type in {"DISCOVER_CANDIDATES", "REINDEX_RESEARCH"}:
-                    stage = "Finding researchers"
-                elif job_type in {"VERIFY_FACULTY", "REFRESH_FACULTY"}:
-                    stage = "Verifying faculty"
-                elif job_type in {
-                    "CHECK_GRANTS", "CHECK_HIRING", "ENRICH_PROFESSORS"
-                }:
+                if job_type == "INDEX_ROSTER_TOPIC":
+                    stage = "Matching roster faculty"
+                elif job_type == "DISCOVER_FACULTY_DIRECTORIES":
+                    stage = "Finding official faculty pages"
+                elif job_type == "CRAWL_FACULTY_DIRECTORY":
+                    stage = "Importing official faculty rosters"
+                elif job_type == "MATCH_FACULTY_PUBLICATIONS":
+                    stage = "Matching faculty publications"
+                elif job_type in {"CHECK_GRANTS", "CHECK_HIRING", "CHECK_PROGRAM_GPA"}:
                     stage = "Checking opportunities"
                 elif int(topic.get("failed_jobs") or 0) > 0:
                     stage = "Needs attention"
@@ -2209,7 +2509,7 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
             search_providers = list(cursor.fetchall())
             cursor.execute(
                 """
-                SELECT p.id, p.openalex_id, p.name, p.institution_name,
+                SELECT p.id, p.name, p.institution_name,
                        p.research_domain, p.faculty_title, p.faculty_status,
                        p.faculty_confidence, p.faculty_verification_method,
                        faculty_checked_at, next_identity_check_at,
@@ -2235,7 +2535,7 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
             identity_review = list(cursor.fetchall())
             cursor.execute(
                 """
-                SELECT p.id, p.openalex_id, p.name, p.institution_name,
+                SELECT p.id, p.name, p.institution_name,
                        p.research_domain, p.faculty_title, p.faculty_status,
                        p.faculty_confidence, p.faculty_verification_method,
                        p.faculty_checked_at, p.next_identity_check_at,
@@ -2310,8 +2610,87 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                 (max(1, min(250, int(limit))),),
             )
             hiring_issues = list(cursor.fetchall())
+            cursor.execute(
+                """SELECT directory.id, institution.name AS institution_name,
+                          directory.department, directory.directory_url,
+                          directory.validation_status, directory.validation_reason,
+                          directory.last_error, directory.updated_at
+                   FROM faculty_directories directory
+                   JOIN institutions institution ON institution.id = directory.institution_id
+                   WHERE directory.validation_status = 'NEEDS_REVIEW'
+                      OR (directory.active = TRUE AND directory.last_error IS NOT NULL)
+                   ORDER BY directory.updated_at DESC
+                   LIMIT %s""",
+                (max(1, min(250, int(limit))),),
+            )
+            directory_issues = list(cursor.fetchall())
+            cursor.execute(
+                """SELECT candidate.id, institution.name AS institution_name,
+                          candidate.candidate_url, candidate.final_url,
+                          candidate.discovery_method, candidate.page_type,
+                          candidate.scope_label, candidate.classification_status,
+                          candidate.classification_reason, candidate.evidence,
+                          candidate.checked_at
+                   FROM faculty_page_candidates candidate
+                   JOIN institutions institution ON institution.id=candidate.institution_id
+                   WHERE candidate.classification_status = 'UNCERTAIN_REQUIRES_REVIEW'
+                   ORDER BY candidate.checked_at DESC NULLS LAST
+                   LIMIT %s""",
+                (max(1, min(250, int(limit))),),
+            )
+            faculty_page_issues = list(cursor.fetchall())
+            cursor.execute(
+                """SELECT candidate.id, candidate.displayed_name,
+                          institution.name AS institution_name, directory.department,
+                          candidate.profile_url, candidate.displayed_title,
+                          candidate.email, candidate.office_address,
+                          candidate.validation_status, candidate.validation_reason,
+                          candidate.profile_evidence, candidate.checked_at,
+                          candidate.staff_overrides
+                   FROM roster_member_candidates candidate
+                   JOIN faculty_directories directory ON directory.id=candidate.directory_id
+                   JOIN institutions institution ON institution.id=directory.institution_id
+                   WHERE candidate.validation_status NOT IN
+                         ('PENDING', 'PROFILE_VERIFIED', 'ROSTER_VERIFIED',
+                          'REJECTED', 'NOT_A_PERSON', 'HISTORICAL_PROFILE',
+                          'NOT_GROUP_LEADING_FACULTY')
+                   ORDER BY candidate.checked_at DESC NULLS LAST
+                   LIMIT %s""",
+                (max(1, min(250, int(limit))),),
+            )
+            roster_member_issues = list(cursor.fetchall())
+            cursor.execute(
+                """SELECT review.id, review.reason, review.evidence,
+                          review.created_at, professor.id AS professor_id,
+                          professor.name, professor.institution_name,
+                          professor.faculty_status,
+                          professor.publication_status AS publication_identity_status,
+                          professor.faculty_title,
+                          source.source_url AS candidate_url,
+                          source.identity_status AS candidate_status,
+                          source.evidence AS source_evidence
+                   FROM professor_identity_review_queue review
+                   LEFT JOIN LATERAL UNNEST(review.professor_ids) ids(professor_id)
+                     ON TRUE
+                   LEFT JOIN professors professor ON professor.id = ids.professor_id
+                   LEFT JOIN LATERAL (
+                     SELECT source_url, identity_status, evidence
+                     FROM professor_publication_sources
+                     WHERE professor_id=professor.id
+                       AND source_type='GOOGLE_SCHOLAR'
+                       AND identity_status <> 'VERIFIED'
+                     ORDER BY checked_at DESC
+                     LIMIT 1
+                   ) source ON TRUE
+                   WHERE review.status = 'PENDING'
+                   ORDER BY review.created_at DESC
+                   LIMIT %s""",
+                (max(1, min(250, int(limit))),),
+            )
+            publication_identity_issues = list(cursor.fetchall())
     return {
         "job_counts": job_counts,
+        "quality_counts": quality_counts,
         "jobs": jobs,
         "topics": topics,
         "workers": workers,
@@ -2321,6 +2700,10 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
         "identity_ai_usage": identity_ai_usage,
         "hiring_metrics": hiring_metrics,
         "hiring_issues": hiring_issues,
+        "directory_issues": directory_issues,
+        "faculty_page_issues": faculty_page_issues,
+        "roster_member_issues": roster_member_issues,
+        "publication_identity_issues": publication_identity_issues,
     }
 
 
@@ -2338,6 +2721,133 @@ def retry_radar_job(owner_user_id: int, job_id: int) -> None:
                 """,
                 (job_id,),
             )
+
+
+def save_publication_review_candidate(
+    owner_user_id: int, professor_id: int, scholar_url: str
+) -> dict[str, Any]:
+    """Save an unverified staff lead and queue only the serialized Qwen review."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """SELECT id FROM professors
+                   WHERE id=%s AND faculty_status='VERIFIED'
+                     AND data_origin='OFFICIAL_DIRECTORY'""",
+                (professor_id,),
+            )
+            if not cursor.fetchone():
+                raise ValueError("This record is not an approved roster professor.")
+    from ingestion.publication_discovery import save_staff_scholar_candidate
+    save_staff_scholar_candidate(
+        professor_id, scholar_url, submitted_by=owner_user_id
+    )
+    return enqueue_radar_job(
+        "QWEN_REVIEW_PUBLICATION",
+        professor_id=professor_id,
+        requested_by=owner_user_id,
+        priority=100,
+        max_attempts=1,
+    )
+
+
+def save_roster_review_record(owner_user_id: int, candidate_id: int,
+                              values: dict[str, str]) -> None:
+    """Persist staff corrections without automatically approving faculty."""
+    from urllib.parse import urlparse
+    from ingestion.name_normalization import canonical_name_key
+    from ingestion.homepagefinder import is_public_http_url
+    allowed = {'name', 'title', 'email', 'office_address', 'profile_url'}
+    clean = {key: str(value).strip() for key, value in values.items() if key in allowed}
+    if not clean.get('name') or len(clean['name']) > 200:
+        raise ValueError('Enter a person name (at most 200 characters).')
+    parsed = urlparse(clean.get('profile_url', ''))
+    if parsed.scheme not in {'https', 'http'} or not parsed.hostname or parsed.username:
+        raise ValueError('Enter a public faculty profile URL.')
+    if not is_public_http_url(clean['profile_url'], resolve_dns=True):
+        raise ValueError('The profile URL must resolve to a public website.')
+    if any(len(value) > 2000 for value in clean.values()):
+        raise ValueError('One of the values is too long.')
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute('SELECT * FROM roster_member_candidates WHERE id=%s FOR UPDATE', (candidate_id,))
+            before = cursor.fetchone()
+            if not before:
+                raise ValueError('This roster entry no longer exists.')
+            clean['_source_profile_key'] = (before.get('staff_overrides') or {}).get(
+                '_source_profile_key', before['canonical_profile_url'])
+            cursor.execute('''UPDATE roster_member_candidates SET staff_overrides=%s::jsonb,
+                displayed_name=%s, canonical_name_key=%s, displayed_title=%s,
+                email=%s,office_address=%s,validation_status='NEEDS_REVIEW',
+                validation_reason='Staff corrections saved; awaiting source revalidation.'
+                WHERE id=%s''',
+                (json.dumps(clean), clean['name'], canonical_name_key(clean['name']),
+                 clean.get('title',''), clean.get('email',''), clean.get('office_address',''), candidate_id))
+            cursor.execute('''INSERT INTO admin_audit_log
+                (actor_user_id,action,target_type,target_id,notes)
+                VALUES (%s,'EDIT_ROSTER_REVIEW','roster_member_candidates',%s,%s)''',
+                (owner_user_id, candidate_id, json.dumps({'before': dict(before), 'after': clean}, default=str)))
+    enqueue_radar_job('CRAWL_FACULTY_DIRECTORY', faculty_directory_id=int(before['directory_id']),
+                      requested_by=owner_user_id, priority=95)
+
+
+def reject_publication_candidate(
+    owner_user_id: int, professor_id: int, scholar_url: str
+) -> None:
+    """Reject one candidate without changing verified faculty status."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """UPDATE professor_publication_sources
+                   SET identity_status='REJECTED_BY_STAFF', checked_at=NOW(),
+                       evidence=evidence || jsonb_build_object(
+                           'rejected_by', %s, 'rejected_at', NOW()
+                       )
+                   WHERE professor_id=%s AND source_url=%s""",
+                (owner_user_id, professor_id, scholar_url),
+            )
+
+
+def requeue_unresolved_publication_reviews(owner_user_id: int) -> int:
+    """Queue unresolved/failed publication identities once, without loops."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """SELECT DISTINCT p.id
+                   FROM professors p
+                   WHERE p.faculty_status='VERIFIED'
+                     AND p.data_origin='OFFICIAL_DIRECTORY'
+                     AND p.canonical_rank IN (
+                       'ASSISTANT_PROFESSOR','ASSOCIATE_PROFESSOR','PROFESSOR'
+                     )
+                     AND p.faculty_title !~* '\\m(adjunct|affiliate|affiliated|visiting|emeritus|emerita|part[- ]time|lecturer|instructor)\\M'
+                     AND (
+                       p.publication_status IN ('REVIEW_REQUIRED','SOURCE_UNAVAILABLE')
+                       OR EXISTS (
+                         SELECT 1 FROM radar_jobs failed
+                         WHERE failed.professor_id=p.id
+                           AND failed.job_type IN (
+                             'MATCH_FACULTY_PUBLICATIONS','QWEN_REVIEW_PUBLICATION'
+                           )
+                           AND failed.status='failed'
+                       )
+                     )"""
+            )
+            professor_ids = [int(row["id"]) for row in cursor.fetchall()]
+    queued = 0
+    for professor_id in professor_ids:
+        job = enqueue_radar_job(
+            "QWEN_REVIEW_PUBLICATION",
+            professor_id=professor_id,
+            requested_by=owner_user_id,
+            priority=90,
+            max_attempts=1,
+        )
+        queued += int(not job.get("reused"))
+    return queued
 
 
 def recover_stalled_radar_jobs(owner_user_id: int) -> int:
@@ -2440,7 +2950,7 @@ def retry_unresolved_identities(owner_user_id: int, limit: int = 100) -> int:
             )
     for professor_id in professor_ids:
         enqueue_radar_job(
-            "REFRESH_FACULTY",
+            "MATCH_FACULTY_PUBLICATIONS",
             professor_id=professor_id,
             requested_by=owner_user_id,
             priority=95,
@@ -2598,7 +3108,7 @@ def review_faculty_identity(
 
     if normalized_decision == "RETRY":
         enqueue_radar_job(
-            "REFRESH_FACULTY",
+            "MATCH_FACULTY_PUBLICATIONS",
             professor_id=professor_id,
             requested_by=owner_user_id,
             priority=100,

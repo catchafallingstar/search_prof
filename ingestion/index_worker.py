@@ -9,16 +9,22 @@ import signal
 import socket
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
 from ingestion.check_grants import check_and_save_grants
-from ingestion.fetch_prof import fetch_professors_by_keywords
 from ingestion.parse_hiring_signals import scan_hiring_signals
-from ingestion.taxonomy import normalize_taxonomy
-from ingestion.verify_faculty import verify_faculty_candidates
-from ingestion.websearch import search_provider_runtime_state
+from ingestion.topic_language import normalize_taxonomy
+from ingestion.websearch import search_provider_runtime_state, identity_search_can_run
+from ingestion.roster_topic_index import index_rostered_topic
+from ingestion.research_classification import enrich_classify_paper
+from ingestion.faculty_roster import crawl_directory
+from ingestion.publication_discovery import (
+    discover_faculty_publications,
+    review_queued_scholar_candidates,
+)
+from ingestion.university_directory_discovery import discover_faculty_directories
+from ingestion.program_gpa import check_program_gpa_for_professor
 from radar_store import (
     claim_next_radar_job,
     complete_radar_job,
@@ -26,21 +32,17 @@ from radar_store import (
     enqueue_radar_job,
     fail_radar_job,
     fetch_radar_topic_by_id,
-    fetch_topic_candidate_ids,
-    fetch_topic_identity_retry_delay,
     fetch_topic_enrichment_ids,
     mark_professor_enrichment_checked,
     refresh_topic_coverage,
     reschedule_radar_job,
-    save_topic_candidates,
     save_topic_grant_checks,
-    save_topic_taxonomy_mappings,
     stop_worker_heartbeat,
-    update_topic_after_discovery,
     update_radar_job_progress,
     update_worker_heartbeat,
 )
 from settings import setting, setting_int
+from ingestion.event_log import write_event
 
 
 class RetryableJobError(RuntimeError):
@@ -56,11 +58,13 @@ def _publish_job_progress(
     stage: str,
     professor_ids: list[int] | None = None,
     detail: str = "",
+    **metadata: Any,
 ) -> None:
     if job.get("id") is None:
         return
     update_radar_job_progress(
-        int(job["id"]), stage, professor_ids=professor_ids, detail=detail
+        int(job["id"]), stage, professor_ids=professor_ids, detail=detail,
+        **metadata,
     )
 
 
@@ -70,7 +74,46 @@ def log_event(event: str, **values: Any) -> None:
         "event": event,
         **values,
     }
-    print(json.dumps(payload, default=str), flush=True)
+    write_event(payload)
+
+
+def _job_outcome(job_type: str, result: dict[str, Any]) -> str:
+    """Describe the data result separately from successful job execution."""
+    if job_type == "DISCOVER_FACULTY_DIRECTORIES":
+        return "APPROVED" if result.get("directories") else "REVIEW_REQUIRED"
+    if job_type == "CRAWL_FACULTY_DIRECTORY":
+        if int(result.get("profiles_pending") or 0) > 0:
+            return "REVIEW_REQUIRED"
+        return "APPROVED" if int(result.get("profiles_verified") or 0) > 0 else "NO_CHANGE"
+    if job_type == "MATCH_FACULTY_PUBLICATIONS":
+        status = str(result.get("status") or "")
+        return {
+            "OFFICIAL_PUBLICATIONS_FOUND": "APPROVED",
+            "SCHOLAR_VERIFIED": "APPROVED",
+            "NO_PUBLICATIONS_FOUND": "NO_PUBLICATIONS_FOUND",
+            "SOURCE_UNAVAILABLE": "SOURCE_UNAVAILABLE",
+            "REVIEW_REQUIRED": "REVIEW_REQUIRED",
+            "SCHOLAR_REVIEW_QUEUED": "NO_CHANGE",
+            "NOT_APPLICABLE": "NO_CHANGE",
+        }.get(status, "REVIEW_REQUIRED")
+    if job_type == "QWEN_REVIEW_PUBLICATION":
+        status = str(result.get("status") or "")
+        return {
+            "SCHOLAR_VERIFIED": "APPROVED",
+            "NO_PUBLICATIONS_FOUND": "NO_PUBLICATIONS_FOUND",
+            "SOURCE_UNAVAILABLE": "SOURCE_UNAVAILABLE",
+            "REVIEW_REQUIRED": "REVIEW_REQUIRED",
+        }.get(status, "REVIEW_REQUIRED")
+    if job_type == "ENRICH_CLASSIFY_PAPER":
+        return "APPROVED" if int(result.get("categories_accepted") or 0) else "NO_CHANGE"
+    if job_type == "CHECK_HIRING" and bool(result.get("timed_out")):
+        return "SOURCE_UNAVAILABLE"
+    if job_type in {"CHECK_HIRING", "CHECK_GRANTS", "CHECK_PROGRAM_GPA"}:
+        return "NO_CHANGE" if not any(
+            int(result.get(key) or 0)
+            for key in ("signals_added", "grants_added", "requirements_found")
+        ) else "APPROVED"
+    return "SUCCEEDED"
 
 
 def _topic_for_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -81,118 +124,6 @@ def _topic_for_job(job: dict[str, Any]) -> dict[str, Any]:
     if not topic:
         raise RuntimeError("The radar topic no longer exists.")
     return topic
-
-
-def _discover(job: dict[str, Any]) -> dict[str, Any]:
-    if not setting("OPENALEX_API_KEY").strip():
-        raise RuntimeError("OPENALEX_API_KEY is required by the indexing worker.")
-    topic = _topic_for_job(job)
-    _publish_job_progress(
-        job,
-        "DISCOVER_CANDIDATES",
-        detail="Searching OpenAlex for relevant papers and extracting candidate authors.",
-    )
-    taxonomy = normalize_taxonomy(str(topic["requested_query"]))
-    normalized_topic = str(taxonomy.get("topic_name") or topic["normalized_query"])
-    save_topic_taxonomy_mappings(
-        int(topic["id"]), list(taxonomy.get("openalex_mappings") or [])
-    )
-    discovery = fetch_professors_by_keywords(taxonomy, target_professors=100)
-    prospects = list(discovery.get("prospects") or [])
-    save_topic_candidates(int(topic["id"]), prospects)
-    update_topic_after_discovery(
-        int(topic["id"]),
-        normalized_topic,
-        int(discovery.get("candidates_ranked") or len(prospects)),
-        int(discovery.get("papers") or 0),
-    )
-    enqueue_radar_job(
-        "VERIFY_FACULTY",
-        radar_topic_id=int(topic["id"]),
-        requested_by=job.get("requested_by"),
-        priority=85,
-        max_attempts=20,
-    )
-    return {
-        "candidates_ranked": int(discovery.get("candidates_ranked") or len(prospects)),
-        "papers_found": int(discovery.get("papers") or 0),
-    }
-
-
-def _verify(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    topic = _topic_for_job(job)
-    capacity = search_provider_runtime_state()
-    direct_only = not bool(capacity["available"])
-    search_wait = max(2, int(capacity.get("retry_after_seconds") or 60))
-    # Identity checks can involve several slow official pages. Keep each job
-    # small enough to finish comfortably before the worker's hard deadline.
-    # Each completed candidate is committed independently by the verifier, so
-    # the next rescheduled job continues with the first unfinished identity.
-    batch_size = setting_int("INDEX_VERIFY_BATCH_SIZE", 1, 1, 6)
-    professor_ids = fetch_topic_candidate_ids(int(topic["id"]), batch_size, direct_only=direct_only)
-    if professor_ids:
-        _publish_job_progress(
-            job,
-            "VERIFY_FACULTY",
-            professor_ids=professor_ids,
-            detail=(
-                "Checking the target university first, then using bounded paper "
-                "affiliation evidence for unresolved identities. "
-                f"Processing {len(professor_ids)} candidate(s); known pages first, web search only if needed."
-            ),
-        )
-        research_area = str(
-            topic.get("requested_query") or topic.get("normalized_query") or ""
-        ).strip()
-        verify_kwargs: dict[str, Any] = {}
-        if research_area:
-            verify_kwargs["research_area"] = research_area
-        if direct_only:
-            verify_kwargs.update(
-                direct_only=True, retry_after_seconds=search_wait
-            )
-        verification = verify_faculty_candidates(professor_ids, **verify_kwargs)
-    else:
-        verification = {
-            "verified_ids": [], "checked": 0, "evaluated": 0, "verified": 0
-        }
-    coverage = refresh_topic_coverage(int(topic["id"]))
-    more_due = bool(fetch_topic_candidate_ids(int(topic["id"]), 1))
-    pending_any = more_due or bool(fetch_topic_candidate_ids(int(topic["id"]), 1, include_deferred=True))
-    needs_more = (
-        int(coverage.get("verified_count") or 0)
-        < int(coverage.get("desired_results") or 100)
-        and pending_any
-    )
-    # Enrichment queries select only verified faculty. A newly verified person
-    # need not wait for every other candidate in this field to finish.
-    if int(verification.get("verified") or 0) > 0 or (
-        not needs_more and int(coverage.get("verified_count") or 0) > 0
-    ):
-        enqueue_radar_job(
-            "ENRICH_PROFESSORS",
-            radar_topic_id=int(topic["id"]),
-            requested_by=job.get("requested_by"),
-            priority=86,
-            max_attempts=20,
-        )
-    # Never spin through unrelated candidates every two seconds when the shared
-    # search budget is the thing they are waiting for. Direct-ready work has its
-    # own eligibility path in claim_next_radar_job.
-    if direct_only or int(verification.get("deferred") or 0):
-        retry_delay = max(search_wait if direct_only else 2,
-                          int(verification.get("retry_after_seconds") or 2))
-    else:
-        retry_delay = fetch_topic_identity_retry_delay(int(topic["id"])) if needs_more and not more_due else 2
-    return {
-        "evaluated": int(verification.get("evaluated") or 0),
-        "newly_verified": int(verification.get("verified") or 0),
-        "verified_count": int(coverage.get("verified_count") or 0),
-        "candidates_seen": int(coverage.get("candidates_seen") or 0),
-        "deferred": int(verification.get("deferred") or 0),
-        "retry_after_seconds": retry_delay,
-        "waiting_for": "web_search" if (direct_only or verification.get("deferred")) else None,
-    }, needs_more
 
 
 def _check_grants(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -219,7 +150,6 @@ def _check_grants(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 
 
 def _check_hiring(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    topic = _topic_for_job(job)
     if job.get("professor_id") is not None:
         professor_ids = [int(job["professor_id"])]
         _publish_job_progress(
@@ -229,7 +159,7 @@ def _check_hiring(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             detail="Checking the professor or lab page for a public recruiting statement.",
         )
         result = scan_hiring_signals(
-            domain_name=str(topic.get("normalized_topic") or topic["normalized_query"]),
+            domain_name=None,
             professor_ids=professor_ids,
             radar_run_id=None,
         )
@@ -238,6 +168,7 @@ def _check_hiring(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             "signals_added": int(result.get("signals_added") or 0),
             "timed_out": bool(result.get("timed_out")),
         }, False
+    topic = _topic_for_job(job)
     limit = setting_int("INDEX_ENRICH_BATCH_SIZE", 10, 1, 25)
     professor_ids = fetch_topic_enrichment_ids(int(topic["id"]), "hiring", limit)
     if not professor_ids:
@@ -263,40 +194,131 @@ def _check_hiring(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     }, more
 
 
-def _enrich_professors(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """Check grants and public hiring pages concurrently after verification."""
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        grants_future = executor.submit(_check_grants, job)
-        hiring_future = executor.submit(_check_hiring, job)
-        grants_result, grants_more = grants_future.result()
-        hiring_result, hiring_more = hiring_future.result()
-    return {
-        "grants": grants_result,
-        "hiring": hiring_result,
-    }, bool(grants_more or hiring_more)
-
-
 def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     job_type = str(job["job_type"])
-    if job_type in {"DISCOVER_CANDIDATES", "REINDEX_RESEARCH"}:
-        return _discover(job), False
-    if job_type == "VERIFY_FACULTY":
-        return _verify(job)
-    if job_type == "REFRESH_FACULTY":
+    if job_type == "DISCOVER_FACULTY_DIRECTORIES":
+        institution_id = job.get("institution_id")
+        if institution_id is None:
+            raise RuntimeError("DISCOVER_FACULTY_DIRECTORIES requires an institution.")
+        _publish_job_progress(
+            job, job_type,
+            detail="Inspecting the official university domain for faculty directories.",
+        )
+        result = discover_faculty_directories(
+            int(institution_id),
+            progress_callback=lambda url, current, total: _publish_job_progress(
+                job, job_type,
+                detail=f"Validating directory candidate {current} of {total}.",
+                source_url=url,
+            ),
+        )
+        for directory in result.get("directories") or []:
+            enqueue_radar_job(
+                "CRAWL_FACULTY_DIRECTORY",
+                faculty_directory_id=int(directory["directory_id"]),
+                priority=90,
+                max_attempts=8,
+            )
+        return result, False
+    if job_type == "CRAWL_FACULTY_DIRECTORY":
+        directory_id = job.get("faculty_directory_id")
+        if directory_id is None:
+            raise RuntimeError("CRAWL_FACULTY_DIRECTORY requires a directory.")
+        _publish_job_progress(job, job_type, detail="Extracting current faculty from an approved official roster.")
+        result = crawl_directory(
+            int(directory_id),
+            progress_callback=lambda member, current, total: _publish_job_progress(
+                job, job_type,
+                detail=f"Saving roster member {current} of {total}.",
+                member_name=member.name,
+                source_url=member.profile_url,
+            ),
+        )
+        return result, False
+    if job_type == "MATCH_FACULTY_PUBLICATIONS":
         professor_id = job.get("professor_id")
         if professor_id is None:
-            raise RuntimeError("REFRESH_FACULTY requires a professor.")
-        capacity = search_provider_runtime_state()
-        result = (verify_faculty_candidates([int(professor_id)]) if capacity["available"] else
-                  verify_faculty_candidates([int(professor_id)], direct_only=True,
-                      retry_after_seconds=max(2, int(capacity.get("retry_after_seconds") or 60))))
-        return result, bool(result.get("deferred"))
+            raise RuntimeError("MATCH_FACULTY_PUBLICATIONS requires a professor.")
+        _publish_job_progress(
+            job, job_type, professor_ids=[int(professor_id)],
+            detail="Checking official profile and linked research pages; Scholar is fallback only.",
+        )
+        result = discover_faculty_publications(
+            int(professor_id),
+            progress_callback=lambda title, current, total: _publish_job_progress(
+                job, job_type, professor_ids=[int(professor_id)],
+                detail=f"Importing paper {current} of {total}.", paper_title=title,
+            ),
+            activity_callback=lambda stage, metadata: _publish_job_progress(
+                job, job_type, professor_ids=[int(professor_id)],
+                detail=("Reviewing Google Scholar identity evidence with Qwen."
+                        if stage == "QWEN_SCHOLAR_REVIEW"
+                        else "Checking the official faculty profile for publication evidence."),
+                **metadata,
+            ),
+        )
+        if result.get("status") == "SCHOLAR_REVIEW_QUEUED":
+            enqueue_radar_job(
+                "QWEN_REVIEW_PUBLICATION",
+                professor_id=int(professor_id),
+                priority=20,
+                max_attempts=1,
+            )
+        return result, False
+    if job_type == "QWEN_REVIEW_PUBLICATION":
+        professor_id = job.get("professor_id")
+        if professor_id is None:
+            raise RuntimeError("QWEN_REVIEW_PUBLICATION requires a professor.")
+        _publish_job_progress(
+            job, job_type, professor_ids=[int(professor_id)],
+            detail="Qwen is reviewing one saved Scholar identity candidate.",
+        )
+        result = review_queued_scholar_candidates(
+            int(professor_id),
+            progress_callback=lambda title, current, total: _publish_job_progress(
+                job, job_type, professor_ids=[int(professor_id)],
+                detail=f"Publication identity verified — importing paper {current} of {total}.",
+                paper_title=title,
+            ),
+            activity_callback=lambda stage, metadata: _publish_job_progress(
+                job, stage, professor_ids=[int(professor_id)],
+                detail="Qwen is checking the candidate; this request may take up to five minutes.",
+                **metadata,
+            ),
+        )
+        return result, False
+    if job_type == "CHECK_PROGRAM_GPA":
+        professor_id = job.get("professor_id")
+        if professor_id is None:
+            raise RuntimeError("CHECK_PROGRAM_GPA requires a representative professor.")
+        return check_program_gpa_for_professor(int(professor_id)), False
+    if job_type == "ENRICH_CLASSIFY_PAPER":
+        paper_id = job.get("paper_id")
+        if paper_id is None:
+            raise RuntimeError("ENRICH_CLASSIFY_PAPER requires a paper.")
+        _publish_job_progress(
+            job, job_type,
+            detail="Resolving the paper abstract and assigning evidence-backed research categories.",
+            paper_id=int(paper_id),
+        )
+        return enrich_classify_paper(int(paper_id)), False
+    if job_type == "INDEX_ROSTER_TOPIC":
+        topic = _topic_for_job(job)
+        _publish_job_progress(
+            job, "INDEX_ROSTER_TOPIC",
+            detail="Matching confirmed roster faculty using direct paper-title and abstract evidence.",
+        )
+        result = index_rostered_topic(int(topic["id"]))
+        refresh_topic_coverage(int(topic["id"]))
+        enqueue_radar_job(
+            "CHECK_GRANTS", radar_topic_id=int(topic["id"]),
+            priority=35, max_attempts=5,
+        )
+        return result, False
     if job_type == "CHECK_GRANTS":
         return _check_grants(job)
     if job_type == "CHECK_HIRING":
         return _check_hiring(job)
-    if job_type == "ENRICH_PROFESSORS":
-        return _enrich_professors(job)
     raise RuntimeError(f"Unknown radar job type: {job_type}")
 
 
@@ -377,7 +399,9 @@ def run_worker(
     jobs_processed = 0
     announced_wait = False
     update_worker_heartbeat(worker_id)
-    log_event("worker_started", worker_id=worker_id)
+    log_event("worker_started", worker_id=worker_id,
+              search_providers=search_provider_runtime_state()['providers'],
+              ddgs_backend=setting('DDGS_BACKEND').strip() or 'auto')
     try:
         while not stopping:
             if max_jobs is not None and jobs_processed >= max_jobs:
@@ -386,10 +410,10 @@ def run_worker(
             # Search availability is checked only at the actual web-search step.
             # Direct pages, cached metadata and grants may still be usable.
             capacity = search_provider_runtime_state()
-            search_ready = bool(capacity["available"])
+            search_ready = identity_search_can_run(capacity)
             if not search_ready and not announced_wait:
                 log_event("search_waiting", retry_after_seconds=capacity["retry_after_seconds"],
-                          detail="Search-dependent identities are parked; direct pages, grants and other work can continue.")
+                          detail="Directory and Scholar recovery searches are parked; direct official pages and grants can continue.")
                 announced_wait = True
             elif search_ready:
                 announced_wait = False
@@ -414,7 +438,10 @@ def run_worker(
                     reschedule_radar_job(int(job["id"]), max(2, int(result.get("retry_after_seconds") or 2)), result)
                     status = "rescheduled"
                 else:
-                    complete_radar_job(int(job["id"]), result)
+                    complete_radar_job(
+                        int(job["id"]), result,
+                        outcome_status=_job_outcome(str(job["job_type"]), result),
+                    )
                     status = "completed"
                 log_event(
                     "job_finished",

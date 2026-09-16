@@ -18,10 +18,6 @@ from ingestion.name_normalization import name_tokens
 from ingestion.websearch import SearchUnavailable, search_web
 from settings import setting_int
 
-NEW_AP_PATTERN = re.compile(
-    r"(?:joining|starting\s+(?:my\s+)?lab|new\s+assistant\s+professor|incoming\s+(?:faculty|professor))",
-    re.IGNORECASE,
-)
 RELATED_ACADEMIC_LINK_PATTERN = re.compile(
     r"(?:\blab\b|laborator|research\s+group|opening|prospective|join\s+us|"
     r"personal\s+(?:site|website|homepage)|\bwebsite\b|\bhomepage\b)",
@@ -41,10 +37,11 @@ UNTRUSTED_HIRING_HOSTS = {
     "academia.edu", "amacad.org", "biopharmadive.com", "cell.com",
     "coursicle.com", "indeed.com", "linkedin.com", "phdportal.com",
     "quora.com", "researchgate.net", "scispace.com", "scite.ai",
-    "zoominfo.com",
+    "zoominfo.com", "googleadservices.com", "googlesyndication.com",
+    "doubleclick.net",
 }
 UNTRUSTED_HIRING_PATH_PATTERN = re.compile(
-    r"/(?:news|events?|articles?|publications?|papers?|doi|jobs?-search|directory-entry)/",
+    r"/(?:aclick|pagead|news|events?|articles?|publications?|papers?|doi|jobs?-search|directory-entry)(?:/|$)",
     re.IGNORECASE,
 )
 MONTHS = {
@@ -82,6 +79,16 @@ def _month_number(value: str) -> int:
 def _dated_interval(text: str) -> dict[str, Any] | None:
     """Return the first meaningful date with honest partial-date precision."""
     value = " ".join(str(text or "").split())
+    # Normalize common human and extraction variants without interpreting
+    # arbitrary long social-media counters as dates.
+    value = re.sub(r"\b(20\d)\s+(\d)\b", r"\1\2", value)
+    value = re.sub(r"\b(20)\s+(\d{2})\b", r"\1\2", value)
+    value = re.sub(
+        r"\b(Spring|Summer|Fall|Autumn|Winter)\s*['’]\s*(\d{2})\b",
+        lambda match: f"{match.group(1)} 20{match.group(2)}",
+        value,
+        flags=re.IGNORECASE,
+    )
     patterns = (
         ("DAY", re.compile(rf"\b({MONTH_PATTERN})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?[,]?\s+(20\d{{2}})\b", re.I)),
         ("DAY_ISO", re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")),
@@ -242,10 +249,13 @@ def _fetch_hiring_page_snapshot(homepage_url: str) -> dict[str, Any]:
         if not chunks:
             chunks = list(soup.stripped_strings)
         matches: list[str] = []
+        gpa_sentences: list[str] = []
         seen: set[str] = set()
         for chunk in chunks:
             for sentence in re.split(r"(?<=[.!?])\s+|[;\n\r\t]+", chunk):
                 cleaned = " ".join(sentence.split())
+                if 10 < len(cleaned) < 500 and re.search(r"\bGPA\b", cleaned, re.IGNORECASE):
+                    gpa_sentences.append(cleaned)
                 if (
                     15 < len(cleaned) < 500
                     and cleaned not in seen
@@ -255,6 +265,7 @@ def _fetch_hiring_page_snapshot(homepage_url: str) -> dict[str, Any]:
                     matches.append(cleaned)
         return {
             "sentences": matches[:5],
+            "gpa_sentences": list(dict.fromkeys(gpa_sentences))[:10],
             "accessible": True,
             "text": identity_text,
             "title": title,
@@ -263,7 +274,7 @@ def _fetch_hiring_page_snapshot(homepage_url: str) -> dict[str, Any]:
         }
     except (OSError, requests.RequestException) as error:
         print(f"Homepage fetch failed for {homepage_url}: {error}")
-        return {"sentences": [], "accessible": False, "text": "", "title": "", "links": []}
+        return {"sentences": [], "gpa_sentences": [], "accessible": False, "text": "", "title": "", "links": []}
 
 
 def _fetch_and_parse_homepage_status(homepage_url: str) -> tuple[list[str], bool]:
@@ -371,15 +382,41 @@ def _saved_page_is_attributed(
     professor: dict[str, Any], snapshot: dict[str, Any]
 ) -> bool:
     text = f"{snapshot.get('title') or ''} {snapshot.get('text') or ''}"
+    # A publication can follow a person across a career move, so it must not
+    # substitute for proof of the candidate's current institution on a hiring
+    # page. Both identity and current institution must be present.
     return bool(
         _ordered_name_present(str(professor.get("name") or ""), text)
-        and (
-            _institution_present(str(professor.get("institution_name") or ""), text)
-            or _supporting_paper_present(
-                list(professor.get("supporting_paper_titles") or []), text
-            )
-        )
+        and _institution_present(str(professor.get("institution_name") or ""), text)
     )
+
+
+def _page_is_person_specific(professor: dict[str, Any], url: str, snapshot: dict[str, Any]) -> bool:
+    """Reject generic directories/job boards that mention many researchers."""
+    name = str(professor.get("name") or "")
+    title = str(snapshot.get("title") or "")
+    if _ordered_name_present(name, title):
+        return True
+    expected = "".join(_normalized_tokens(name))
+    compact_url = re.sub(r"[^a-z0-9]", "", urlparse(url).path.casefold())
+    return bool(len(expected) >= 7 and expected in compact_url)
+
+
+def _quote_names_conflicting_program(professor: dict[str, Any], quote: str) -> bool:
+    """Catch explicit program acronyms that contradict the stored employer."""
+    institution_words = [
+        token for token in re.findall(r"[A-Za-z]+", str(professor.get("institution_name") or ""))
+        if token.casefold() not in {"and", "at", "in", "of", "the"}
+    ]
+    expected = "".join(word[0] for word in institution_words).upper()
+    mentioned = {
+        match.upper()
+        for match in re.findall(
+            r"\b([A-Z]{2,8})\s+(?:PhD|doctoral|graduate)\s+(?:application|program)\b",
+            quote,
+        )
+    }
+    return bool(mentioned and expected and expected not in mentioned)
 
 
 def save_signal_to_db(
@@ -395,7 +432,7 @@ def save_signal_to_db(
     freshness_status = str(freshness.get("freshness_status") or "UNDATED")
     public_current = freshness_status in {"CURRENT", "UPCOMING", "UNDATED"}
     check_status = "PRESENT" if check_status == "PRESENT" and public_current else "NOT_FOUND"
-    roles, has_funding = extract_roles_and_funding(raw_quote)
+    roles, _has_funding = extract_roles_and_funding(raw_quote)
     role_priority = ("PhD", "Postdoc", "Research Assistant", "Intern")
     primary_role = next((role for role in role_priority if role in roles), None)
     position_type = {
@@ -404,8 +441,6 @@ def save_signal_to_db(
         "Research Assistant": "Research Assistant",
         "Intern": "Internship",
     }.get(primary_role or "", "PhD")
-    is_new_ap = bool(NEW_AP_PATTERN.search(raw_quote))
-    score_boost = 40 + (20 if has_funding else 0) + (30 if is_new_ap else 0)
     quote_hash = get_text_hash(f"{professor_id}|{source_url}|{raw_quote}")
     confidence = "high" if signal_type in {"homepage", "official_profile"} else "medium"
     with get_db_connection() as connection:
@@ -448,19 +483,9 @@ def save_signal_to_db(
             signal_row = cursor.fetchone()
             inserted = bool(signal_row and signal_row.get("inserted"))
             opportunity_id = None
-            if inserted and public_current:
-                role_text = ", ".join(roles) if roles else "unspecified role"
-                cursor.execute(
-                    """
-                    UPDATE professors
-                    SET radar_score = radar_score + %s,
-                        career_stage = CASE WHEN %s THEN 'NEW_AP' ELSE career_stage END,
-                        score_breakdown = score_breakdown || %s,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (score_boost, is_new_ap, f" +{score_boost} ({signal_type}; {role_text})", professor_id),
-                )
+            # Hiring evidence is volatile and expires. It is ranked dynamically
+            # by the read query, so never bake it into the permanent professor
+            # score (which previously left stale boosts after invalidation).
             return {
                 "inserted": inserted,
                 "opportunity_id": opportunity_id,
@@ -494,7 +519,10 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
         snapshot = _fetch_hiring_page_snapshot(page)
         accessible = bool(snapshot["accessible"])
         any_accessible = any_accessible or accessible
-        attributed = not validate_saved or _saved_page_is_attributed(professor, snapshot)
+        attributed = not validate_saved or (
+            _saved_page_is_attributed(professor, snapshot)
+            and _page_is_person_specific(professor, page, snapshot)
+        )
         source_check = {
             "source_type": signal_type,
             "url": page,
@@ -509,9 +537,15 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
             return None, snapshot
         sentences = list(snapshot["sentences"])
         if gpa_evidence is None:
-            gpa_evidence = extract_gpa_evidence(sentences, page)
+            gpa_evidence = extract_gpa_evidence(
+                list(snapshot.get("gpa_sentences") or []), page
+            )
         quote = clean_and_extract_hiring_quote(". ".join(sentences))
         if not quote:
+            return None, snapshot
+        if _quote_names_conflicting_program(professor, quote):
+            source_check["result"] = "INSTITUTION_ATTRIBUTION_FAILED"
+            source_check["quote"] = quote
             return None, snapshot
         freshness = _hiring_signal_freshness(quote, snapshot)
         source_check.update(freshness)
@@ -533,7 +567,9 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
 
     # 1. Recheck a previously attributed hiring source first.
     for prior in professor.get("prior_hiring_sources") or []:
-        outcome, _snapshot = check_page("homepage", str(prior))
+        outcome, _snapshot = check_page(
+            "homepage", str(prior), validate_saved=True
+        )
         if outcome:
             return outcome
 
@@ -595,7 +631,10 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
                 "result": "SEARCH_UNAVAILABLE", "query": query,
                 "error": str(error),
             })
-            results = []
+            # Missing search capacity is not evidence that no hiring page
+            # exists. Let the durable worker reschedule this professor after
+            # the shared provider slot becomes available.
+            raise
         except Exception as error:
             print(f"Hiring-page search failed for {name}: {type(error).__name__}")
             checked_sources.append({
@@ -627,6 +666,7 @@ def record_professor_hiring_check(
     professor_id: int,
     check_status: str,
     gpa_evidence: dict[str, Any] | None,
+    next_check_days: int | None = None,
 ) -> None:
     """Record the inspection separately from whether recruiting text was seen."""
     with get_db_connection() as connection:
@@ -638,7 +678,8 @@ def record_professor_hiring_check(
                     SET public_hiring_checked_at = NOW(),
                         public_hiring_check_status = 'SOURCE_UNAVAILABLE',
                         public_hiring_failure_count = public_hiring_failure_count + 1,
-                        public_hiring_next_check_at = NOW() + INTERVAL '6 hours',
+                        public_hiring_next_check_at = NOW() + INTERVAL '2 days',
+                        lab_gpa_check_status = 'SOURCE_UNAVAILABLE',
                         updated_at = NOW()
                     WHERE id = %s
                     """,
@@ -649,7 +690,7 @@ def record_professor_hiring_check(
                     UPDATE hiring_signals
                     SET last_checked_at = NOW(), check_status = 'SOURCE_UNAVAILABLE',
                         consecutive_check_failures = consecutive_check_failures + 1,
-                        next_check_at = NOW() + INTERVAL '6 hours'
+                        next_check_at = NOW() + INTERVAL '2 days'
                     WHERE professor_id = %s AND attribution_status = 'VERIFIED'
                     """,
                     (professor_id,),
@@ -662,18 +703,19 @@ def record_professor_hiring_check(
                 SET public_hiring_checked_at = NOW(),
                     public_hiring_check_status = %s,
                     public_hiring_failure_count = 0,
-                    public_hiring_next_check_at = NOW() + INTERVAL '24 hours',
+                    public_hiring_next_check_at = NOW() + (%s * INTERVAL '1 day'),
+                    lab_gpa_check_status = %s,
                     lab_gpa_policy = %s,
                     lab_gpa_evidence_text = %s,
                     lab_gpa_source_url = %s,
                     lab_gpa_minimum = %s,
-                    program_gpa_minimum = %s,
-                    program_gpa_source_url = %s,
                     gpa_last_checked_at = NOW(), updated_at = NOW()
                 WHERE id = %s
                 """,
                 (
                     check_status,
+                    max(1, int(next_check_days or (1 if check_status == "PRESENT" else 30))),
+                    "FOUND" if gpa_evidence else "NOT_STATED",
                     (
                         (gpa_evidence or {}).get("policy", "not_stated")
                         if (gpa_evidence or {}).get("scope", "lab") == "lab"
@@ -682,8 +724,6 @@ def record_professor_hiring_check(
                     (gpa_evidence or {}).get("evidence"),
                     (gpa_evidence or {}).get("source_url"),
                     (gpa_evidence or {}).get("minimum") if (gpa_evidence or {}).get("scope", "lab") == "lab" else None,
-                    (gpa_evidence or {}).get("minimum") if (gpa_evidence or {}).get("scope") == "program" else None,
-                    (gpa_evidence or {}).get("source_url") if (gpa_evidence or {}).get("scope") == "program" else None,
                     professor_id,
                 ),
             )
@@ -693,7 +733,7 @@ def record_professor_hiring_check(
                     UPDATE hiring_signals
                     SET last_checked_at = NOW(), check_status = 'NOT_FOUND',
                         consecutive_check_failures = 0,
-                        next_check_at = NOW() + INTERVAL '24 hours'
+                        next_check_at = NOW() + INTERVAL '30 days'
                     WHERE professor_id = %s AND attribution_status = 'VERIFIED'
                     """,
                     (professor_id,),
@@ -777,7 +817,7 @@ def scan_hiring_signals(
                     SELECT professor_id, source_url
                     FROM hiring_signals
                     WHERE professor_id = ANY(%s)
-                      AND attribution_status = 'VERIFIED'
+                      AND attribution_status IN ('VERIFIED', 'UNVERIFIED')
                     ORDER BY professor_id, last_seen_at DESC, id DESC
                     """,
                     (professor_ids_for_sources,),
@@ -815,7 +855,9 @@ def scan_hiring_signals(
                     professor["prior_hiring_sources"] = prior_by_professor.get(professor_id, [])
                     professor["supporting_paper_titles"] = papers_by_professor.get(professor_id, [])
 
-    max_workers = setting_int("RADAR_MAX_WORKERS", 2, 1, 8)
+    # DDGS is globally paced and this function may fall through to search.
+    # A single checker prevents sibling candidates from racing for one slot.
+    max_workers = setting_int("HIRING_MAX_WORKERS", 1, 1, 1)
     hits = 0
     checked = 0
     results: list[dict[str, Any]] = []
@@ -889,6 +931,15 @@ def scan_hiring_signals(
                         int(professor["id"]),
                         str(outcome.get("check_status") or "SOURCE_UNAVAILABLE"),
                         outcome.get("gpa"),
+                        (
+                            7
+                            if outcome.get("signal")
+                            and re.search(
+                                r"prospective|welcome|contact (?:me|us)|interested students",
+                                str(outcome["signal"][2]), re.IGNORECASE,
+                            )
+                            else 1 if outcome.get("signal") else 30
+                        ),
                     )
                     if progress_callback:
                         total = max(1, len(professors))
@@ -897,6 +948,13 @@ def scan_hiring_signals(
                             55 + int(35 * checked / total),
                             {"professors_checked": checked, "signals_added": hits},
                         )
+                except SearchUnavailable:
+                    # This is a queue scheduling event, not a completed check.
+                    # Propagate it so the durable worker restores the job to
+                    # queued without consuming an attempt.
+                    for remaining in pending:
+                        remaining.cancel()
+                    raise
                 except Exception as error:
                     checked += 1
                     checked_professor_ids.append(int(professor["id"]))

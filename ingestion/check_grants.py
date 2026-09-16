@@ -7,13 +7,11 @@ from typing import Any
 import requests
 
 from db import get_db_connection
-from ingestion.orcid_evidence import normalize_orcid
-from ingestion.taxonomy import phrase_covers_query
-from settings import setting, setting_bool
+from ingestion.topic_language import phrase_covers_query
+from settings import setting
 
 NSF_API_URL = "https://api.nsf.gov/services/v1/awards.json"
 NIH_REPORTER_API_URL = "https://api.reporter.nih.gov/v2/projects/search"
-ORCID_RECORD_URL = "https://pub.orcid.org/v3.0/{orcid}/record"
 
 
 def get_funding_hash(professor_id: int, grant_id: str, award_title: str) -> str:
@@ -139,45 +137,6 @@ def _nih_awards_for_professor(professor: dict[str, Any]) -> list[dict[str, Any]]
     return awards
 
 
-def _orcid_awards_for_professor(professor: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalize public, self-reported ORCID funding for a known ORCID iD."""
-    if not setting_bool("ORCID_ENABLED", False) or not setting("ORCID_ACCESS_TOKEN").strip():
-        return []
-    orcid = normalize_orcid(professor.get("orcid_id") or "")
-    if not orcid:
-        return []
-    headers = {"Accept": "application/json", "User-Agent": "ScholarRadar/1.0 (grant indexer)"}
-    token = setting("ORCID_ACCESS_TOKEN").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    response = requests.get(ORCID_RECORD_URL.format(orcid=orcid), headers=headers, timeout=8)
-    response.raise_for_status()
-    activities = response.json().get("activities-summary") or {}
-    groups = (activities.get("fundings") or {}).get("group") or []
-    awards: list[dict[str, Any]] = []
-    for group in groups:
-        summaries = group.get("funding-summary") or []
-        for summary in summaries:
-            title = str((summary.get("title") or {}).get("title") or "").strip()
-            organization = summary.get("organization") or {}
-            external_ids = (summary.get("external-ids") or {}).get("external-id") or []
-            grant_id = next((str(item.get("external-id-value") or "") for item in external_ids if item.get("external-id-value")), "")
-            put_code = str(summary.get("put-code") or "")
-            awards.append({
-                "id": grant_id or f"ORCID:{orcid}:{put_code}",
-                "title": title or "Untitled ORCID funding",
-                "abstractText": title,
-                "fundProgramName": str((summary.get("type") or "").replace("_", " ")),
-                "pdPIName": professor["name"],
-                "awardeeName": str(organization.get("name") or professor["institution_name"]),
-                "startDate": (summary.get("start-date") or {}).get("year", {}).get("value"),
-                "expDate": (summary.get("end-date") or {}).get("year", {}).get("value"),
-                "_source": "ORCID public funding",
-                "_source_url": f"https://orcid.org/{orcid}",
-            })
-    return awards
-
-
 def check_and_save_grants(
     tax_meta: dict[str, Any],
     professor_ids: list[int],
@@ -195,7 +154,7 @@ def check_and_save_grants(
                 return {"professors_checked": 0, "grants_added": 0, "results": [], "source_checks": []}
             cursor.execute(
                 """
-                SELECT id, name, institution_name, orcid_id
+                SELECT id, name, institution_name
                 FROM professors
                 WHERE id = ANY(%s)
                 ORDER BY id
@@ -229,16 +188,6 @@ def check_and_save_grants(
             except requests.RequestException as error:
                 print(f"NIH RePORTER request failed for {professor['name']}: {error}")
                 source_checks.append({"professor_id": professor["id"], "source": "NIH_REP", "status": "SOURCE_UNAVAILABLE", "error": str(error)[:1000]})
-            try:
-                if normalize_orcid(professor.get("orcid_id") or ""):
-                    awards.extend(_orcid_awards_for_professor(professor))
-                    configured = setting_bool("ORCID_ENABLED", False) and bool(setting("ORCID_ACCESS_TOKEN").strip())
-                    source_checks.append({"professor_id": professor["id"], "source": "ORCID", "status": "CHECKED" if configured else "DISABLED"})
-                else:
-                    source_checks.append({"professor_id": professor["id"], "source": "ORCID", "status": "NOT_APPLICABLE"})
-            except requests.RequestException as error:
-                print(f"ORCID funding request failed for {professor['name']}: {error}")
-                source_checks.append({"professor_id": professor["id"], "source": "ORCID", "status": "SOURCE_UNAVAILABLE", "error": str(error)[:1000]})
             return professor, awards, None, source_checks
         except requests.RequestException as error:
             print(f"NSF request failed for {professor['name']}: {error}")

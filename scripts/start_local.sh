@@ -24,7 +24,10 @@ set -a
 source .env
 set +a
 
-docker compose up -d --wait --wait-timeout 60 postgres
+# Apply the idempotent schema to the exact DATABASE_URL used by the app before
+# starting either process. This also prevents a stale worker from seeing newer
+# Python code with an older database schema.
+bash scripts/apply_schema.sh > /tmp/scholarradar-schema.log
 if [[ ",${SEARCH_PROVIDERS:-ddgs}," == *",searxng,"* ]]; then
   docker compose up -d searxng
 fi
@@ -38,18 +41,22 @@ if ! .venv/bin/python -c "import psycopg, psycopg_binary, streamlit"; then
 fi
 
 worker_pid=""
-.venv/bin/python -m scripts.migrate_affiliation_quota
+web_pid=""
 cleanup() {
   if [[ -n "$worker_pid" ]] && kill -0 "$worker_pid" 2>/dev/null; then
     kill "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$web_pid" ]] && kill -0 "$web_pid" 2>/dev/null; then
+    kill "$web_pid" 2>/dev/null || true
+    wait "$web_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT INT TERM
 
 if [[ ",${SEARCH_PROVIDERS:-ddgs}," == *",searxng,"* ]]; then
   echo "ScholarRadar metasearch started at ${SEARXNG_URL}."
-  echo "Search outages are paused and retried without creating identity decisions."
+  echo "Directory-recovery searches wait for capacity while roster and paper work continues."
 fi
 
 .venv/bin/python -m scripts.run_worker \
@@ -58,4 +65,20 @@ fi
 worker_pid=$!
 echo "ScholarRadar worker started (PID $worker_pid; log: /tmp/scholarradar-worker.log)"
 
-.venv/bin/python -m streamlit run app.py
+.venv/bin/python -m streamlit run app.py &
+web_pid=$!
+
+# The site and worker are one local service. If either process exits, stop the
+# other and release the flock instead of leaving a half-running installation
+# that blocks the next `make start`.
+if wait -n "$worker_pid" "$web_pid"; then
+  exit_status=0
+else
+  exit_status=$?
+fi
+if ! kill -0 "$worker_pid" 2>/dev/null; then
+  echo "ScholarRadar worker stopped; shutting down the site. Check /tmp/scholarradar-worker.log." >&2
+elif ! kill -0 "$web_pid" 2>/dev/null; then
+  echo "ScholarRadar site stopped; shutting down the worker." >&2
+fi
+exit "$exit_status"

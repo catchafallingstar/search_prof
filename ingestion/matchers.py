@@ -14,7 +14,19 @@ FUNDING_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 NEGATIVE_PATTERNS = re.compile(
-    r"(?:do\s+not\s+have|not\s+accepting|not\s+recruiting|no\s+openings|lab\s+is\s+full|position\s+has\s+been\s+filled)",
+    r"(?:do\s+not\s+have|not\s+(?:currently\s+)?(?:accepting|recruiting|taking|looking\s+for|seeking)|"
+    r"no\s+(?:new\s+)?openings|(?:lab|group)\s+is\s+(?:quite\s+)?full|"
+    r"position\s+has\s+been\s+filled)",
+    re.IGNORECASE,
+)
+NON_RECRUITING_CONTEXT_PATTERNS = re.compile(
+    r"(?:\bwelcom(?:e|ing)\b.{0,100}\b(?:as|who\s+will\s+be|rotation|joined?)\b|"
+    r"\brecruit\s+and\s+retain\b|\bhelp\s+recruit\b|"
+    r"\bsecure\b.{0,100}\bfaculty\b.{0,120}\brecruit\b|"
+    r"\blook(?:ing)?\s+for\s+opportunities\s+to\s+engage\b|"
+    r"\bonce\s+funding\b.{0,100}\b(?:recruit|accept)\b|"
+    r"\b(?:contact|email)\s+(?:me|us)\b.{0,100}\b(?:if|whether)\b.{0,100}\baccepting\b|"
+    r"\bsee\s+if\s+(?:i|we)\s+(?:am|are)\s+accepting\b)",
     re.IGNORECASE,
 )
 SEARCH_DATE_PREFIX = re.compile(
@@ -28,7 +40,12 @@ def get_text_hash(text: str) -> str:
 
 
 def is_valid_signal_text(text: str) -> bool:
-    return bool(text and FLEXIBLE_HIRING_PATTERN.search(text) and not NEGATIVE_PATTERNS.search(text))
+    return bool(
+        text
+        and FLEXIBLE_HIRING_PATTERN.search(text)
+        and not NEGATIVE_PATTERNS.search(text)
+        and not NON_RECRUITING_CONTEXT_PATTERNS.search(text)
+    )
 
 
 def extract_roles_and_funding(text: str) -> tuple[list[str], bool]:
@@ -61,6 +78,14 @@ def clean_and_extract_hiring_quote(raw_snippet: str) -> str:
         return ""
 
     cleaned = raw_snippet.strip()
+    # Social widgets sometimes append large counters and unrelated posts to a
+    # genuine sentence. They are not evidence and can also look like years.
+    cleaned = re.split(
+        r"\b(?:Reply|Retweet|Like)\s+on\s+(?:Twitter|X)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
     prefix = SEARCH_DATE_PREFIX.match(cleaned)
     if prefix:
         if _prefix_is_stale(prefix):

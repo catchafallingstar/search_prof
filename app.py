@@ -6,9 +6,7 @@ from radar_store import (
     RADAR_DISCOVERY_VERSION,
     fetch_indexing_runtime_state,
     fetch_indexed_professors,
-    fetch_topic_verification_progress,
     request_topic_index,
-    request_visible_hiring_refreshes,
 )
 from ui import (
     configure_page,
@@ -172,11 +170,6 @@ def render_radar_panel(
                 institution=institution_filter,
                 limit=visible_limit,
             )
-            if topic and radar_professors:
-                request_visible_hiring_refreshes(
-                    int(topic["id"]),
-                    [int(row["professor_id"]) for row in radar_professors],
-                )
         except Exception as error:
             st.error(f"The verified professor index could not be loaded: {error}")
 
@@ -187,17 +180,16 @@ def render_radar_panel(
             active_job_type = topic.get("active_job_type")
             active_job_status = topic.get("active_job_status")
             runtime = fetch_indexing_runtime_state()
-            verification_progress = fetch_topic_verification_progress(int(topic["id"]))
             stage_labels = {
-                ("DISCOVER_CANDIDATES", "queued"): "Waiting to find matching researchers",
-                ("DISCOVER_CANDIDATES", "running"): (
-                    "Finding researchers from matching papers"
-                ),
-                ("REINDEX_RESEARCH", "queued"): "Waiting to update this research area",
-                ("REINDEX_RESEARCH", "running"): "Updating matching researchers",
-                ("VERIFY_FACULTY", "queued"): "Waiting to verify faculty identities",
-                ("VERIFY_FACULTY", "running"): (
-                    "Verifying faculty on university pages"
+                ("DISCOVER_FACULTY_DIRECTORIES", "queued"): "Waiting to inspect an official university site",
+                ("DISCOVER_FACULTY_DIRECTORIES", "running"): "Finding official faculty pages",
+                ("CRAWL_FACULTY_DIRECTORY", "queued"): "Waiting to import an approved faculty page",
+                ("CRAWL_FACULTY_DIRECTORY", "running"): "Importing faculty from an official roster",
+                ("MATCH_FACULTY_PUBLICATIONS", "queued"): "Waiting to match faculty publications",
+                ("MATCH_FACULTY_PUBLICATIONS", "running"): "Matching faculty to one academic author",
+                ("INDEX_ROSTER_TOPIC", "queued"): "Waiting to match confirmed faculty",
+                ("INDEX_ROSTER_TOPIC", "running"): (
+                    "Matching confirmed faculty to supporting papers"
                 ),
                 ("CHECK_GRANTS", "queued"): "Waiting to check grants",
                 ("CHECK_GRANTS", "running"): "Checking grants",
@@ -217,14 +209,10 @@ def render_radar_panel(
             index_status = st.status(
                 indexing_label, state=indexing_state, expanded=False
             )
-            checked = int(verification_progress["identities_checked"])
-            pending = int(verification_progress["identities_pending"])
             index_status.write(
-                f"**{candidates}** candidates · **{checked}** checked · "
-                f"**{available}** verified"
+                f"**{candidates}** roster faculty considered · "
+                f"**{available}** supported by matching papers"
             )
-            if pending:
-                index_status.caption(f"{pending} identity checks remaining")
             if active_job_status == "queued":
                 if int(runtime["healthy_workers"]) == 0:
                     index_status.error(

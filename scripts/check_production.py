@@ -53,17 +53,6 @@ def check_configuration(values: dict[str, str] | None = None) -> list[Check]:
     else:
         checks.append(Check("PASS", "Managed PostgreSQL", "A non-local TLS PostgreSQL URL is configured."))
 
-    openalex_key = read("OPENALEX_API_KEY")
-    checks.append(
-        Check(
-            "FAIL" if _looks_placeholder(openalex_key) else "PASS",
-            "OpenAlex API key",
-            "Configure OPENALEX_API_KEY as a deployment secret."
-            if _looks_placeholder(openalex_key)
-            else "Configured without printing its value.",
-        )
-    )
-
     brave_ready = not _looks_placeholder(read("BRAVE_SEARCH_API_KEY"))
     searxng_url = read("SEARXNG_URL").strip()
     searxng_parsed = urlparse(searxng_url)

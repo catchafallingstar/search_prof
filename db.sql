@@ -47,6 +47,41 @@ CREATE INDEX IF NOT EXISTS college_scorecard_institutions_domain_idx
     ON college_scorecard_institutions (primary_domain)
     WHERE primary_domain IS NOT NULL;
 
+-- Canonical institution identity is separate from names seen on web pages.
+-- Aliases are explicit and reviewable; parent systems never imply that two
+-- campuses are interchangeable.
+CREATE TABLE IF NOT EXISTS institution_aliases (
+    institution_id BIGINT NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    alias_type TEXT NOT NULL DEFAULT 'OFFICIAL',
+    reviewed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (institution_id, normalized_alias)
+);
+CREATE INDEX IF NOT EXISTS institution_aliases_normalized_idx
+    ON institution_aliases (normalized_alias);
+
+CREATE TABLE IF NOT EXISTS institution_domains (
+    institution_id BIGINT NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
+    domain TEXT NOT NULL,
+    domain_type TEXT NOT NULL DEFAULT 'PRIMARY',
+    reviewed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (institution_id, domain)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS institution_domains_reviewed_unique_idx
+    ON institution_domains (domain) WHERE reviewed = TRUE;
+
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS parent_system_id BIGINT
+    REFERENCES institutions(id) ON DELETE SET NULL;
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS ror_id TEXT;
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS operating_status TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS faculty_discovery_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS faculty_discovery_checked_at TIMESTAMPTZ;
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS faculty_discovery_next_at TIMESTAMPTZ;
+ALTER TABLE institutions ADD COLUMN IF NOT EXISTS faculty_discovery_error TEXT;
+
 CREATE TABLE IF NOT EXISTS users (
     id BIGSERIAL PRIMARY KEY,
     oidc_subject TEXT NOT NULL UNIQUE,
@@ -86,7 +121,6 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
 
 CREATE TABLE IF NOT EXISTS professors (
     id BIGSERIAL PRIMARY KEY,
-    openalex_id TEXT,
     name TEXT NOT NULL,
     institution_id BIGINT REFERENCES institutions(id) ON DELETE SET NULL,
     institution_name TEXT NOT NULL,
@@ -130,9 +164,58 @@ CREATE TABLE IF NOT EXISTS professors (
     score_breakdown TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT professors_openalex_unique UNIQUE (openalex_id),
     CONSTRAINT professors_name_institution_unique UNIQUE (name, institution_name)
 );
+
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS canonical_name_key TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS canonical_profile_url TEXT;
+CREATE INDEX IF NOT EXISTS professors_canonical_name_institution_idx
+    ON professors (institution_id, canonical_name_key)
+    WHERE canonical_name_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS professors_canonical_profile_idx
+    ON professors (canonical_profile_url)
+    WHERE canonical_profile_url IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS professors_canonical_profile_unique_idx
+    ON professors (canonical_profile_url)
+    WHERE canonical_profile_url IS NOT NULL;
+CREATE TABLE IF NOT EXISTS professor_name_aliases (
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    canonical_name_key TEXT NOT NULL,
+    source_url TEXT,
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (professor_id, alias)
+);
+CREATE INDEX IF NOT EXISTS professor_name_aliases_key_idx
+    ON professor_name_aliases (canonical_name_key);
+
+CREATE TABLE IF NOT EXISTS professor_identity_review_queue (
+    id BIGSERIAL PRIMARY KEY,
+    professor_ids BIGINT[] NOT NULL,
+    canonical_name_key TEXT,
+    institution_id BIGINT REFERENCES institutions(id) ON DELETE SET NULL,
+    reason TEXT NOT NULL,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING', 'MERGED', 'SEPARATE', 'DISMISSED')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ
+);
+DELETE FROM professor_identity_review_queue duplicate
+USING professor_identity_review_queue keeper
+WHERE duplicate.id > keeper.id
+  AND duplicate.status = 'PENDING' AND keeper.status = 'PENDING'
+  AND duplicate.canonical_name_key IS NOT DISTINCT FROM keeper.canonical_name_key
+  AND duplicate.institution_id IS NOT DISTINCT FROM keeper.institution_id
+  AND duplicate.reason = keeper.reason
+  AND duplicate.professor_ids = keeper.professor_ids;
+DROP INDEX IF EXISTS professor_identity_review_pending_unique;
+CREATE UNIQUE INDEX professor_identity_review_pending_unique
+    ON professor_identity_review_queue (
+        canonical_name_key, COALESCE(institution_id, 0), reason, professor_ids
+    ) WHERE status = 'PENDING';
 
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_status TEXT NOT NULL DEFAULT 'UNVERIFIED';
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_title TEXT;
@@ -143,7 +226,6 @@ ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_confidence NUMERIC(4, 3)
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_checked_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS faculty_verified_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS next_identity_check_at TIMESTAMPTZ;
-ALTER TABLE professors ADD COLUMN IF NOT EXISTS orcid_id TEXT;
 -- Retry scheduling is not an identity decision or an identity freshness date.
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_retry_at TIMESTAMPTZ;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_retry_reason TEXT;
@@ -165,6 +247,282 @@ ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_year INTEGER;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_start_date DATE;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS appointment_date_precision TEXT;
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS graduate_faculty_status TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS data_origin TEXT NOT NULL DEFAULT 'OFFICIAL_DIRECTORY';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS employment_status TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS canonical_rank TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS display_title TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS department TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS roster_verified_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS roster_last_seen_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS lab_gpa_check_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+
+-- Do not infer an official-directory membership from a legacy method label.
+-- Canonical origins are reconciled below, after the evidence and membership
+-- tables exist.
+
+UPDATE professors
+SET lab_gpa_check_status = CASE
+        WHEN lab_gpa_evidence_text IS NOT NULL THEN 'FOUND'
+        WHEN gpa_last_checked_at IS NOT NULL THEN 'NOT_STATED'
+        ELSE 'NOT_CHECKED'
+    END
+WHERE lab_gpa_check_status = 'NOT_CHECKED';
+
+CREATE TABLE IF NOT EXISTS faculty_directories (
+    id BIGSERIAL PRIMARY KEY,
+    institution_id BIGINT NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
+    department TEXT NOT NULL,
+    directory_url TEXT NOT NULL UNIQUE,
+    directory_type TEXT NOT NULL DEFAULT 'DEPARTMENT_FACULTY',
+    parser_type TEXT NOT NULL DEFAULT 'GENERIC_HTML',
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    validation_status TEXT NOT NULL DEFAULT 'PENDING',
+    validation_reason TEXT,
+    discovered_by TEXT NOT NULL DEFAULT 'MANUAL',
+    expected_profile_count INTEGER,
+    content_hash CHAR(64),
+    last_success_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Discovery and extraction are deliberately staged. An official-domain URL
+-- is not a roster, and a person-looking link is not yet a professor.
+CREATE TABLE IF NOT EXISTS institution_units (
+    id BIGSERIAL PRIMARY KEY,
+    institution_id BIGINT NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
+    parent_unit_id BIGINT REFERENCES institution_units(id) ON DELETE SET NULL,
+    unit_name TEXT NOT NULL,
+    unit_type TEXT NOT NULL CHECK (unit_type IN (
+        'UNIVERSITY', 'COLLEGE', 'SCHOOL', 'DEPARTMENT', 'PROGRAM',
+        'INSTITUTE', 'CENTER', 'LAB', 'ADMINISTRATIVE_UNIT', 'UNKNOWN'
+    )),
+    official_url TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (institution_id, official_url)
+);
+CREATE TABLE IF NOT EXISTS faculty_page_candidates (
+    id BIGSERIAL PRIMARY KEY,
+    institution_id BIGINT NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
+    unit_id BIGINT REFERENCES institution_units(id) ON DELETE SET NULL,
+    candidate_url TEXT NOT NULL,
+    final_url TEXT,
+    discovery_method TEXT NOT NULL,
+    page_type TEXT NOT NULL DEFAULT 'UNKNOWN',
+    scope_label TEXT,
+    classification_status TEXT NOT NULL DEFAULT 'UNVALIDATED' CHECK (
+        classification_status IN ('UNVALIDATED', 'APPROVED_ROSTER',
+        'MIXED_ROSTER_REQUIRES_SECTION_PARSER', 'NOT_A_ROSTER',
+        'UNCERTAIN_REQUIRES_REVIEW', 'FETCH_FAILED', 'REDIRECTED',
+        'OUTSIDE_OFFICIAL_DOMAIN')),
+    classification_reason TEXT,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    checked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (institution_id, candidate_url)
+);
+ALTER TABLE faculty_directories ADD COLUMN IF NOT EXISTS unit_id BIGINT
+    REFERENCES institution_units(id) ON DELETE SET NULL;
+ALTER TABLE faculty_directories ADD COLUMN IF NOT EXISTS page_candidate_id BIGINT
+    REFERENCES faculty_page_candidates(id) ON DELETE SET NULL;
+ALTER TABLE faculty_directories ADD COLUMN IF NOT EXISTS page_type TEXT NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE faculty_directories ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'PENDING';
+ALTER TABLE faculty_directories ADD COLUMN IF NOT EXISTS validation_reason TEXT;
+ALTER TABLE faculty_directories ADD COLUMN IF NOT EXISTS discovered_by TEXT NOT NULL DEFAULT 'MANUAL';
+ALTER TABLE faculty_directories ADD COLUMN IF NOT EXISTS expected_profile_count INTEGER;
+ALTER TABLE faculty_directories DROP CONSTRAINT IF EXISTS faculty_directories_validation_status_check;
+ALTER TABLE faculty_directories ADD CONSTRAINT faculty_directories_validation_status_check
+    CHECK (validation_status IN ('PENDING', 'APPROVED', 'REJECTED', 'NEEDS_REVIEW'));
+
+CREATE TABLE IF NOT EXISTS faculty_directory_memberships (
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    directory_id BIGINT NOT NULL REFERENCES faculty_directories(id) ON DELETE CASCADE,
+    listed_name TEXT NOT NULL,
+    listed_title TEXT,
+    listed_department TEXT,
+    profile_url TEXT NOT NULL,
+    appointment_type TEXT NOT NULL DEFAULT 'PRIMARY',
+    source_excerpt TEXT,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    currently_listed BOOLEAN NOT NULL DEFAULT TRUE,
+    missing_checks INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (directory_id, profile_url)
+);
+CREATE INDEX IF NOT EXISTS faculty_directory_memberships_professor_idx
+    ON faculty_directory_memberships (professor_id, currently_listed);
+
+CREATE TABLE IF NOT EXISTS roster_member_candidates (
+    id BIGSERIAL PRIMARY KEY,
+    directory_id BIGINT NOT NULL REFERENCES faculty_directories(id) ON DELETE CASCADE,
+    displayed_name TEXT NOT NULL,
+    canonical_name_key TEXT NOT NULL,
+    displayed_title TEXT,
+    department TEXT,
+    profile_url TEXT NOT NULL,
+    canonical_profile_url TEXT NOT NULL,
+    email TEXT,
+    phone TEXT,
+    office_address TEXT,
+    section_heading TEXT,
+    appointment_type TEXT NOT NULL DEFAULT 'PRIMARY',
+    source_excerpt TEXT,
+    validation_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (
+        validation_status IN ('PENDING', 'PROFILE_VERIFIED', 'ROSTER_VERIFIED',
+        'ROSTER_CONFIRMED_PROFILE_UNAVAILABLE', 'NAME_MISMATCH', 'ROLE_UNCLEAR',
+        'INSTITUTION_UNRESOLVED', 'HISTORICAL_PROFILE', 'NOT_A_PERSON',
+        'REJECTED', 'NEEDS_REVIEW')),
+    validation_reason TEXT,
+    profile_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    validation_version INTEGER NOT NULL DEFAULT 2,
+    professor_id BIGINT REFERENCES professors(id) ON DELETE SET NULL,
+    checked_at TIMESTAMPTZ,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (directory_id, canonical_profile_url)
+);
+ALTER TABLE roster_member_candidates DROP CONSTRAINT IF EXISTS roster_member_candidates_validation_status_check;
+ALTER TABLE roster_member_candidates ADD COLUMN IF NOT EXISTS validation_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE roster_member_candidates ADD CONSTRAINT roster_member_candidates_validation_status_check
+    CHECK (validation_status IN ('PENDING', 'PROFILE_VERIFIED', 'ROSTER_VERIFIED',
+        'ROSTER_CONFIRMED_PROFILE_UNAVAILABLE', 'NAME_MISMATCH', 'ROLE_UNCLEAR',
+        'INSTITUTION_UNRESOLVED', 'HISTORICAL_PROFILE', 'NOT_A_PERSON',
+        'REJECTED', 'NEEDS_REVIEW', 'NOT_GROUP_LEADING_FACULTY'));
+UPDATE faculty_directories directory
+SET last_success_at = NULL, updated_at = NOW()
+WHERE EXISTS (
+    SELECT 1 FROM roster_member_candidates candidate
+    WHERE candidate.directory_id=directory.id
+      AND candidate.validation_version < 2
+);
+CREATE INDEX IF NOT EXISTS roster_member_candidates_status_idx
+    ON roster_member_candidates (validation_status, checked_at);
+
+-- Ollama is an evidence interpreter only. Its output is cached and audited
+-- here; canonical records are still written by deterministic validation code.
+CREATE TABLE IF NOT EXISTS ollama_extraction_runs (
+    id BIGSERIAL PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source_record_key TEXT NOT NULL,
+    institution_id BIGINT REFERENCES institutions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    input_excerpt TEXT NOT NULL,
+    raw_response TEXT,
+    parsed_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+    validation_status TEXT NOT NULL CHECK (
+        validation_status IN ('VALID', 'INVALID_EVIDENCE', 'MODEL_UNAVAILABLE')
+    ),
+    validation_errors TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_type, source_record_key, model, prompt_version, input_hash)
+);
+CREATE INDEX IF NOT EXISTS ollama_extraction_runs_source_idx
+    ON ollama_extraction_runs (source_type, source_record_key, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS faculty_appointments (
+    id BIGSERIAL PRIMARY KEY,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    institution_id BIGINT NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    canonical_rank TEXT,
+    appointment_type TEXT NOT NULL,
+    country_code CHAR(2),
+    start_date DATE,
+    end_date DATE,
+    current BOOLEAN NOT NULL DEFAULT TRUE,
+    primary_appointment BOOLEAN NOT NULL DEFAULT FALSE,
+    source_url TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (professor_id, institution_id, title, source_url)
+);
+
+CREATE TABLE IF NOT EXISTS professor_external_identities (
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    confidence NUMERIC(4, 3) NOT NULL DEFAULT 0,
+    match_status TEXT NOT NULL DEFAULT 'PENDING',
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    reviewed_at TIMESTAMPTZ,
+    PRIMARY KEY (provider, external_id)
+);
+
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS publication_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS publication_checked_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS publication_discovery_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE professors DROP CONSTRAINT IF EXISTS professors_publication_status_check;
+ALTER TABLE professors ADD CONSTRAINT professors_publication_status_check CHECK (
+    publication_status IN ('NOT_CHECKED','OFFICIAL_PUBLICATIONS_FOUND','SCHOLAR_VERIFIED',
+    'NO_PUBLICATIONS_FOUND','SOURCE_UNAVAILABLE','REVIEW_REQUIRED',
+    'SCHOLAR_REVIEW_QUEUED','NOT_APPLICABLE'));
+CREATE TABLE IF NOT EXISTS professor_publication_sources (
+    id BIGSERIAL PRIMARY KEY,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL CHECK (source_type IN (
+        'OFFICIAL_PROFILE','OFFICIAL_ALTERNATE_PROFILE','PERSONAL_SITE','LAB_SITE',
+        'LINKED_SITE','GOOGLE_SCHOLAR')),
+    source_url TEXT NOT NULL,
+    identity_status TEXT NOT NULL,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (professor_id, source_url)
+);
+ALTER TABLE professor_publication_sources
+    DROP CONSTRAINT IF EXISTS professor_publication_sources_source_type_check;
+ALTER TABLE professor_publication_sources
+    ADD CONSTRAINT professor_publication_sources_source_type_check CHECK (
+        source_type IN ('OFFICIAL_PROFILE','OFFICIAL_ALTERNATE_PROFILE',
+        'PERSONAL_SITE','LAB_SITE','LINKED_SITE','GOOGLE_SCHOLAR'));
+
+-- Research interests are fallback evidence only. They never create a faculty
+-- identity and never claim that a publication exists. Each label retains the
+-- official page and the exact profile passage from which it was extracted.
+CREATE TABLE IF NOT EXISTS professor_research_interests (
+    id BIGSERIAL PRIMARY KEY,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    display_interest TEXT NOT NULL,
+    normalized_interest TEXT NOT NULL,
+    evidence_method TEXT NOT NULL CHECK (
+        evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY')
+    ),
+    source_url TEXT NOT NULL,
+    source_excerpt TEXT NOT NULL,
+    confidence NUMERIC(4, 3) NOT NULL DEFAULT 0.700
+        CHECK (confidence BETWEEN 0 AND 1),
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (professor_id, normalized_interest, source_url)
+);
+CREATE INDEX IF NOT EXISTS professor_research_interests_professor_idx
+    ON professor_research_interests (professor_id, checked_at DESC);
+ALTER TABLE professor_research_interests DROP CONSTRAINT IF EXISTS professor_research_interests_evidence_method_check;
+ALTER TABLE professor_research_interests ADD CONSTRAINT professor_research_interests_evidence_method_check
+    CHECK (evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY',
+                              'QWEN_VALIDATED_SECTION','AI_SUGGESTION'));
+ALTER TABLE roster_member_candidates ADD COLUMN IF NOT EXISTS staff_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS program_admission_requirements (
+    id BIGSERIAL PRIMARY KEY,
+    institution_id BIGINT NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
+    department_key TEXT NOT NULL DEFAULT '',
+    department TEXT,
+    degree_type TEXT NOT NULL DEFAULT 'PhD',
+    policy TEXT NOT NULL DEFAULT 'NOT_CHECKED',
+    minimum_gpa NUMERIC(3, 2),
+    evidence_text TEXT,
+    source_url TEXT,
+    application_cycle TEXT,
+    check_status TEXT NOT NULL DEFAULT 'NOT_CHECKED',
+    checked_at TIMESTAMPTZ,
+    next_check_at TIMESTAMPTZ,
+    last_error TEXT,
+    UNIQUE (institution_id, department_key, degree_type)
+);
 
 UPDATE professors
 SET next_identity_check_at = faculty_checked_at + CASE
@@ -355,8 +713,7 @@ WHERE pp.professor_id = p.id
   AND pp.verification_status = 'verified';
 
 -- Version 4 verifies career moves using an official current faculty page plus
--- corroborating OpenAlex affiliation fragments, an earlier institution named
--- on that page, or matching publication evidence. Existing positive decisions
+-- an earlier institution named on that page or matching publication evidence. Existing positive decisions
 -- remain valid; only unresolved automatic decisions need the new resolver.
 UPDATE professors
 SET faculty_verification_version = 4,
@@ -392,7 +749,7 @@ SET verification_status = 'UNVERIFIED',
     confidence = 0,
     decision_method = 'automatic_search',
     evidence_text =
-        'A possible official page was found, but the current evidence does not safely connect it to this OpenAlex author.',
+        'A possible official page was found, but the current evidence does not safely connect it to this person.',
     checked_at = NOW()
 WHERE verification_status = 'CONFLICT'
   AND evidence_text =
@@ -446,7 +803,7 @@ CREATE TABLE IF NOT EXISTS role_verifications (
     professor_profile_id BIGINT REFERENCES professor_profiles(id) ON DELETE CASCADE,
     institution_membership_id BIGINT REFERENCES institution_memberships(id) ON DELETE CASCADE,
     method TEXT NOT NULL
-        CHECK (method IN ('institution_email', 'official_directory', 'orcid', 'institution_admin', 'manual_review')),
+        CHECK (method IN ('institution_email', 'official_directory', 'institution_admin', 'manual_review')),
     evidence_url TEXT,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'verified', 'rejected', 'expired')),
@@ -455,6 +812,9 @@ CREATE TABLE IF NOT EXISTS role_verifications (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     reviewed_at TIMESTAMPTZ
 );
+ALTER TABLE role_verifications DROP CONSTRAINT IF EXISTS role_verifications_method_check;
+ALTER TABLE role_verifications ADD CONSTRAINT role_verifications_method_check
+    CHECK (method IN ('institution_email','official_directory','institution_admin','manual_review'));
 
 CREATE TABLE IF NOT EXISTS opportunities (
     id BIGSERIAL PRIMARY KEY,
@@ -537,7 +897,7 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE TABLE IF NOT EXISTS papers (
     id BIGSERIAL PRIMARY KEY,
-    openalex_id TEXT NOT NULL UNIQUE,
+    source_key CHAR(64) NOT NULL UNIQUE,
     title TEXT NOT NULL,
     publication_year INTEGER,
     venue TEXT,
@@ -545,10 +905,99 @@ CREATE TABLE IF NOT EXISTS papers (
     doi TEXT,
     pdf_url TEXT,
     pdf_checked_at TIMESTAMPTZ,
+    source_type TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    source_evidence TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS pdf_url TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS pdf_checked_at TIMESTAMPTZ;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS abstract_text TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS raw_citation TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS metadata_status TEXT NOT NULL DEFAULT 'NEEDS_RESOLUTION';
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS abstract_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS abstract_source_url TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS abstract_checked_at TIMESTAMPTZ;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS classification_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS classified_at TIMESTAMPTZ;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS source_key CHAR(64);
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS source_type TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS source_url TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS source_evidence TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS papers_source_key_unique_idx
+    ON papers (source_key) WHERE source_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS paper_abstract_evidence (
+    id BIGSERIAL PRIMARY KEY,
+    paper_id BIGINT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    abstract_text TEXT,
+    source_url TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    title_match_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+    doi_match BOOLEAN NOT NULL DEFAULT FALSE,
+    verification_status TEXT NOT NULL CHECK (verification_status IN (
+        'VERIFIED_DOI','VERIFIED_TITLE','TITLE_CONFLICT','SOURCE_UNAVAILABLE',
+        'NOT_FOUND','REVIEW_REQUIRED'
+    )),
+    content_hash CHAR(64),
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (paper_id, source_url)
+);
+
+-- Versioned, explainable research taxonomy and paper/professor assignments.
+CREATE TABLE IF NOT EXISTS research_categories (
+    id BIGSERIAL PRIMARY KEY,
+    category_key TEXT NOT NULL UNIQUE,
+    canonical_name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    parent_key TEXT,
+    aliases TEXT[] NOT NULL DEFAULT '{}',
+    positive_terms TEXT[] NOT NULL DEFAULT '{}',
+    exclusion_terms TEXT[] NOT NULL DEFAULT '{}',
+    breadth TEXT NOT NULL DEFAULT 'SPECIALIZED'
+        CHECK (breadth IN ('BROAD','SPECIALIZED','NARROW')),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    classification_version INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS paper_research_categories (
+    paper_id BIGINT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    category_id BIGINT NOT NULL REFERENCES research_categories(id) ON DELETE CASCADE,
+    lexical_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+    concept_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+    combined_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+    decision TEXT NOT NULL CHECK (decision IN (
+        'AUTO_ACCEPTED','AUTO_REJECTED','REVIEW_REQUIRED','QWEN_ACCEPTED','QWEN_REJECTED'
+    )),
+    evidence_text TEXT,
+    matched_terms TEXT[] NOT NULL DEFAULT '{}',
+    classification_version INTEGER NOT NULL DEFAULT 1,
+    classified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (paper_id, category_id)
+);
+
+CREATE TABLE IF NOT EXISTS professor_research_categories (
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    category_id BIGINT NOT NULL REFERENCES research_categories(id) ON DELETE CASCADE,
+    expertise_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+    current_activity_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+    matching_paper_count INTEGER NOT NULL DEFAULT 0,
+    recent_matching_paper_count INTEGER NOT NULL DEFAULT 0,
+    strongest_paper_id BIGINT REFERENCES papers(id) ON DELETE SET NULL,
+    latest_matching_year INTEGER,
+    status TEXT NOT NULL CHECK (status IN (
+        'CURRENTLY_ACTIVE','ESTABLISHED_EXPERTISE','EMERGING_AREA','HISTORICAL_ONLY'
+    )),
+    classification_version INTEGER NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (professor_id, category_id)
+);
+CREATE INDEX IF NOT EXISTS paper_research_categories_current_idx
+    ON paper_research_categories (category_id, decision, combined_score DESC);
+CREATE INDEX IF NOT EXISTS professor_research_categories_rank_idx
+    ON professor_research_categories (category_id, current_activity_score DESC);
 
 CREATE TABLE IF NOT EXISTS professor_papers (
     professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
@@ -629,6 +1078,7 @@ CREATE TABLE IF NOT EXISTS hiring_signals (
         CHECK (source_date_precision IS NULL OR source_date_precision IN ('YEAR', 'MONTH', 'DAY', 'SEASON')),
     freshness_status TEXT NOT NULL DEFAULT 'UNDATED'
         CHECK (freshness_status IN ('CURRENT', 'UPCOMING', 'UNDATED', 'OLDER', 'HISTORICAL', 'EXPIRED')),
+    review_reason TEXT,
     expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -644,6 +1094,7 @@ ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS source_date_text TEXT;
 ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS source_date DATE;
 ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS source_date_precision TEXT;
 ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS freshness_status TEXT NOT NULL DEFAULT 'UNDATED';
+ALTER TABLE hiring_signals ADD COLUMN IF NOT EXISTS review_reason TEXT;
 
 -- Automated web discoveries used to create pending opportunity advertisements.
 -- They are evidence records, not submissions, so keep the evidence in
@@ -679,6 +1130,9 @@ CREATE TABLE IF NOT EXISTS radar_topics (
 );
 ALTER TABLE radar_topics
     ADD COLUMN IF NOT EXISTS discovery_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE radar_topics
+    ADD COLUMN IF NOT EXISTS research_category_id BIGINT
+    REFERENCES research_categories(id) ON DELETE SET NULL;
 
 -- Funding freshness is topic- and source-specific. This must be declared
 -- after radar_topics so an empty database can apply the schema in one pass.
@@ -694,28 +1148,6 @@ CREATE TABLE IF NOT EXISTS professor_topic_grant_checks (
 );
 CREATE INDEX IF NOT EXISTS professor_topic_grant_checks_due_idx
     ON professor_topic_grant_checks (radar_topic_id, next_check_at);
-
--- Stable OpenAlex hierarchy nodes used by ScholarRadar. One user-facing
--- research area can map to several domains, fields, subfields, or topics.
-CREATE TABLE IF NOT EXISTS openalex_research_nodes (
-    openalex_id TEXT PRIMARY KEY,
-    node_type TEXT NOT NULL
-        CHECK (node_type IN ('domain', 'field', 'subfield', 'topic')),
-    display_name TEXT NOT NULL,
-    description TEXT,
-    parent_id TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS radar_topic_openalex_nodes (
-    radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
-    openalex_node_id TEXT NOT NULL
-        REFERENCES openalex_research_nodes(openalex_id) ON DELETE CASCADE,
-    weight NUMERIC(5, 3) NOT NULL DEFAULT 1.0,
-    mapping_method TEXT NOT NULL,
-    reviewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (radar_topic_id, openalex_node_id)
-);
 
 CREATE TABLE IF NOT EXISTS radar_topic_professors (
     radar_topic_id BIGINT NOT NULL REFERENCES radar_topics(id) ON DELETE CASCADE,
@@ -733,6 +1165,13 @@ CREATE TABLE IF NOT EXISTS radar_topic_professors (
 );
 ALTER TABLE radar_topic_professors
     ADD COLUMN IF NOT EXISTS is_current_match BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE radar_topic_professors
+    ADD COLUMN IF NOT EXISTS evidence_basis TEXT NOT NULL DEFAULT 'PAPER'
+    CHECK (evidence_basis IN ('PAPER','RESEARCH_INTEREST'));
+ALTER TABLE radar_topic_professors
+    ADD COLUMN IF NOT EXISTS interest_summary TEXT;
+ALTER TABLE radar_topic_professors
+    ADD COLUMN IF NOT EXISTS interest_source_url TEXT;
 
 -- Exact paper evidence for each topic/professor match. professor_papers is the
 -- professor's global publication trail; this table records which paper made a
@@ -743,7 +1182,6 @@ CREATE TABLE IF NOT EXISTS radar_topic_professor_papers (
     paper_id BIGINT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
     relevance_score NUMERIC(5, 2) NOT NULL DEFAULT 0,
     matched_query TEXT NOT NULL,
-    matched_openalex_node_id TEXT,
     is_current_match BOOLEAN NOT NULL DEFAULT TRUE,
     discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -752,24 +1190,33 @@ CREATE TABLE IF NOT EXISTS radar_topic_professor_papers (
         REFERENCES professor_papers(professor_id, paper_id) ON DELETE CASCADE
 );
 ALTER TABLE radar_topic_professor_papers
-    ADD COLUMN IF NOT EXISTS matched_openalex_node_id TEXT;
+    ADD COLUMN IF NOT EXISTS evidence_method TEXT NOT NULL DEFAULT 'DIRECT_PAPER_TEXT';
+ALTER TABLE radar_topic_professor_papers
+    ADD COLUMN IF NOT EXISTS matched_text TEXT;
 
 -- Durable work queue. The partial unique index prevents duplicate active work
 -- for the same topic/professor while allowing a later refresh job.
 CREATE TABLE IF NOT EXISTS radar_jobs (
     id BIGSERIAL PRIMARY KEY,
+    institution_id BIGINT REFERENCES institutions(id) ON DELETE CASCADE,
     radar_topic_id BIGINT REFERENCES radar_topics(id) ON DELETE CASCADE,
     professor_id BIGINT REFERENCES professors(id) ON DELETE CASCADE,
+    faculty_directory_id BIGINT REFERENCES faculty_directories(id) ON DELETE CASCADE,
+    paper_id BIGINT REFERENCES papers(id) ON DELETE CASCADE,
     requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
     job_type TEXT NOT NULL CHECK (job_type IN (
-        'DISCOVER_CANDIDATES', 'VERIFY_FACULTY', 'REFRESH_FACULTY',
-        'CHECK_HIRING', 'CHECK_GRANTS', 'ENRICH_PROFESSORS',
-        'REINDEX_RESEARCH'
+        'DISCOVER_FACULTY_DIRECTORIES', 'CRAWL_FACULTY_DIRECTORY',
+        'MATCH_FACULTY_PUBLICATIONS', 'QWEN_REVIEW_PUBLICATION', 'INDEX_ROSTER_TOPIC',
+        'ENRICH_CLASSIFY_PAPER', 'CHECK_HIRING', 'CHECK_GRANTS', 'CHECK_PROGRAM_GPA'
     )),
     dedupe_key TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 50 CHECK (priority BETWEEN 0 AND 100),
     status TEXT NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    outcome_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (
+        outcome_status IN ('PENDING', 'APPROVED', 'REVIEW_REQUIRED', 'REJECTED',
+        'NO_CHANGE', 'NO_PUBLICATIONS_FOUND',
+        'SOURCE_UNAVAILABLE', 'SUCCEEDED')),
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts BETWEEN 1 AND 20),
     available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -782,6 +1229,49 @@ CREATE TABLE IF NOT EXISTS radar_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE radar_jobs ADD COLUMN IF NOT EXISTS outcome_status TEXT NOT NULL DEFAULT 'PENDING';
+ALTER TABLE radar_jobs DROP CONSTRAINT IF EXISTS radar_jobs_outcome_status_check;
+UPDATE radar_jobs SET outcome_status = CASE
+    WHEN outcome_status IN ('NO_AUTHOR_MATCH','NO_INDEXED_PUBLICATIONS') THEN 'NO_PUBLICATIONS_FOUND'
+    WHEN outcome_status = 'AMBIGUOUS_AUTHOR_MATCH' THEN 'REVIEW_REQUIRED'
+    ELSE outcome_status
+END;
+ALTER TABLE radar_jobs ADD CONSTRAINT radar_jobs_outcome_status_check CHECK (
+    outcome_status IN ('PENDING', 'APPROVED', 'REVIEW_REQUIRED', 'REJECTED',
+    'NO_CHANGE', 'NO_PUBLICATIONS_FOUND',
+    'SOURCE_UNAVAILABLE', 'SUCCEEDED'));
+UPDATE radar_jobs
+SET outcome_status = CASE
+    WHEN status <> 'completed' THEN 'PENDING'
+    WHEN job_type='MATCH_FACULTY_PUBLICATIONS' AND result_json->>'status'='NO_PUBLICATIONS_FOUND'
+         THEN 'NO_PUBLICATIONS_FOUND'
+    WHEN job_type='MATCH_FACULTY_PUBLICATIONS' AND result_json->>'status'='REVIEW_REQUIRED'
+         THEN 'REVIEW_REQUIRED'
+    WHEN job_type='MATCH_FACULTY_PUBLICATIONS' AND result_json->>'status' IN
+         ('OFFICIAL_PUBLICATIONS_FOUND','SCHOLAR_VERIFIED') THEN 'APPROVED'
+    WHEN job_type='CRAWL_FACULTY_DIRECTORY'
+         AND COALESCE((result_json->>'profiles_pending')::INTEGER,0) > 0
+         THEN 'REVIEW_REQUIRED'
+    WHEN job_type='CRAWL_FACULTY_DIRECTORY'
+         AND COALESCE((result_json->>'profiles_verified')::INTEGER,0) > 0
+         THEN 'APPROVED'
+    WHEN job_type='DISCOVER_FACULTY_DIRECTORIES'
+         AND jsonb_array_length(COALESCE(result_json->'directories','[]'::jsonb)) > 0
+         THEN 'APPROVED'
+    WHEN job_type='DISCOVER_FACULTY_DIRECTORIES' THEN 'REVIEW_REQUIRED'
+    ELSE 'SUCCEEDED'
+END
+WHERE outcome_status='PENDING';
+ALTER TABLE radar_jobs ADD COLUMN IF NOT EXISTS institution_id BIGINT
+    REFERENCES institutions(id) ON DELETE CASCADE;
+ALTER TABLE radar_jobs ADD COLUMN IF NOT EXISTS paper_id BIGINT
+    REFERENCES papers(id) ON DELETE CASCADE;
+ALTER TABLE radar_jobs DROP CONSTRAINT IF EXISTS radar_jobs_job_type_check;
+ALTER TABLE radar_jobs ADD CONSTRAINT radar_jobs_job_type_check CHECK (job_type IN (
+    'DISCOVER_FACULTY_DIRECTORIES', 'CRAWL_FACULTY_DIRECTORY',
+    'MATCH_FACULTY_PUBLICATIONS', 'QWEN_REVIEW_PUBLICATION', 'INDEX_ROSTER_TOPIC',
+    'ENRICH_CLASSIFY_PAPER', 'CHECK_HIRING', 'CHECK_GRANTS', 'CHECK_PROGRAM_GPA'
+));
 
 CREATE TABLE IF NOT EXISTS radar_worker_heartbeats (
     worker_id TEXT PRIMARY KEY,
@@ -820,16 +1310,10 @@ CREATE TABLE IF NOT EXISTS web_search_provider_health (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Migrations for databases created before the staged indexing pipeline and
--- shared OpenAlex rate limiter were introduced.
-ALTER TABLE radar_jobs
-    DROP CONSTRAINT IF EXISTS radar_jobs_job_type_check;
-ALTER TABLE radar_jobs
-    ADD CONSTRAINT radar_jobs_job_type_check CHECK (job_type IN (
-        'DISCOVER_CANDIDATES', 'VERIFY_FACULTY', 'REFRESH_FACULTY',
-        'CHECK_HIRING', 'CHECK_GRANTS', 'ENRICH_PROFESSORS',
-        'REINDEX_RESEARCH'
-    ));
+-- Columns retained from earlier deployments because provider accounting is
+-- still useful to the university-directory recovery search.
+ALTER TABLE radar_jobs ADD COLUMN IF NOT EXISTS faculty_directory_id BIGINT
+    REFERENCES faculty_directories(id) ON DELETE CASCADE;
 ALTER TABLE web_search_provider_health
     ADD COLUMN IF NOT EXISTS next_request_at TIMESTAMPTZ;
 ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS usage_day DATE;
@@ -842,12 +1326,6 @@ ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_this_mo
 ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_total BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_today INTEGER NOT NULL DEFAULT 0;
 
-CREATE TABLE IF NOT EXISTS identity_orcid_cache (
-    orcid_id TEXT PRIMARY KEY,
-    result_json JSONB NOT NULL DEFAULT '{}',
-    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL
-);
 
 -- A run is targeted to one user query. ScholarRadar never attempts to preload
 -- every professor or every field.
@@ -978,6 +1456,59 @@ CREATE INDEX IF NOT EXISTS web_search_cache_expiry_idx
 CREATE INDEX IF NOT EXISTS web_search_provider_block_idx
     ON web_search_provider_health (blocked_until)
     WHERE status = 'blocked';
+
+-- Reconcile canonical provenance from actual current evidence. A legacy label
+-- is never enough to call a professor current faculty.
+UPDATE professors p
+SET data_origin = 'OFFICIAL_DIRECTORY'
+WHERE EXISTS (
+    SELECT 1
+    FROM faculty_directory_memberships membership
+    JOIN faculty_directories directory ON directory.id = membership.directory_id
+    WHERE membership.professor_id = p.id
+      AND membership.currently_listed = TRUE
+      AND directory.active = TRUE
+);
+
+UPDATE professors p
+SET data_origin = 'OFFICIAL_PROFILE'
+WHERE data_origin = 'OFFICIAL_DIRECTORY'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM faculty_directory_memberships membership
+      JOIN faculty_directories directory ON directory.id = membership.directory_id
+      WHERE membership.professor_id = p.id
+        AND membership.currently_listed = TRUE
+        AND directory.active = TRUE
+  )
+  AND EXISTS (
+      SELECT 1 FROM faculty_verification_evidence evidence
+      WHERE evidence.professor_id = p.id
+        AND evidence.supports_decision = TRUE
+        AND evidence.currentness = 'CURRENT'
+        AND evidence.verification_status = 'VERIFIED'
+  );
+
+UPDATE professors p
+SET faculty_status = 'UNVERIFIED', employment_status = 'UNKNOWN',
+    data_origin = 'UNVERIFIED_IMPORT', faculty_confidence = 0,
+    next_identity_check_at = NOW(), updated_at = NOW()
+WHERE faculty_status = 'VERIFIED'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM faculty_directory_memberships membership
+      JOIN faculty_directories directory ON directory.id = membership.directory_id
+      WHERE membership.professor_id = p.id
+        AND membership.currently_listed = TRUE
+        AND directory.active = TRUE
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM faculty_verification_evidence evidence
+      WHERE evidence.professor_id = p.id
+        AND evidence.supports_decision = TRUE
+        AND evidence.currentness = 'CURRENT'
+        AND evidence.verification_status = 'VERIFIED'
+  );
 
 -- Latest bounded identity pass: staff-only snippets, page reasons and affiliation trail.
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_search_audit JSONB NOT NULL DEFAULT '{}'::jsonb;

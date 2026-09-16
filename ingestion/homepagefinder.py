@@ -83,12 +83,8 @@ def is_valid_homepage(url: str) -> bool:
 def get_professor_homepage(
     prof_name: str,
     institution: str,
-    openalex_homepage: str | None = None,
     **_: object,
 ) -> str:
-    if openalex_homepage and is_valid_homepage(openalex_homepage):
-        return openalex_homepage.strip()
-
     clean_institution = (institution or "").split("(")[0].strip()
     queries = [f'"{prof_name}" "{clean_institution}" faculty lab homepage']
     for query in queries:
