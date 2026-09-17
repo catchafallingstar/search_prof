@@ -261,7 +261,7 @@ def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             enqueue_radar_job(
                 "QWEN_REVIEW_PUBLICATION",
                 professor_id=int(professor_id),
-                priority=20,
+                priority=70,
                 max_attempts=1,
             )
         return result, False

@@ -729,23 +729,61 @@ def _queue_linked_scholar_review(professor_id: int, urls: list[str],
     pending = []
     for url in _dedupe_scholar_profiles(urls):
         saved = previous.get(_scholar_profile_key(url), {})
-        status = saved.get('identity_status')
-        refresh_due = (status=='VERIFIED' and saved.get('checked_at')
-                       and saved['checked_at'] < datetime.now(timezone.utc)-timedelta(days=30))
-        if status and status not in {'QWEN_QUEUED','STAFF_CANDIDATE'} and not refresh_due:
-            steps.append({'step':'QWEN_SCHOLAR_REVIEW','status':status,'source_url':url,
-                          'reason':'Saved decision retained; explicit retry or scheduled refresh required.'})
+        status = saved.get("identity_status")
+        checked_at = saved.get("checked_at")
+        now = datetime.now(timezone.utc)
+
+        refresh_due = (
+            status == "VERIFIED"
+            and checked_at
+            and checked_at < now - timedelta(days=30)
+        )
+
+        retry_due = (
+            status == "SOURCE_UNAVAILABLE"
+            and (
+                checked_at is None
+                or checked_at < now - timedelta(hours=6)
+            )
+        )
+
+        if (
+            status
+            and status not in {"QWEN_QUEUED", "STAFF_CANDIDATE"}
+            and not refresh_due
+            and not retry_due
+        ):
+            steps.append({
+                "step": "QWEN_SCHOLAR_REVIEW",
+                "status": status,
+                "source_url": url,
+                "reason": (
+                    "Saved decision retained; retry is not due yet."
+                    if status == "SOURCE_UNAVAILABLE"
+                    else
+                    "Saved decision retained; explicit retry or scheduled refresh required."
+                ),
+            })
             continue
         _record_source(professor_id,'GOOGLE_SCHOLAR',url,'QWEN_QUEUED',
                        {'discovered_by':'OFFICIAL_PROFILE_LINK','verified':False})
         pending.append(url)
     if pending:
         from radar_store import enqueue_radar_job
-        job = enqueue_radar_job('QWEN_REVIEW_PUBLICATION',professor_id=professor_id,priority=20,max_attempts=1)
-        steps.append({'step':'QWEN_SCHOLAR_REVIEW','status':'QUEUED','job_id':job['id'],
-                      'reason':'Supplemental Scholar review; existing publications retained.',
-                      'candidate_count':len(pending)})
+        job = enqueue_radar_job(
+            "QWEN_REVIEW_PUBLICATION",
+            professor_id=professor_id,
+            priority=70,
+            max_attempts=3,
+        )
 
+        steps.append({
+            "step": "QWEN_SCHOLAR_REVIEW",
+            "status": "QUEUED",
+            "job_id": job["id"],
+            "reason": "Supplemental Scholar review; existing publications retained.",
+            "candidate_count": len(pending),
+        })
 
 def _store_interest_fallback(
     professor_id: int, professor: dict[str, Any],
@@ -1160,45 +1198,73 @@ def review_queued_scholar_candidates(
             steps.append({'step':'SCHOLAR_PROFILE','status':'CHECKED','source_url':str(response.url),
                           'papers_found':len(scholar['papers']),
                           'reason':f'Fetched up to {min(100,max_works)} listed works; not a completeness guarantee.'})
-            model = review_publication_identity(
-                source_record_key=str(response.url),
-                institution_id=int(professor["institution_id"]),
-                professor_name=str(professor["name"]),
-                institution=str(professor["institution_name"]),
-                department=str(professor.get("department") or ""),
-                official_email_domain=str(professor.get("official_institution_domain") or ""),
-                known_pages=known_urls,
-                scholar_profile=scholar,
-            )
             decision, reasons = scholar_identity_decision(
-                dict(professor), scholar, known_urls, scholar_url=str(response.url),
+                dict(professor),
+                scholar,
+                known_urls,
+                scholar_url=str(response.url),
                 official_scholar_urls=official_scholar_urls,
             )
-            # A model failure can only hold a candidate; it can never approve it.
-            if model.status != "VALID":
-                decision = "REVIEW_REQUIRED" if model.status != "MODEL_UNAVAILABLE" else "SOURCE_UNAVAILABLE"
-            elif str(model.data.get("same_person") or "").upper() != "YES":
-                decision = (
-                    "PROFILE_NAME_CONFLICT"
-                    if str(model.data.get("same_person") or "").upper() == "NO"
-                    else "REVIEW_REQUIRED"
+
+            model = None
+
+# Deterministic verification is already sufficient when we have:
+# - a compatible professor name, AND
+# - an independent trusted identity signal such as an official-profile link,
+#   verified institutional email, compatible affiliation, or known homepage.
+#
+# Only use Qwen when deterministic evidence is not already sufficient.
+            if decision != "VERIFIED":
+                model = review_publication_identity(
+                    source_record_key=str(response.url),
+                    institution_id=int(professor["institution_id"]),
+                    professor_name=str(professor["name"]),
+                    institution=str(professor["institution_name"]),
+                    department=str(professor.get("department") or ""),
+                    official_email_domain=str(
+                        professor.get("official_institution_domain") or ""
+                    ),
+                    known_pages=known_urls,
+                    scholar_profile=scholar,
                 )
-            evidence = {"reasons": reasons, "qwen_status": model.status,
-                        "qwen": model.data, "qwen_errors": list(model.errors),
-                        "name": scholar.get("name"),
-                        "affiliation": scholar.get("affiliation"),
-                        "verified_email": scholar.get("verified_email"),
-                        "discovered_by": (
-                            "OFFICIAL_PROFILE_LINK"
-                            if _scholar_profile_key(str(response.url)) in {
-                                _scholar_profile_key(value)
-                                for value in official_scholar_urls
-                            }
-                            else "SAVED_CANDIDATE"
-                        )}
+
+                if model.status != "VALID":
+                    decision = (
+                        "REVIEW_REQUIRED"
+                        if model.status != "MODEL_UNAVAILABLE"
+                        else "SOURCE_UNAVAILABLE"
+                    )
+
+                elif str(model.data.get("same_person") or "").upper() != "YES":
+                    decision = (
+                        "PROFILE_NAME_CONFLICT"
+                        if str(model.data.get("same_person") or "").upper() == "NO"
+                        else "REVIEW_REQUIRED"
+                    )
+
+            qwen_status = model.status if model is not None else "NOT_NEEDED"
+            qwen_data = model.data if model is not None else {}
+            qwen_errors = list(model.errors) if model is not None else []
+            evidence = {
+                "reasons": reasons,
+                "qwen_status": qwen_status,
+                "qwen": qwen_data,
+                "qwen_errors": qwen_errors,
+                "name": scholar.get("name"),
+                "affiliation": scholar.get("affiliation"),
+                "verified_email": scholar.get("verified_email"),
+                "discovered_by": (
+                    "OFFICIAL_PROFILE_LINK"
+                    if _scholar_profile_key(str(response.url)) in {
+                        _scholar_profile_key(value)
+                        for value in official_scholar_urls
+                    }
+                    else "SAVED_CANDIDATE"
+                ),
+            }
             _record_source(professor_id, "GOOGLE_SCHOLAR", str(response.url), decision, evidence)
             reviewed.append({"url": str(response.url), "decision": decision, "reasons": reasons})
-            steps.append({"step": "QWEN_SCHOLAR_REVIEW", "status": model.status,
+            steps.append({"step": "QWEN_SCHOLAR_REVIEW", "status": qwen_status,
                           "source_url": str(response.url),
                           "deterministic_decision": decision,
                           "decision_signals": reasons})
