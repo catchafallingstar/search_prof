@@ -136,7 +136,7 @@ def test_discovery_visits_personal_sections_before_search(monkeypatch):
         'https://example.edu/profile': '<main><a href="https://mckeekimberly.com/">mckeekimberly.com</a><a href="https://scholar.google.com/citations?user=example">Scholar</a></main>',
         'https://mckeekimberly.com/': '<nav><a href="/research/">Research</a><a href="/about/">About</a></nav><main>Kimberly McKee</main>',
         'https://mckeekimberly.com/research/': '<main><h2>Publications</h2><p>“A Genuine Research Paper” (2025)</p></main>',
-        'https://mckeekimberly.com/about/': '<main><h1>Kimberly McKee</h1></main>',
+        'https://mckeekimberly.com/about/': '<main><h1>Kimberly McKee</h1><a href="https://scholar.google.de/citations?user=personal">Scholar</a></main>',
     }
     visited = []
     def get(url, **kwargs):
@@ -148,11 +148,12 @@ def test_discovery_visits_personal_sections_before_search(monkeypatch):
     monkeypatch.setattr(module,'_status',lambda *args:None)
     monkeypatch.setattr(module,'_save',lambda pid,papers,callback:len(papers))
     scholar_queues=[]
-    monkeypatch.setattr(module,'_queue_linked_scholar_review',lambda pid,urls,steps:scholar_queues.append(urls))
+    monkeypatch.setattr(module,'_queue_linked_scholar_review',lambda pid,urls,steps,**kwargs:scholar_queues.append((urls,kwargs.get('discovered_by','OFFICIAL_PROFILE_LINK'))) if urls else None)
     monkeypatch.setattr(module,'_publication_search',lambda *args,**kwargs: (_ for _ in ()).throw(AssertionError('Search before linked sections')))
     result = module.discover_faculty_publications(1)
     assert result['papers_imported'] == 1
-    assert scholar_queues == [['https://scholar.google.com/citations?user=example']]
+    assert scholar_queues == [(['https://scholar.google.com/citations?user=example'],'OFFICIAL_PROFILE_LINK'),
+                              (['https://scholar.google.de/citations?user=personal'],'LINKED_RESEARCH_PAGE')]
     assert set(visited) == set(pages)
 
 

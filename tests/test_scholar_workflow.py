@@ -1,0 +1,133 @@
+from contextlib import contextmanager
+from types import SimpleNamespace
+from urllib.parse import urlencode
+
+import pytest
+import requests
+
+from ingestion import publication_discovery as pub
+from ingestion.index_worker import _scholar_retry_delay
+
+URL = 'https://scholar.google.com/citations?user=testid'
+
+
+@pytest.mark.parametrize('host', ['scholar.google.com','scholar.google.co.uk','scholar.google.com.tr','scholar.google.de'])
+def test_supported_regional_profiles(host):
+    assert pub._is_scholar_profile_url(f'https://{host}/citations?user=abc')
+
+
+@pytest.mark.parametrize('url', [
+    'https://scholar.google.com.evil.test/citations?user=abc',
+    'https://scholar.google.xyz/citations?user=abc',
+    'https://scholar.google.com/citations',
+    'https://scholar.google.com/other?user=abc',
+])
+def test_lookalikes_and_nonprofiles_rejected(url):
+    assert not pub._is_scholar_profile_url(url)
+
+
+def install_pages(monkeypatch, batches, names=None):
+    calls=[]
+    def get(url, params, **kwargs):
+        index=len(calls);calls.append(params.copy())
+        if isinstance(batches[index],Exception): raise batches[index]
+        return SimpleNamespace(text=str(index),url=url+'?'+urlencode(params),raise_for_status=lambda:None)
+    def parse(html,url):
+        index=int(html)
+        return dict(name=names[index] if names else 'Jane Smith', papers=[
+            pub.Publication(f'Paper number {n}',2024,'',url,'GOOGLE_SCHOLAR','citation')
+            for n in batches[index]])
+    monkeypatch.setattr(pub.requests,'get',get)
+    monkeypatch.setattr(pub,'parse_scholar_profile',parse)
+    monkeypatch.setattr(pub.time,'sleep',lambda _:None)
+    return calls
+
+
+def test_pagination_beyond_one_hundred(monkeypatch):
+    calls=install_pages(monkeypatch,[range(100),range(100,140)])
+    result=pub.fetch_scholar_profile(URL,headers={})
+    assert len(result['papers'])==140
+    assert result['pagination_status']=='END_OF_LIST'
+    assert [c['cstart'] for c in calls]==[0,100]
+
+
+def test_repeated_page_stops_without_duplicates(monkeypatch):
+    calls=install_pages(monkeypatch,[range(100),range(100)])
+    result=pub.fetch_scholar_profile(URL,headers={})
+    assert len(result['papers'])==100 and len(calls)==2
+    assert result['pagination_status']=='REPEATED_PAGE'
+
+
+def test_changed_identity_aborts(monkeypatch):
+    install_pages(monkeypatch,[range(100),range(100,110)],['Jane Smith','John Jones'])
+    with pytest.raises(requests.HTTPError,match='identity changed'):
+        pub.fetch_scholar_profile(URL,headers={})
+
+
+def test_pagination_stops_on_block(monkeypatch):
+    calls=install_pages(monkeypatch,[range(100),requests.HTTPError('blocked')])
+    with pytest.raises(requests.HTTPError):pub.fetch_scholar_profile(URL,headers={})
+    assert len(calls)==2
+
+
+def test_retry_is_delayed_and_bounded():
+    job=dict(job_type='QWEN_REVIEW_PUBLICATION',attempts=1,max_attempts=3)
+    assert _scholar_retry_delay(job,{'status':'SOURCE_UNAVAILABLE'})==21600
+    assert _scholar_retry_delay(job,{'status':'SOURCE_UNAVAILABLE','retry_after_seconds':86400})==86400
+    assert not _scholar_retry_delay({**job,'attempts':3},{'status':'SOURCE_UNAVAILABLE'})
+    assert not _scholar_retry_delay(job,{'status':'REVIEW_REQUIRED'})
+
+
+def setup_review(monkeypatch, *, official=True):
+    professor=dict(id=1,name='Jane Smith',institution_id=1,institution_name='Example University',
+                   faculty_source_url='https://example.edu/jane',official_institution_domain='example.edu',department='CS')
+    queries=[]
+    class Cursor:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def execute(self,sql,*args):queries.append(sql)
+        def fetchone(self):return professor
+    @contextmanager
+    def connection():yield SimpleNamespace(cursor=Cursor)
+    monkeypatch.setattr(pub,'get_db_connection',connection)
+    monkeypatch.setattr(pub,'_saved_scholar_candidates',lambda _: [URL])
+    monkeypatch.setattr(pub,'_official_profile_scholar_candidates',lambda _: set())
+    html='<main><h1>Jane Smith</h1>'+(f'<a href="{URL}">Scholar</a>' if official else '')+'</main>'
+    monkeypatch.setattr(pub.requests,'get',lambda *args,**kwargs:SimpleNamespace(text=html,url=professor['faculty_source_url'],raise_for_status=lambda:None))
+    sources=[];statuses=[];saved=[]
+    monkeypatch.setattr(pub,'_record_source',lambda *args:sources.append(args))
+    monkeypatch.setattr(pub,'_status',lambda pid,value:statuses.append(value))
+    monkeypatch.setattr(pub,'_save',lambda pid,papers,callback:saved.extend(papers) or len(papers))
+    monkeypatch.setattr(pub,'_dismiss_resolved_scholar_reviews',lambda _:None)
+    scholar=dict(name='Jane Smith',affiliation='Example University',verified_email='',homepage='',
+                 papers=[pub.Publication('A real research paper',2024,'',URL,'GOOGLE_SCHOLAR','evidence')],
+                 pagination_status='END_OF_LIST',pages_fetched=1,works_limit=300)
+    monkeypatch.setattr(pub,'fetch_scholar_profile',lambda *args,**kwargs:scholar)
+    return sources,statuses,saved,queries
+
+
+def test_direct_official_link_does_not_require_qwen(monkeypatch):
+    sources,statuses,saved,queries=setup_review(monkeypatch)
+    monkeypatch.setattr(pub,'review_publication_identity',lambda **kwargs:pytest.fail('Qwen not needed'))
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='SCHOLAR_VERIFIED' and len(saved)==1
+    assert sources[-1][-1]['qwen_status']=='NOT_NEEDED'
+
+
+def test_affiliation_alone_cannot_bypass_unavailable_qwen(monkeypatch):
+    sources,statuses,saved,queries=setup_review(monkeypatch,official=False)
+    monkeypatch.setattr(pub,'review_publication_identity',lambda **kwargs:SimpleNamespace(status='MODEL_UNAVAILABLE',data={},errors=[]))
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='SOURCE_UNAVAILABLE' and not saved
+    assert not any('INSERT INTO professor_identity_review_queue' in q for q in queries)
+
+
+def test_http_outage_is_not_an_identity_review(monkeypatch):
+    sources,statuses,saved,queries=setup_review(monkeypatch)
+    response=requests.Response();response.status_code=429;response.headers['Retry-After']='86400'
+    def fail(*args,**kwargs):raise requests.HTTPError('429',response=response)
+    monkeypatch.setattr(pub,'fetch_scholar_profile',fail)
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='SOURCE_UNAVAILABLE'
+    assert result['retry_after_seconds']==86400
+    assert not saved and not any('INSERT INTO professor_identity_review_queue' in q for q in queries)

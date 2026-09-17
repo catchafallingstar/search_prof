@@ -77,6 +77,14 @@ def log_event(event: str, **values: Any) -> None:
     write_event(payload)
 
 
+def _scholar_retry_delay(job: dict[str, Any], result: dict[str, Any]) -> int:
+    if (job['job_type']=='QWEN_REVIEW_PUBLICATION'
+        and result.get('status')=='SOURCE_UNAVAILABLE'
+        and int(job.get('attempts') or 1)<int(job.get('max_attempts') or 3)):
+        return max(21600,int(result.get('retry_after_seconds') or 21600))
+    return 0
+
+
 def _job_outcome(job_type: str, result: dict[str, Any]) -> str:
     """Describe the data result separately from successful job execution."""
     if job_type == "DISCOVER_FACULTY_DIRECTORIES":
@@ -241,7 +249,7 @@ def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             raise RuntimeError("MATCH_FACULTY_PUBLICATIONS requires a professor.")
         _publish_job_progress(
             job, job_type, professor_ids=[int(professor_id)],
-            detail="Checking official profile and linked research pages; Scholar is fallback only.",
+            detail="Checking official profile and linked research pages; linked Scholar profiles are reviewed separately.",
         )
         result = discover_faculty_publications(
             int(professor_id),
@@ -282,7 +290,7 @@ def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             ),
             activity_callback=lambda stage, metadata: _publish_job_progress(
                 job, stage, professor_ids=[int(professor_id)],
-                detail="Qwen is checking the candidate; this request may take up to five minutes.",
+                detail="Checking Scholar identity and publications; Qwen is used when direct official-link evidence is insufficient.",
                 **metadata,
             ),
         )
@@ -434,8 +442,14 @@ def run_worker(
             )
             try:
                 result, needs_more = run_job_isolated(job, worker_id)
+                scholar_delay = _scholar_retry_delay(job,result)
+                scholar_retry = bool(scholar_delay)
+                if scholar_retry:
+                    needs_more = True
+                    result['retry_after_seconds'] = scholar_delay
                 if needs_more:
-                    reschedule_radar_job(int(job["id"]), max(2, int(result.get("retry_after_seconds") or 2)), result)
+                    reschedule_radar_job(int(job["id"]), max(2, int(result.get("retry_after_seconds") or 2)), result,
+                                         preserve_attempts=scholar_retry)
                     status = "rescheduled"
                 else:
                     complete_radar_job(

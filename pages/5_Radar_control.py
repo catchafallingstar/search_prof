@@ -123,6 +123,9 @@ def live_panel() -> None:
             if entry.get("evidence_text"):
                 st.write(f"Paper/evidence: {str(entry['evidence_text'])[:500]}")
             st.write(f"Result: {entry.get('result_status') or 'Finished successfully'}")
+            if any(step.get('step')=='QWEN_SCHOLAR_REVIEW' and step.get('status')=='QUEUED'
+                   for step in entry.get('audit_steps') or []):
+                st.info('Google Scholar identity verification and publication extraction are queued as a separate background job.')
             if entry.get("result_detail"):
                 st.caption(str(entry["result_detail"])[:500])
             if entry.get("source_url"):
@@ -140,7 +143,9 @@ def live_panel() -> None:
                 if step.get("saved_candidates") is not None:
                     details.append(f"saved candidates: {step['saved_candidates']}")
                 if step.get("papers_imported") is not None:
-                    details.append(f"imported: {step['papers_imported']}")
+                    details.append(f"newly linked: {step['papers_imported']}")
+                if step.get('papers_already_linked') is not None:
+                    details.append(f"already linked: {step['papers_already_linked']}")
                 if step.get("deterministic_decision"):
                     details.append(f"decision: {step['deterministic_decision']}")
                 if step.get("decision_signals"):

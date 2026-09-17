@@ -1370,13 +1370,14 @@ def reschedule_radar_job(
     job_id: int,
     delay_seconds: int = 2,
     result: dict[str, Any] | None = None,
+    *, preserve_attempts: bool = False,
 ) -> None:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE radar_jobs
-                SET status = 'queued', attempts = 0,
+                SET status = 'queued', attempts = CASE WHEN %s THEN attempts ELSE 0 END,
                     outcome_status = 'PENDING',
                     available_at = NOW() + (%s * INTERVAL '1 second'),
                     locked_at = NULL, locked_by = NULL, started_at = NULL,
@@ -1384,7 +1385,7 @@ def reschedule_radar_job(
                     result_json = %s::jsonb
                 WHERE id = %s
                 """,
-                (max(0, int(delay_seconds)), json.dumps(result or {}), job_id),
+                (preserve_attempts, max(0, int(delay_seconds)), json.dumps(result or {}), job_id),
             )
 
 
@@ -2113,10 +2114,11 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                        COALESCE(job.completed_at, job.updated_at) AS activity_at,
                        CASE
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
-                              AND job.job_type IN (
-                                'MATCH_FACULTY_PUBLICATIONS','QWEN_REVIEW_PUBLICATION'
-                              )
-                           THEN 'Publication identity verified — papers imported'
+                              AND job.job_type='QWEN_REVIEW_PUBLICATION'
+                           THEN 'Google Scholar identity verified — Scholar papers processed'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
+                              AND job.job_type='MATCH_FACULTY_PUBLICATIONS'
+                           THEN 'Official or linked publication sources processed'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
                            THEN 'Approved'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='REVIEW_REQUIRED' THEN 'Needs staff review'

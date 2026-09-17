@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -38,6 +39,19 @@ NON_PROFILE_PATH = re.compile(
     re.I,
 )
 PUBLICATION_DISCOVERY_VERSION = 10
+SCHOLAR_SUFFIXES = frozenset({'com','co.uk','com.tr','de','fr','ca','com.au','co.in',
+    'co.jp','com.br','es','it','nl','ch','se','no','dk','fi','at','be','pl','pt',
+    'co.nz','co.za','com.mx','com.sg','com.hk','com.tw','co.kr','co.id'})
+
+
+def _is_google_scholar_host(host: str) -> bool:
+    return str(host).casefold() in {'scholar.google.' + suffix for suffix in SCHOLAR_SUFFIXES}
+
+
+def _is_scholar_profile_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return (parsed.scheme in {'http','https'} and _is_google_scholar_host(parsed.hostname or '')
+            and parsed.path.rstrip('/') == '/citations' and bool(parse_qs(parsed.query).get('user')))
 RESEARCH_INTEREST_HEADING = re.compile(
     r"\b(?:research|scholarly|academic)?\s*(?:interests?|areas?|expertise|"
     r"specialt(?:y|ies)|research focus|areas? of interest|areas? of expertise)\b",
@@ -561,7 +575,7 @@ def linked_scholar_profiles(html: str, profile_url: str) -> list[str]:
         parsed = urlparse(url)
         host = (parsed.hostname or "").casefold()
         if (
-            (host == "scholar.google.com" or host.endswith(".scholar.google.com"))
+            _is_google_scholar_host(host)
             and parsed.path.rstrip("/") == "/citations"
             and parse_qs(parsed.query).get("user")
         ):
@@ -623,11 +637,15 @@ def scholar_identity_decision(
     if institutions_equivalent(str(professor["institution_name"]), str(scholar.get("affiliation") or "")):
         reasons.append("compatible_affiliation")
     domain = str(professor.get("official_institution_domain") or "").casefold().removeprefix("www.")
-    if domain and domain in str(scholar.get("verified_email") or "").casefold():
+    email_match = re.search(r'Verified email at\s+([a-z0-9.-]+)', str(scholar.get('verified_email') or ''), re.I)
+    if domain and email_match and email_match[1].casefold().rstrip('.') == domain:
         reasons.append("verified_email_domain")
     homepage_host = (urlparse(str(scholar.get("homepage") or "")).hostname or "").casefold().removeprefix("www.")
     known_hosts = {(urlparse(value).hostname or "").casefold().removeprefix("www.") for value in known_urls}
-    if homepage_host and homepage_host in known_hosts:
+    homepage_path = urlparse(str(scholar.get('homepage') or '')).path.rstrip('/')
+    if homepage_host and homepage_path and any(
+        urlparse(value).hostname == urlparse(str(scholar.get('homepage') or '')).hostname
+        and urlparse(value).path.rstrip('/') == homepage_path for value in known_urls):
         reasons.append("known_homepage")
     official_keys = {
         _scholar_profile_key(url) for url in (official_scholar_urls or set())
@@ -645,7 +663,7 @@ def _record_source(professor_id: int, source_type: str, url: str, status: str, e
                 VALUES (%s,%s,%s,%s,%s::jsonb,NOW())
                 ON CONFLICT (professor_id,source_url) DO UPDATE SET
                 source_type=EXCLUDED.source_type,identity_status=EXCLUDED.identity_status,
-                evidence=EXCLUDED.evidence,checked_at=NOW()""",
+                evidence=professor_publication_sources.evidence || EXCLUDED.evidence,checked_at=NOW()""",
                 (professor_id, source_type, url, status, json.dumps(evidence)))
 
 
@@ -665,9 +683,11 @@ def _save(professor_id: int, papers: list[Publication], progress: Callable[[str,
                     DO UPDATE SET title=EXCLUDED.title,
                     publication_year=COALESCE(EXCLUDED.publication_year,papers.publication_year),
                     venue=COALESCE(NULLIF(EXCLUDED.venue,''),papers.venue),
-                    doi=COALESCE(EXCLUDED.doi,papers.doi),source_type=EXCLUDED.source_type,
-                    source_url=EXCLUDED.source_url,source_evidence=EXCLUDED.source_evidence,
-                    raw_citation=COALESCE(NULLIF(EXCLUDED.raw_citation,''),papers.raw_citation),
+                    doi=COALESCE(EXCLUDED.doi,papers.doi),
+                    source_type=CASE WHEN EXCLUDED.source_type='GOOGLE_SCHOLAR' AND papers.source_type<>'GOOGLE_SCHOLAR' THEN papers.source_type ELSE EXCLUDED.source_type END,
+                    source_url=CASE WHEN EXCLUDED.source_type='GOOGLE_SCHOLAR' AND papers.source_type<>'GOOGLE_SCHOLAR' THEN papers.source_url ELSE EXCLUDED.source_url END,
+                    source_evidence=CASE WHEN EXCLUDED.source_type='GOOGLE_SCHOLAR' AND papers.source_type<>'GOOGLE_SCHOLAR' THEN papers.source_evidence ELSE EXCLUDED.source_evidence END,
+                    raw_citation=CASE WHEN EXCLUDED.source_type='GOOGLE_SCHOLAR' AND papers.source_type<>'GOOGLE_SCHOLAR' THEN papers.raw_citation ELSE COALESCE(NULLIF(EXCLUDED.raw_citation,''),papers.raw_citation) END,
                     metadata_status=CASE WHEN EXCLUDED.doi IS NOT NULL THEN 'DOI_IDENTIFIED'
                                          ELSE papers.metadata_status END RETURNING id""",
                     (paper_key(paper), paper.title, paper.year, paper.venue, paper.doi or None,
@@ -696,7 +716,7 @@ def _status(professor_id: int, value: str) -> None:
         with connection.cursor() as cursor:
             cursor.execute(
                 """UPDATE professors SET publication_status=CASE
-                     WHEN %s IN ('NO_PUBLICATIONS_FOUND','REVIEW_REQUIRED','SCHOLAR_REVIEW_QUEUED')
+                     WHEN %s IN ('NO_PUBLICATIONS_FOUND','REVIEW_REQUIRED','SCHOLAR_REVIEW_QUEUED','SOURCE_UNAVAILABLE')
                        AND EXISTS (SELECT 1 FROM professor_papers WHERE professor_id=professors.id)
                      THEN CASE WHEN publication_status='SCHOLAR_VERIFIED'
                                THEN 'SCHOLAR_VERIFIED' ELSE 'OFFICIAL_PUBLICATIONS_FOUND' END
@@ -708,7 +728,8 @@ def _status(professor_id: int, value: str) -> None:
 
 
 def _queue_linked_scholar_review(professor_id: int, urls: list[str],
-                                 steps: list[dict[str, Any]]) -> None:
+                                 steps: list[dict[str, Any]], *,
+                                 discovered_by: str = 'OFFICIAL_PROFILE_LINK') -> None:
     """Supplement existing papers with new official-linked Scholar evidence.
 
     Completed decisions are not silently retried on every publication crawl.
@@ -766,7 +787,7 @@ def _queue_linked_scholar_review(professor_id: int, urls: list[str],
             })
             continue
         _record_source(professor_id,'GOOGLE_SCHOLAR',url,'QWEN_QUEUED',
-                       {'discovered_by':'OFFICIAL_PROFILE_LINK','verified':False})
+                       {'discovered_by':discovered_by,'verified':False})
         pending.append(url)
     if pending:
         from radar_store import enqueue_radar_job
@@ -888,11 +909,7 @@ def save_staff_scholar_candidate(
     """Persist an unverified staff lead; saving it never attaches papers."""
     url = str(source_url or "").strip()
     parsed = urlparse(url)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or parsed.hostname not in {"scholar.google.com", "scholar.googleusercontent.com"}
-        or "/citations" not in parsed.path
-    ):
+    if not _is_scholar_profile_url(url):
         raise ValueError("Enter a Google Scholar citations profile URL.")
     _record_source(
         professor_id,
@@ -941,6 +958,7 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
     profile_url = str(professor.get("verified_profile_url") or professor.get("faculty_source_url") or "")
     known_urls, papers = ([profile_url] if profile_url else []), []
     official_scholar_urls: list[str] = []
+    linked_site_scholar_urls: list[str] = []
     explicit_interests: list[tuple[list[str], str, str]] = []
     biography_text = ""
     biography_url = profile_url
@@ -998,7 +1016,7 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
                     if not depth:
                         pending_links.extend((child, 1) for child in personal_site_sections(linked.text, str(linked.url)))
                     found = extract_publications(linked.text, str(linked.url), kind, str(professor['name'])); papers.extend(found)
-                    official_scholar_urls.extend(linked_scholar_profiles(linked.text, str(linked.url)))
+                    linked_site_scholar_urls.extend(linked_scholar_profiles(linked.text, str(linked.url)))
                     interests, interest_excerpt = extract_research_interests(linked.text)
                     if interests:
                         explicit_interests.append(
@@ -1020,11 +1038,15 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
     if papers:
         imported = _save(professor_id, papers, progress_callback); _status(professor_id, "OFFICIAL_PUBLICATIONS_FOUND")
         _queue_linked_scholar_review(professor_id, official_scholar_urls, steps)
+        _queue_linked_scholar_review(professor_id,
+            [u for u in linked_site_scholar_urls if _scholar_profile_key(u) not in {_scholar_profile_key(v) for v in official_scholar_urls}],
+            steps, discovered_by='LINKED_RESEARCH_PAGE')
         if explicit_interests:
             _store_interest_fallback(professor_id, professor, explicit_interests,
                                      biography_text, biography_url, steps)
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
-                      "papers_found": len(papers), "papers_imported": imported})
+                      "papers_found": len(papers), "papers_imported": imported,
+                      "papers_already_linked": len(papers)-imported})
         return {"status": "OFFICIAL_PUBLICATIONS_FOUND", "papers_found": len(papers),
                 "papers_imported": imported, "steps": steps}
     official_root = _host_root(
@@ -1087,8 +1109,12 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
         imported = _save(professor_id, papers, progress_callback)
         _status(professor_id, "OFFICIAL_PUBLICATIONS_FOUND")
         _queue_linked_scholar_review(professor_id, official_scholar_urls, steps)
+        _queue_linked_scholar_review(professor_id,
+            [u for u in linked_site_scholar_urls if _scholar_profile_key(u) not in {_scholar_profile_key(v) for v in official_scholar_urls}],
+            steps, discovered_by='LINKED_RESEARCH_PAGE')
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
-                      "papers_found": len(papers), "papers_imported": imported})
+                      "papers_found": len(papers), "papers_imported": imported,
+                      "papers_already_linked": len(papers)-imported})
         return {"status": "OFFICIAL_PUBLICATIONS_FOUND",
                 "papers_found": len(papers), "papers_imported": imported,
                 "steps": steps}
@@ -1103,14 +1129,15 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
             "verified": False,
         })
     saved_urls = _saved_scholar_candidates(professor_id)
+    linked_site_keys = {_scholar_profile_key(u) for u in linked_site_scholar_urls}
     scholar_query = f'"{professor["name"]}" "{professor["institution_name"]}" Google Scholar'
     # An explicit link from the verified university profile is stronger than a
     # search result and makes another DDGS request unnecessary.
-    results = [] if saved_urls else _publication_search(scholar_query, max_results=5)
+    results = [] if saved_urls or linked_site_scholar_urls else _publication_search(scholar_query, max_results=5)
     searched_urls = [str(r.get("href") or r.get("url") or "") for r in results]
-    searched_urls = [u for u in searched_urls if "scholar.google." in u.casefold() and "/citations" in u]
+    searched_urls = [u for u in searched_urls if _is_scholar_profile_url(u)]
     urls = _dedupe_scholar_profiles(
-        [*official_scholar_urls, *saved_urls, *searched_urls]
+        [*official_scholar_urls, *linked_site_scholar_urls, *saved_urls, *searched_urls]
     )[:5]
     steps.append({"step": "GOOGLE_SCHOLAR_SEARCH",
                   "status": "NOT_NEEDED" if saved_urls else "CHECKED",
@@ -1128,6 +1155,7 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
     for url in urls:
         _record_source(professor_id, "GOOGLE_SCHOLAR", url, "QWEN_QUEUED", {
             "discovered_by": ("OFFICIAL_PROFILE_LINK" if url in official_scholar_urls
+                              else 'LINKED_RESEARCH_PAGE' if _scholar_profile_key(url) in linked_site_keys
                               else "SAVED_CANDIDATE" if url in saved_urls else "SEARCH"),
             "verified": False,
         })
@@ -1138,10 +1166,49 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
             "papers_imported": 0, "candidate_count": len(urls), "steps": steps}
 
 
+def fetch_scholar_profile(url: str, *, headers: dict[str, str], max_works: int = 300) -> dict[str, Any]:
+    """Bounded, paced pagination; never continue through a block or identity change."""
+    if not _is_scholar_profile_url(url):
+        raise ValueError('Not a supported Scholar profile URL')
+    limit = max(1, min(300, max_works))
+    found: dict[str, Publication] = {}
+    profile = None
+    reason = 'LIMIT_REACHED'
+    pages = 0
+    for offset in range(0, limit, 100):
+        if offset:
+            time.sleep(2)
+        # Remove caller-supplied pagination so it cannot conflict with ours.
+        base = url.split('?', 1)[0]
+        params = {'user':_scholar_profile_key(url),'pagesize':min(100,limit-offset),'cstart':offset}
+        response = requests.get(base,params=params,timeout=30,headers=headers)
+        response.raise_for_status()
+        if not _is_scholar_profile_url(str(response.url)) or _scholar_profile_key(str(response.url)) != _scholar_profile_key(url):
+            raise requests.HTTPError('Scholar redirect changed profile identity')
+        if _is_block_page(response.text):
+            raise requests.HTTPError('Scholar returned an access challenge')
+        page = parse_scholar_profile(response.text,str(response.url))
+        if not page.get('name'):
+            raise requests.HTTPError('Scholar response has no readable profile identity')
+        if profile is not None and not same_person_name(profile['name'],page['name']):
+            raise requests.HTTPError('Scholar identity changed during pagination')
+        profile = profile or page
+        batch = page['papers']; before = len(found); pages += 1
+        for paper in batch:
+            found.setdefault(paper_key(paper),paper)
+        if batch and len(found)==before:
+            reason='REPEATED_PAGE'; break
+        if len(batch)<params['pagesize']:
+            reason='END_OF_LIST'; break
+    assert profile is not None
+    return {**profile,'papers':list(found.values())[:limit],
+            'pagination_status':reason,'pages_fetched':pages,'works_limit':limit}
+
+
 def review_queued_scholar_candidates(
     professor_id: int, *, progress_callback: Callable[[str, int, int], None] | None = None,
     activity_callback: Callable[[str, dict[str, Any]], None] | None = None,
-    max_works: int = 100,
+    max_works: int = 300,
 ) -> dict[str, object]:
     """Review durable Scholar candidates. One worker processes this queue serially."""
     with get_db_connection() as connection:
@@ -1159,7 +1226,10 @@ def review_queued_scholar_candidates(
     if not professor:
         raise RuntimeError("Qwen review requires a verified roster professor.")
     known_urls = [str(professor.get("faculty_source_url") or "")]
-    official_scholar_urls = _official_profile_scholar_candidates(professor_id)
+    # Re-establish direct provenance from today's official page. Older rows
+    # may have incorrectly labelled personal-site links as official links.
+    official_scholar_urls: set[str] = set()
+    saved_official_urls = _official_profile_scholar_candidates(professor_id)
     headers = {"User-Agent": "Mozilla/5.0 ScholarRadar/2.0 evidence-review"}
     # Re-read the authoritative profile so provenance survives retries even if
     # an older decision row was written before provenance was preserved.
@@ -1167,13 +1237,16 @@ def review_queued_scholar_candidates(
         try:
             official_response = requests.get(known_urls[0], timeout=30, headers=headers)
             official_response.raise_for_status()
-            official_scholar_urls.update(linked_scholar_profiles(
-                official_response.text, str(official_response.url)
-            ))
+            attributable, _ = alternate_official_profile_matches(
+                official_response.text, str(official_response.url), dict(professor))
+            if attributable and not _is_block_page(official_response.text):
+                official_scholar_urls.update(linked_scholar_profiles(
+                    official_response.text, str(official_response.url)
+                ))
         except requests.RequestException:
             pass
     urls = _dedupe_scholar_profiles([
-        *official_scholar_urls, *_saved_scholar_candidates(professor_id)
+        *official_scholar_urls, *saved_official_urls, *_saved_scholar_candidates(professor_id)
     ])
     if not urls:
         _status(professor_id, "NO_PUBLICATIONS_FOUND")
@@ -1182,41 +1255,32 @@ def review_queued_scholar_candidates(
                 "status": "NOT_RUN", "reason": "No saved Scholar candidate."}]}
     reviewed: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
+    retry_delay = 21600
     for index, url in enumerate(urls, 1):
         if activity_callback:
             activity_callback("QWEN_SCHOLAR_REVIEW", {"source_url": url,
                 "candidate_number": index, "candidate_total": len(urls)})
         try:
-            response = requests.get(url, params={'pagesize':min(100,max_works),'cstart':0},
-                                    timeout=30, headers=headers)
-            response.raise_for_status()
-            if _is_block_page(response.text):
-                raise requests.HTTPError('Scholar returned an access challenge')
-            scholar = parse_scholar_profile(response.text, str(response.url))
-            if not scholar.get('name'):
-                raise requests.HTTPError('Scholar response has no readable profile identity')
-            steps.append({'step':'SCHOLAR_PROFILE','status':'CHECKED','source_url':str(response.url),
+            scholar = fetch_scholar_profile(url,headers=headers,max_works=max_works)
+            steps.append({'step':'SCHOLAR_PROFILE','status':'CHECKED','source_url':url,
                           'papers_found':len(scholar['papers']),
-                          'reason':f'Fetched up to {min(100,max_works)} listed works; not a completeness guarantee.'})
+                          'reason':f"{scholar['pagination_status']}; {scholar['pages_fetched']} page(s), limit {scholar['works_limit']} works."})
             decision, reasons = scholar_identity_decision(
                 dict(professor),
                 scholar,
                 known_urls,
-                scholar_url=str(response.url),
+                scholar_url=url,
                 official_scholar_urls=official_scholar_urls,
             )
 
             model = None
 
-# Deterministic verification is already sufficient when we have:
-# - a compatible professor name, AND
-# - an independent trusted identity signal such as an official-profile link,
-#   verified institutional email, compatible affiliation, or known homepage.
-#
-# Only use Qwen when deterministic evidence is not already sufficient.
-            if decision != "VERIFIED":
+            # Bypass the model only for the freshly fetched direct official
+            # link plus compatible name. Same university alone is too weak.
+            direct_verified = decision == 'VERIFIED' and 'linked_from_official_profile' in reasons
+            if not direct_verified and decision != 'PROFILE_NAME_CONFLICT':
                 model = review_publication_identity(
-                    source_record_key=str(response.url),
+                    source_record_key=url,
                     institution_id=int(professor["institution_id"]),
                     professor_name=str(professor["name"]),
                     institution=str(professor["institution_name"]),
@@ -1255,17 +1319,17 @@ def review_queued_scholar_candidates(
                 "verified_email": scholar.get("verified_email"),
                 "discovered_by": (
                     "OFFICIAL_PROFILE_LINK"
-                    if _scholar_profile_key(str(response.url)) in {
+                    if _scholar_profile_key(url) in {
                         _scholar_profile_key(value)
                         for value in official_scholar_urls
                     }
                     else "SAVED_CANDIDATE"
                 ),
             }
-            _record_source(professor_id, "GOOGLE_SCHOLAR", str(response.url), decision, evidence)
-            reviewed.append({"url": str(response.url), "decision": decision, "reasons": reasons})
+            _record_source(professor_id, "GOOGLE_SCHOLAR", url, decision, evidence)
+            reviewed.append({"url": url, "decision": decision, "reasons": reasons})
             steps.append({"step": "QWEN_SCHOLAR_REVIEW", "status": qwen_status,
-                          "source_url": str(response.url),
+                          "source_url": url,
                           "deterministic_decision": decision,
                           "decision_signals": reasons})
             if decision == "VERIFIED":
@@ -1276,15 +1340,31 @@ def review_queued_scholar_candidates(
                 _dismiss_resolved_scholar_reviews(professor_id)
                 steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                               "papers_found": len(scholar_papers),
-                              "papers_imported": imported})
+                              "papers_imported": imported,
+                              "papers_already_linked": len(scholar_papers)-imported})
                 return {"status": value, "papers_found": len(scholar_papers),
                         "papers_imported": imported, "steps": steps}
         except requests.RequestException as error:
+            http_status = error.response.status_code if error.response is not None else None
+            retry_after = error.response.headers.get('Retry-After','') if error.response is not None else ''
+            try:
+                delay = int(retry_after) if retry_after.isdigit() else int((parsedate_to_datetime(retry_after)-datetime.now(timezone.utc)).total_seconds())
+                retry_delay = max(retry_delay,delay)
+            except (ValueError,TypeError,OverflowError):
+                pass
             _record_source(professor_id, "GOOGLE_SCHOLAR", url, "SOURCE_UNAVAILABLE",
-                           {"error": type(error).__name__})
+                           {"error": type(error).__name__, 'http_status':http_status,
+                            'retry_after_seconds':retry_delay})
             steps.append({"step": "SCHOLAR_PROFILE", "status": "SOURCE_UNAVAILABLE",
-                          "source_url": url, "error": type(error).__name__})
+                          "source_url": url, "error": type(error).__name__,
+                          'http_status':http_status,'retry_after_seconds':retry_delay})
             reviewed.append({"url": url, "decision": "SOURCE_UNAVAILABLE"})
+            if http_status in {403,429}:
+                break  # Do not hammer other profiles through the same block.
+    if reviewed and all(item.get('decision')=='SOURCE_UNAVAILABLE' for item in reviewed):
+        _status(professor_id,'SOURCE_UNAVAILABLE')
+        return {'status':'SOURCE_UNAVAILABLE','papers_found':0,'papers_imported':0,
+                'candidates':reviewed,'steps':steps,'retry_after_seconds':retry_delay}
     _status(professor_id, "REVIEW_REQUIRED")
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
