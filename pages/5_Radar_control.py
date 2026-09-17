@@ -118,7 +118,7 @@ def live_panel() -> None:
                 st.caption(
                     "Very low confidence · No direct interest found; possible research area created by AI."
                     if interest_step.get("evidence_method") == "AI_SUGGESTION" else
-                    "Low confidence · No papers found; possible research areas based on the professor’s website."
+                    "Low confidence · Research areas based on website statements, not paper-level classification."
                 )
             if entry.get("evidence_text"):
                 st.write(f"Paper/evidence: {str(entry['evidence_text'])[:500]}")

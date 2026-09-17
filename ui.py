@@ -416,9 +416,9 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
                 st.write(f"- {interest}")
             st.caption(
                 "No direct interest found. Possible research areas created by AI; "
-                "no papers found. These suggestions are unverified."
+                "no paper evidence for this match. These suggestions are unverified."
                 if row.get("interests_ai_generated") else
-                "No papers found. Possible research areas based on the professor’s website."
+                "No paper evidence for this match. Possible research areas based on the professor’s website."
             )
             source = str(row.get("interest_source_url") or "")
             if is_http_url(source) and not row.get("interests_ai_generated"):

@@ -842,6 +842,10 @@ def crawl_directory(
                          {**row['staff_overrides'], '_candidate_id': row['id']} for row in cursor.fetchall()}
     for member_index, member in enumerate(members, start=1):
         correction = overrides.get(_canonical_profile_url(member.profile_url))
+        # A staff-retired observation is historical evidence, not permission
+        # to overwrite a manually corrected current appointment on recrawl.
+        if correction and correction.get('retired_observation') is True:
+            continue
         if correction:
             member = replace(member, **{key: value for key, value in correction.items()
                                        if key in {'name','title','email','office_address','profile_url'}})

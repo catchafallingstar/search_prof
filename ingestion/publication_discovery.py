@@ -7,6 +7,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -36,7 +37,7 @@ NON_PROFILE_PATH = re.compile(
     r"/(?:news|events?|awards?|honors?|alumni|archive|stories?|press|jobs?)(?:/|$)",
     re.I,
 )
-PUBLICATION_DISCOVERY_VERSION = 6
+PUBLICATION_DISCOVERY_VERSION = 10
 RESEARCH_INTEREST_HEADING = re.compile(
     r"\b(?:research|scholarly|academic)?\s*(?:interests?|areas?|expertise|"
     r"specialt(?:y|ies)|research focus|areas? of interest|areas? of expertise)\b",
@@ -96,7 +97,7 @@ def paper_key(paper: Publication) -> str:
 
 def _main(soup: BeautifulSoup) -> Any:
     root = soup.select_one("main,[role=main],article,#main-content,.main-content") or soup.body or soup
-    for node in root.select("script,style,noscript,header,nav,footer,aside,form,.menu,.navigation,.footer"):
+    for node in root.select("script,style,noscript,header,nav,footer,aside,form,.menu,.navigation,.footer,.comments-area,.sharedaddy"):
         node.decompose()
     return root
 
@@ -326,23 +327,68 @@ def _publication_search(query: str, max_results: int) -> list[dict[str, Any]]:
             raise
 
 
-def extract_publications(html: str, url: str, source_type: str) -> list[Publication]:
-    """Read repeated records only inside an explicit publication section."""
+def _clean_publication_title(title: str) -> str:
+    # Strip only explicitly bracketed award badges, never the raw citation.
+    return re.sub(r'^\s*\[[^\]]*\baward\b[^\]]*\]\s*', '', title, flags=re.I).strip()
+
+
+def _author_year_publication(text: str, url: str, source_type: str,
+                             subject_name: str) -> Publication | None:
+    """Recognize attributable citations even without a Publications heading.
+
+    A subject surname/initial must occur in the author list, not just in the
+    title or surrounding prose. Preserve the full citation for auditing.
+    """
+    parts = _name_parts(subject_name)
+    if len(parts) < 2:
+        return None
+    match = re.fullmatch(r'(.{3,600}?)\s*\(((?:19|20)\d{2})[a-z]?\)\.\s*(.+)', text)
+    if not match:
+        return None
+    authors, year, body = match.groups()
+    if not re.match(r'^[^,;\d]{1,80},\s*[A-Za-z]', authors):
+        return None
+    folded_authors = fold_name_text(authors).casefold()
+    subject_author = (rf'(?<!\w){re.escape(parts[-1])},\s*'
+                      rf'(?:{re.escape(parts[0])}\b|{re.escape(parts[0][0])}\.(?=\W|$))')
+    if not re.search(subject_author, folded_authors):
+        return None
+    pieces = re.split(r'\.\s+', body, maxsplit=1)
+    if len(pieces) != 2:
+        return None
+    title, venue = pieces
+    title = _clean_publication_title(title)
+    if len(_title_key(title).split()) < 3:
+        return None
+    # Journal volume/pages, a chapter's editor container, or a publisher.
+    # A year in an education/award sentence is not sufficient.
+    if not re.search(r'\b(?:Journal|Review|Proceedings|Press|Routledge|Springer|Wiley)\b|^In\s|\d+\s*\(\d+\)|\d+\s*[,;:]\s*\d+[-–]\d+', venue, re.I):
+        return None
+    doi = DOI.search(text)
+    return Publication(title.strip(), int(year), doi[0].rstrip('.,;)') if doi else '',
+                       url, source_type, text, authors.strip(), venue.strip())
+
+
+def extract_publications(html: str, url: str, source_type: str, subject_name: str = '') -> list[Publication]:
+    """Read publication sections and subject-attributed bibliographic records."""
     root = _main(BeautifulSoup(html, "html.parser"))
-    entries: list[str] = []
+    entries: list[tuple[str, str]] = []
+    consumed: set[int] = set()
     headings = list(root.find_all(["h1", "h2", "h3", "h4", "h5"]))
     headings.extend(
         node for node in root.find_all("p")
         if node.find(["strong", "b"])
         and len(node.get_text(" ", strip=True)) <= 120
+        and node.get_text(' ', strip=True).strip(' :') == node.find(['strong','b']).get_text(' ', strip=True).strip(' :')
         and PUBLICATION_HEADING.search(node.get_text(" ", strip=True))
     )
     for heading in headings:
         if not PUBLICATION_HEADING.search(heading.get_text(" ", strip=True)):
             continue
-        level = int(heading.name[1]) if heading.name.startswith("h") else 6
         for node in heading.find_all_next():
-            if node.name in {"h1", "h2", "h3", "h4", "h5"} and int(node.name[1]) <= level:
+            if root not in node.parents:
+                break
+            if node.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
                 break
             if (
                 heading.name == "p"
@@ -352,15 +398,43 @@ def extract_publications(html: str, url: str, source_type: str) -> list[Publicat
             ):
                 break
             if node.name in {"li", "tr", "article", "cite", "p"}:
+                if id(node) in consumed:
+                    continue
+                nested = node.find_all(['ul', 'ol'], recursive=False) if node.name == 'li' else []
+                title_only = ''
+                if nested:
+                    # A book's indented editor/publisher lines belong to that
+                    # book. Do not flatten them into its title or emit them again.
+                    metadata = [li.get_text(' ', strip=True) for lst in nested for li in lst.find_all('li')]
+                    is_metadata = lambda value: bool(re.search(
+                        r'^(?:edited by|published by|ISBN\b|DOI\b)|\b(?:Press|Publishing|Publisher|Gale Group)\b.*\b(?:19|20)\d{2}\b', value, re.I))
+                    own = BeautifulSoup(str(node), 'html.parser').find('li')
+                    for lst in own.find_all(['ul','ol']):
+                        lst.decompose()
+                    candidate_title = own.get_text(' ', strip=True).strip(' .')
+                    if metadata and all(is_metadata(value) for value in metadata) and len(candidate_title.split()) >= 3:
+                        title_only = candidate_title
+                        consumed.update(id(child) for child in node.find_all())
+                    else:
+                        # Group labels such as "Books" aren't publications;
+                        # their child entries must be parsed independently.
+                        continue
                 text = " ".join(node.get_text(" ", strip=True).split()).strip(" •·-–—")
                 if 18 <= len(text) <= 1200:
-                    entries.append(text)
+                    entries.append((text, title_only))
             if len(entries) >= 200:
                 break
     found: dict[str, Publication] = {}
-    for entry in entries:
+    for entry, title_only in entries:
+        if re.match(r'^(?:(?:19|20)\d{2}\s+)?(?:Ph\.?D\.?|M\.?Sc\.?|B\.?A\.?|M\.?A\.?|Education|Office|Email)\b', entry, re.I):
+            continue
         quoted = re.search(r"[\"“]([^\"”]{12,350})[\"”]", entry)
-        title = (quoted.group(1) if quoted else entry).strip()
+        # Author-year citations can contain a short quoted phrase *within*
+        # their title. Do not discard its unquoted subtitle.
+        citation = re.search(r'\((?:19|20)\d{2}[a-z]?\)\.\s*(.+)', entry)
+        title = title_only or (re.split(r'\.\s+', citation.group(1), maxsplit=1)[0]
+                 if citation else quoted.group(1) if quoted else entry).strip()
+        title = _clean_publication_title(title)
         if len(_title_key(title).split()) < 3:
             continue
         year = YEAR.search(entry)
@@ -369,6 +443,41 @@ def extract_publications(html: str, url: str, source_type: str) -> list[Publicat
                             doi.group(0).rstrip(".,;)") if doi else "", url,
                             source_type, entry)
         found.setdefault(paper_key(paper), paper)
+    # Humanities profiles often put full book citations under Achievements,
+    # not Publications. Require the subject's author name and publisher/year.
+    family = _name_parts(subject_name)[-1] if subject_name else ''
+    for record in root.find_all(['p', 'li', 'cite']):
+        if record.find(['p','li','cite']):
+            continue  # Only leaf records, never a whole containing list.
+        text = ' '.join(record.get_text(' ', strip=True).split())
+        citation = _author_year_publication(text, url, source_type, subject_name)
+        if citation:
+            found[paper_key(citation)] = citation
+    for paragraph in root.find_all('p'):
+        text = ' '.join(paragraph.get_text(' ', strip=True).split())
+        citation = re.match(r'^((?:.+?,\s*eds?|[^.]*))\.\s*(.+?)\s*\(([^()]*\bPress\b[^()]*\b((?:19|20)\d{2}))\)\.?$', text)
+        if citation and family and fold_name_text(citation[1]).casefold().startswith(family + ','):
+            title = re.sub(r'^(?:eds?\.)\s*', '', citation[2]).strip(' .')
+            paper = Publication(title, int(citation[4]), '', url, source_type, text)
+            found.setdefault(paper_key(paper), paper)
+        # An explicitly authored book in the biography: title is italicized,
+        # and its own adjacent publisher clause supplies the date, not prose.
+        if not re.search(r'\b(?:author|co-editor) of\b', text, re.I):
+            continue
+        subject_parts = _name_parts(subject_name)
+        paragraph_words = set(_name_parts(text))
+        if not subject_parts or not (all(part in paragraph_words for part in (subject_parts[0], subject_parts[-1])) or re.match(r'^(?:Hello!\s*)?I am\b', text)):
+            continue
+        for emphasis in paragraph.find_all(['em','i']):
+            title = emphasis.get_text(' ', strip=True).strip()
+            tail = text.split(title, 1)[-1] if title else ''
+            publication = re.match(r'\s*\(([^()]*\bPress\b[^()]*?)(?:,\s*((?:19|20)\d{2}))?\)', tail)
+            if publication and len(title.split()) >= 3:
+                year = YEAR.search(publication[0])
+                if not year:
+                    continue
+                paper = Publication(title, int(year[1]) if year else None, '', url, source_type, text)
+                found.setdefault(paper_key(paper), paper)
     return list(found.values())
 
 
@@ -393,16 +502,49 @@ def linked_directory_person(html: str, url: str, name: str) -> str:
     return next(iter(found)) if len(found)==1 else ''
 
 
-def linked_research_pages(html: str, profile_url: str) -> list[str]:
+def _is_shared_person_directory(html: str) -> bool:
+    """Multiple person-detail rows must never be read as one person's bio."""
+    root = _main(BeautifulSoup(html, 'html.parser'))
+    rows = root.select('tr, .faculty-card, .person, .directory-person')
+    records = [row for row in rows if any(
+        re.fullmatch(r'(?:view|profile|details|view profile|view details)',
+                     a.get_text(' ', strip=True), re.I)
+        for a in row.find_all('a', href=True))]
+    return len(records) > 1
+
+
+def linked_research_pages(html: str, profile_url: str, subject_name: str = '') -> list[str]:
     root = _main(BeautifulSoup(html, "html.parser"))
     urls = []
     for anchor in root.find_all("a", href=True):
-        if not RESEARCH_LINK.search(anchor.get_text(" ", strip=True)):
-            continue
         url = urljoin(profile_url, str(anchor["href"]))
+        host = (urlparse(url).hostname or '').removeprefix('www.').casefold()
+        label = anchor.get_text(' ', strip=True).casefold().strip().rstrip('/')
+        name_parts = _name_parts(subject_name)
+        named_homepage = (len(name_parts) >= 2 and all(p in host for p in (name_parts[0],name_parts[-1]))
+                          and label.removeprefix('https://').removeprefix('http://').removeprefix('www.') == host)
+        if not RESEARCH_LINK.search(label) and not named_homepage:
+            continue
         if urlparse(url).scheme in {"http", "https"} and "scholar.google." not in url.casefold():
             urls.append(url)
     return list(dict.fromkeys(urls))[:5]
+
+
+def personal_site_sections(html: str, page_url: str) -> list[str]:
+    """One bounded hop within an already official-linked personal site.
+
+    Navigation is useful for discovery, but never used as evidence text.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    urls = []
+    for a in soup.find_all('a', href=True):
+        if not re.fullmatch(r'(?:about(?: me)?|research|publications?|books?|selected publications)', a.get_text(' ',strip=True), re.I):
+            continue
+        target = urljoin(page_url, a['href'])
+        parsed = urlparse(target)
+        if parsed.scheme in {'http','https'} and parsed.hostname == urlparse(page_url).hostname and not parsed.query and not parsed.fragment and target.rstrip('/') != page_url.rstrip('/'):
+            urls.append(target)
+    return list(dict.fromkeys(urls))[:4]
 
 
 def linked_scholar_profiles(html: str, profile_url: str) -> list[str]:
@@ -553,11 +695,56 @@ def _status(professor_id: int, value: str) -> None:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """UPDATE professors SET publication_status=%s,
+                """UPDATE professors SET publication_status=CASE
+                     WHEN %s IN ('NO_PUBLICATIONS_FOUND','REVIEW_REQUIRED','SCHOLAR_REVIEW_QUEUED')
+                       AND EXISTS (SELECT 1 FROM professor_papers WHERE professor_id=professors.id)
+                     THEN CASE WHEN publication_status='SCHOLAR_VERIFIED'
+                               THEN 'SCHOLAR_VERIFIED' ELSE 'OFFICIAL_PUBLICATIONS_FOUND' END
+                     ELSE %s END,
                      publication_checked_at=NOW(),publication_discovery_version=%s,
                      updated_at=NOW() WHERE id=%s""",
-                (value, PUBLICATION_DISCOVERY_VERSION, professor_id),
+                (value, value, PUBLICATION_DISCOVERY_VERSION, professor_id),
             )
+
+
+def _queue_linked_scholar_review(professor_id: int, urls: list[str],
+                                 steps: list[dict[str, Any]]) -> None:
+    """Supplement existing papers with new official-linked Scholar evidence.
+
+    Completed decisions are not silently retried on every publication crawl.
+    Active work is deduplicated by the durable worker queue.
+    """
+    if not urls:
+        return
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT source_url,identity_status,checked_at FROM professor_publication_sources WHERE professor_id=%s AND source_type='GOOGLE_SCHOLAR' ORDER BY checked_at DESC", (professor_id,))
+            previous = {}
+            for row in cursor.fetchall():
+                key = _scholar_profile_key(row['source_url'])
+                # A failed regional URL must not erase a verified decision
+                # for the same Scholar user ID.
+                if key not in previous or (row['identity_status']=='VERIFIED' and previous[key]['identity_status']!='VERIFIED'):
+                    previous[key] = row
+    pending = []
+    for url in _dedupe_scholar_profiles(urls):
+        saved = previous.get(_scholar_profile_key(url), {})
+        status = saved.get('identity_status')
+        refresh_due = (status=='VERIFIED' and saved.get('checked_at')
+                       and saved['checked_at'] < datetime.now(timezone.utc)-timedelta(days=30))
+        if status and status not in {'QWEN_QUEUED','STAFF_CANDIDATE'} and not refresh_due:
+            steps.append({'step':'QWEN_SCHOLAR_REVIEW','status':status,'source_url':url,
+                          'reason':'Saved decision retained; explicit retry or scheduled refresh required.'})
+            continue
+        _record_source(professor_id,'GOOGLE_SCHOLAR',url,'QWEN_QUEUED',
+                       {'discovered_by':'OFFICIAL_PROFILE_LINK','verified':False})
+        pending.append(url)
+    if pending:
+        from radar_store import enqueue_radar_job
+        job = enqueue_radar_job('QWEN_REVIEW_PUBLICATION',professor_id=professor_id,priority=20,max_attempts=1)
+        steps.append({'step':'QWEN_SCHOLAR_REVIEW','status':'QUEUED','job_id':job['id'],
+                      'reason':'Supplemental Scholar review; existing publications retained.',
+                      'candidate_count':len(pending)})
 
 
 def _store_interest_fallback(
@@ -735,13 +922,17 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
                     raise requests.HTTPError('Person detail returned an access challenge')
                 if linked_directory_person(response.text, str(response.url), str(professor['name'])):
                     raise requests.HTTPError('Directory did not resolve to an individual record')
-            papers.extend(extract_publications(response.text, str(response.url), "OFFICIAL_PROFILE"))
+            if _is_shared_person_directory(response.text):
+                steps.append({'step': 'DIRECTORY_PERSON_LINK', 'status': 'REVIEW_REQUIRED',
+                              'reason': 'No unique individual record resolved'})
+                raise requests.HTTPError('Shared directory is not an individual publication source')
+            papers.extend(extract_publications(response.text, str(response.url), "OFFICIAL_PROFILE", str(professor['name'])))
             interests, interest_excerpt = extract_research_interests(response.text)
             if interests:
                 explicit_interests.append((interests, str(response.url), interest_excerpt))
             biography_text = extract_biography_text(response.text)
             biography_url = str(response.url)
-            links = linked_research_pages(response.text, str(response.url)); known_urls.extend(links)
+            links = linked_research_pages(response.text, str(response.url), str(professor['name'])); known_urls.extend(links)
             official_scholar_urls = linked_scholar_profiles(
                 response.text, str(response.url)
             )
@@ -753,13 +944,23 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
                 steps.append({"step": "OFFICIAL_SCHOLAR_LINK", "status": "FOUND",
                               "source_url": scholar_url})
             _record_source(professor_id, "OFFICIAL_PROFILE", str(response.url), "VERIFIED", {"papers_found": len(papers)})
-            for url in links:
+            pending_links = [(url, 0) for url in links]
+            visited_links = set()
+            for url, depth in pending_links:
+                if url in visited_links or len(visited_links) >= 9:
+                    continue
+                visited_links.add(url)
                 try:
                     linked = requests.get(url, timeout=30, headers=headers); linked.raise_for_status()
                     if _is_block_page(linked.text):
                         raise requests.HTTPError("Linked page returned an access challenge")
                     kind = "LAB_SITE" if re.search(r"\blab", url, re.I) else "PERSONAL_SITE"
-                    found = extract_publications(linked.text, str(linked.url), kind); papers.extend(found)
+                    if depth and urlparse(linked.url).hostname != urlparse(url).hostname:
+                        raise requests.HTTPError('Personal-site section redirected off site')
+                    if not depth:
+                        pending_links.extend((child, 1) for child in personal_site_sections(linked.text, str(linked.url)))
+                    found = extract_publications(linked.text, str(linked.url), kind, str(professor['name'])); papers.extend(found)
+                    official_scholar_urls.extend(linked_scholar_profiles(linked.text, str(linked.url)))
                     interests, interest_excerpt = extract_research_interests(linked.text)
                     if interests:
                         explicit_interests.append(
@@ -780,6 +981,10 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
     papers = list({paper_key(p): p for p in papers}.values())[:max_works]
     if papers:
         imported = _save(professor_id, papers, progress_callback); _status(professor_id, "OFFICIAL_PUBLICATIONS_FOUND")
+        _queue_linked_scholar_review(professor_id, official_scholar_urls, steps)
+        if explicit_interests:
+            _store_interest_fallback(professor_id, professor, explicit_interests,
+                                     biography_text, biography_url, steps)
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                       "papers_found": len(papers), "papers_imported": imported})
         return {"status": "OFFICIAL_PUBLICATIONS_FOUND", "papers_found": len(papers),
@@ -820,7 +1025,7 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
                               "reason": identity.get("reason")})
                 continue
             found = extract_publications(
-                response.text, str(response.url), "OFFICIAL_ALTERNATE_PROFILE"
+                response.text, str(response.url), "OFFICIAL_ALTERNATE_PROFILE", str(professor['name'])
             )
             interests, interest_excerpt = extract_research_interests(response.text)
             if interests:
@@ -843,6 +1048,7 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
     if papers:
         imported = _save(professor_id, papers, progress_callback)
         _status(professor_id, "OFFICIAL_PUBLICATIONS_FOUND")
+        _queue_linked_scholar_review(professor_id, official_scholar_urls, steps)
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                       "papers_found": len(papers), "papers_imported": imported})
         return {"status": "OFFICIAL_PUBLICATIONS_FOUND",
@@ -943,9 +1149,17 @@ def review_queued_scholar_candidates(
             activity_callback("QWEN_SCHOLAR_REVIEW", {"source_url": url,
                 "candidate_number": index, "candidate_total": len(urls)})
         try:
-            response = requests.get(url, timeout=30, headers=headers)
+            response = requests.get(url, params={'pagesize':min(100,max_works),'cstart':0},
+                                    timeout=30, headers=headers)
             response.raise_for_status()
+            if _is_block_page(response.text):
+                raise requests.HTTPError('Scholar returned an access challenge')
             scholar = parse_scholar_profile(response.text, str(response.url))
+            if not scholar.get('name'):
+                raise requests.HTTPError('Scholar response has no readable profile identity')
+            steps.append({'step':'SCHOLAR_PROFILE','status':'CHECKED','source_url':str(response.url),
+                          'papers_found':len(scholar['papers']),
+                          'reason':f'Fetched up to {min(100,max_works)} listed works; not a completeness guarantee.'})
             model = review_publication_identity(
                 source_record_key=str(response.url),
                 institution_id=int(professor["institution_id"]),

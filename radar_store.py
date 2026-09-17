@@ -1608,7 +1608,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                      )
                      AND (
                          p.publication_status = 'NOT_CHECKED'
-                         OR (p.publication_discovery_version < 6
+                         OR (p.publication_discovery_version < 10
                              AND NOT EXISTS (SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id))
                      )
                      AND NOT EXISTS (
