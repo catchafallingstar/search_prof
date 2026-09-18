@@ -278,7 +278,7 @@ def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
                 "QWEN_REVIEW_PUBLICATION",
                 professor_id=int(professor_id),
                 priority=70,
-                max_attempts=1,
+                max_attempts=5,
             )
         return result, False
     if job_type == "QWEN_REVIEW_PUBLICATION":

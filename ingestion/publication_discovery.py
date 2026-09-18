@@ -27,6 +27,32 @@ from ingestion.websearch import SearchUnavailable, search_web
 
 PUBLICATION_HEADING = re.compile(r"\b(?:selected )?(?:publications?|papers?|articles?|bibliography|research outputs?)\b", re.I)
 RESEARCH_LINK = re.compile(r"\b(?:personal|academic|research|lab(?:oratory)?|group|publications?|website|homepage)\b", re.I)
+
+BARE_SITE_EXCLUDED_ROOTS = {
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+    "orcid.org",
+    "doi.org",
+}
+
+GENERIC_INSTITUTION_SUBDOMAINS = {
+    "www",
+    "news",
+    "events",
+    "calendar",
+    "admissions",
+    "library",
+    "libraries",
+    "catalog",
+    "giving",
+    "hr",
+    "jobs",
+}
+
 YEAR = re.compile(r"\b((?:19|20)\d{2})\b")
 DOI = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 FACULTY_TITLE = re.compile(
@@ -38,7 +64,7 @@ NON_PROFILE_PATH = re.compile(
     r"/(?:news|events?|awards?|honors?|alumni|archive|stories?|press|jobs?)(?:/|$)",
     re.I,
 )
-PUBLICATION_DISCOVERY_VERSION = 10
+PUBLICATION_DISCOVERY_VERSION = 11
 SCHOLAR_SUFFIXES = frozenset({'com','co.uk','com.tr','de','fr','ca','com.au','co.in',
     'co.jp','com.br','es','it','nl','ch','se','no','dk','fi','at','be','pl','pt',
     'co.nz','co.za','com.mx','com.sg','com.hk','com.tw','co.kr','co.id'})
@@ -55,6 +81,25 @@ def _is_scholar_profile_url(url: str) -> bool:
 RESEARCH_INTEREST_HEADING = re.compile(
     r"\b(?:research|scholarly|academic)?\s*(?:interests?|areas?|expertise|"
     r"specialt(?:y|ies)|research focus|areas? of interest|areas? of expertise)\b",
+    re.I,
+)
+PROFILE_ASIDE_HEADING = re.compile(
+    r"\b(?:"
+    r"research interests?|"
+    r"research areas?|"
+    r"areas? of interest|"
+    r"areas? of expertise|"
+    r"expertise|"
+    r"contact(?: information| details)?|"
+    r"education|"
+    r"biography|"
+    r"bio|"
+    r"publications?"
+    r")\b",
+    re.I,
+)
+PROFILE_ASIDE_CLASS = re.compile(
+    r"(?:profile|person|faculty|research|interest|contact|bio)",
     re.I,
 )
 BIOGRAPHY_HEADING = re.compile(
@@ -109,9 +154,38 @@ def paper_key(paper: Publication) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
+def _person_specific_aside(node: Any) -> bool:
+    """Keep profile-local aside panels while rejecting generic sidebars."""
+    classes = " ".join(str(value) for value in (node.get("class") or []))
+    if PROFILE_ASIDE_CLASS.search(classes):
+        return True
+
+    heading = node.find(["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"])
+    if not heading:
+        return False
+
+    label = " ".join(heading.get_text(" ", strip=True).split())
+    return bool(PROFILE_ASIDE_HEADING.search(label))
+
+
 def _main(soup: BeautifulSoup) -> Any:
-    root = soup.select_one("main,[role=main],article,#main-content,.main-content") or soup.body or soup
-    for node in root.select("script,style,noscript,header,nav,footer,aside,form,.menu,.navigation,.footer,.comments-area,.sharedaddy"):
+    root = (
+        soup.select_one("main,[role=main],article,#main-content,.main-content")
+        or soup.body
+        or soup
+    )
+
+    # Keep person-specific profile panels (for example Research Interests) even
+    # when the site's template renders them as <aside>. Generic sidebars are
+    # still removed before evidence extraction.
+    for node in list(root.find_all("aside")):
+        if not _person_specific_aside(node):
+            node.decompose()
+
+    for node in root.select(
+        "script,style,noscript,header,nav,footer,form,"
+        ".menu,.navigation,.footer,.comments-area,.sharedaddy"
+    ):
         node.decompose()
     return root
 
@@ -527,19 +601,71 @@ def _is_shared_person_directory(html: str) -> bool:
     return len(records) > 1
 
 
+def _bare_profile_site_link(
+    label: str,
+    target_url: str,
+    profile_url: str,
+) -> bool:
+    """Recognize an explicitly printed website URL on a person's profile."""
+    parsed = urlparse(target_url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    profile_host = (
+        urlparse(profile_url).hostname or ""
+    ).casefold().removeprefix("www.")
+
+    if not host or host == profile_host:
+        return False
+    if _host_root(target_url) in BARE_SITE_EXCLUDED_ROOTS:
+        return False
+
+    # Same-institution subdomains can be legitimate labs, but reject obvious
+    # university-wide service/navigation hosts.
+    if _host_root(target_url) == _host_root(profile_url):
+        first_label = host.split(".", 1)[0]
+        if first_label in GENERIC_INSTITUTION_SUBDOMAINS:
+            return False
+
+    visible = label.strip().casefold()
+    visible = re.sub(r"^https?://", "", visible)
+    visible = visible.removeprefix("www.").rstrip("/")
+
+    target = (host + parsed.path.rstrip("/")).rstrip("/")
+    return visible in {host, target}
+
+
 def linked_research_pages(html: str, profile_url: str, subject_name: str = '') -> list[str]:
     root = _main(BeautifulSoup(html, "html.parser"))
     urls = []
     for anchor in root.find_all("a", href=True):
         url = urljoin(profile_url, str(anchor["href"]))
-        host = (urlparse(url).hostname or '').removeprefix('www.').casefold()
-        label = anchor.get_text(' ', strip=True).casefold().strip().rstrip('/')
+        host = (urlparse(url).hostname or "").removeprefix("www.").casefold()
+        label = anchor.get_text(" ", strip=True).casefold().strip().rstrip("/")
         name_parts = _name_parts(subject_name)
-        named_homepage = (len(name_parts) >= 2 and all(p in host for p in (name_parts[0],name_parts[-1]))
-                          and label.removeprefix('https://').removeprefix('http://').removeprefix('www.') == host)
-        if not RESEARCH_LINK.search(label) and not named_homepage:
+        named_homepage = (
+            len(name_parts) >= 2
+            and all(part in host for part in (name_parts[0], name_parts[-1]))
+            and label.removeprefix("https://")
+                .removeprefix("http://")
+                .removeprefix("www.") == host
+        )
+        bare_profile_site = _bare_profile_site_link(
+            anchor.get_text(" ", strip=True),
+            url,
+            profile_url,
+        )
+        if (
+            not RESEARCH_LINK.search(label)
+            and not named_homepage
+            and not bare_profile_site
+        ):
             continue
-        if urlparse(url).scheme in {"http", "https"} and "scholar.google." not in url.casefold():
+        if (
+            urlparse(url).scheme in {"http", "https"}
+            and "scholar.google." not in url.casefold()
+        ):
             urls.append(url)
     return list(dict.fromkeys(urls))[:5]
 
@@ -552,7 +678,20 @@ def personal_site_sections(html: str, page_url: str) -> list[str]:
     soup = BeautifulSoup(html, 'html.parser')
     urls = []
     for a in soup.find_all('a', href=True):
-        if not re.fullmatch(r'(?:about(?: me)?|research|publications?|books?|selected publications)', a.get_text(' ',strip=True), re.I):
+        label = " ".join(a.get_text(" ", strip=True).split())
+        if not re.fullmatch(
+            r"(?:"
+            r"about(?: me)?|"
+            r"research|"
+            r"publications?|"
+            r"books?|"
+            r"selected publications|"
+            r"publications?\s*(?:&|and)\s*research(?: support)?|"
+            r"research(?: support)?\s*(?:&|and)\s*publications?"
+            r")",
+            label,
+            re.I,
+        ):
             continue
         target = urljoin(page_url, a['href'])
         parsed = urlparse(target)
@@ -844,7 +983,7 @@ def _store_interest_fallback(
                             + str(professor.get("department") or "Not stated")),
             confidence=confidence,
         )
-    pending = review.status in {'MODEL_UNAVAILABLE','DISABLED'}
+    pending = review.status in {'MODEL_UNAVAILABLE','MODEL_COOLDOWN','DISABLED'}
     job_id = None
     if pending and queue_on_failure:
         from radar_store import enqueue_radar_job
@@ -1332,11 +1471,13 @@ def review_queued_scholar_candidates(
                 )
 
                 if model.status != "VALID":
-                    decision = (
-                        "REVIEW_REQUIRED"
-                        if model.status != "MODEL_UNAVAILABLE"
-                        else "SOURCE_UNAVAILABLE"
-                    )
+                    if model.status in {
+                        "MODEL_UNAVAILABLE",
+                        "MODEL_COOLDOWN",
+                    }:
+                        decision = "SOURCE_UNAVAILABLE"
+                    else:
+                        decision = "REVIEW_REQUIRED"
 
                 elif str(model.data.get("same_person") or "").upper() != "YES":
                     decision = (
@@ -1400,10 +1541,26 @@ def review_queued_scholar_candidates(
             reviewed.append({"url": url, "decision": "SOURCE_UNAVAILABLE"})
             if http_status in {403,429}:
                 break  # Do not hammer other profiles through the same block.
-    if reviewed and all(item.get('decision')=='SOURCE_UNAVAILABLE' for item in reviewed):
-        _status(professor_id,'SOURCE_UNAVAILABLE')
-        return {'status':'SOURCE_UNAVAILABLE','papers_found':0,'papers_imported':0,
-                'candidates':reviewed,'steps':steps,'retry_after_seconds':retry_delay}
+    decisions = {
+        str(item.get("decision") or "")
+        for item in reviewed
+    }
+    if (
+        "SOURCE_UNAVAILABLE" in decisions
+        and decisions.issubset({
+            "SOURCE_UNAVAILABLE",
+            "PROFILE_NAME_CONFLICT",
+        })
+    ):
+        _status(professor_id, "SOURCE_UNAVAILABLE")
+        return {
+            "status": "SOURCE_UNAVAILABLE",
+            "papers_found": 0,
+            "papers_imported": 0,
+            "candidates": reviewed,
+            "steps": steps,
+            "retry_after_seconds": retry_delay,
+        }
     _status(professor_id, "REVIEW_REQUIRED")
     with get_db_connection() as connection:
         with connection.cursor() as cursor:

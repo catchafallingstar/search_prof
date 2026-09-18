@@ -2754,7 +2754,7 @@ def save_publication_review_candidate(
         professor_id=professor_id,
         requested_by=owner_user_id,
         priority=100,
-        max_attempts=1,
+        max_attempts=5,
     )
 
 
@@ -2851,7 +2851,7 @@ def requeue_unresolved_publication_reviews(owner_user_id: int) -> int:
             professor_id=professor_id,
             requested_by=owner_user_id,
             priority=90,
-            max_attempts=1,
+            max_attempts=5,
         )
         queued += int(not job.get("reused"))
     return queued
