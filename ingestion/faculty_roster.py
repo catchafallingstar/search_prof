@@ -44,6 +44,11 @@ _NON_PERSON_LABEL = re.compile(
     r"programs?|research|resources?|services?|south|students?|staff|union|university|"
     r"view|visitors?|west|default|placeholder|circle|logo|image|photo)\b", re.I
 )
+_PROFILE_ACTION_LABEL = re.compile(
+    r"^(?:view(?: full)? profile|see(?: full)? profile|read more|learn more|"
+    r"view details?|see details?|view bio(?:graphy)?|read bio(?:graphy)?)$",
+    re.I,
+)
 _HISTORICAL_TEXT = re.compile(
     r"\b(?:in memoriam|obituary|remembering|mourns? the loss|passed away|"
     r"former faculty|past faculty)\b", re.I
@@ -168,10 +173,24 @@ def _same_directory_document(left: str, right: str) -> bool:
     )
 
 
+def _clean_display_person_name(value: str) -> str:
+    """Normalize common roster display formats without inventing identity data."""
+    name = " ".join(str(value or "").split()).strip()
+    name = re.sub(r"^(?:Dr|Professor)\.?\s+", "", name, flags=re.I)
+    if name.count(",") == 1:
+        family, given = (part.strip() for part in name.split(",", 1))
+        suffix = given.casefold().rstrip(".")
+        if family and given and suffix not in {"jr", "sr", "ii", "iii", "iv"}:
+            name = f"{given} {family}"
+    return " ".join(name.split())
+
+
 def _looks_like_person_name(value: str) -> bool:
     """Reject navigation/organization labels before they become identities."""
-    name = " ".join(str(value or "").split()).strip()
+    name = _clean_display_person_name(value)
     if not name or any(symbol in name for symbol in ("»", "›", "→", "▶")):
+        return False
+    if _PROFILE_ACTION_LABEL.fullmatch(name):
         return False
     if _NON_PERSON_LABEL.search(name) or re.search(r"\d|@|/|\\|\b(?:and|of|for|the)\b", name, re.I):
         return False
@@ -217,6 +236,22 @@ def _smallest_person_container(anchor: object) -> object | None:
     return None
 
 
+def _person_name_from_container(container: object) -> str:
+    """Recover a real displayed name when the profile link is an action label."""
+    candidates: list[str] = []
+    for node in container.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"], limit=12):
+        candidates.append(node.get_text(" ", strip=True))
+    for node in container.find_all("img", alt=True, limit=6):
+        candidates.append(str(node.get("alt") or ""))
+    for node in container.find_all(attrs={"aria-label": True}, limit=6):
+        candidates.append(str(node.get("aria-label") or ""))
+    for candidate in candidates:
+        cleaned = _clean_display_person_name(candidate)
+        if _looks_like_person_name(cleaned):
+            return cleaned
+    return ""
+
+
 def _table_roster_members(root: object, directory_url: str) -> list[RosterMember]:
     """Parse server-rendered directories whose names and links occupy different cells."""
     members: list[RosterMember] = []
@@ -240,7 +275,7 @@ def _table_roster_members(root: object, directory_url: str) -> list[RosterMember
             else:
                 name = " ".join((cells[first_index].get_text(" ", strip=True),
                                  cells[last_index].get_text(" ", strip=True))).strip()
-            name = re.sub(r"^(?:Dr|Professor)\.?\s+", "", name, flags=re.I)
+            name = _clean_display_person_name(name)
             if not _looks_like_person_name(name):
                 continue
             links = [anchor for anchor in row.find_all("a", href=True)
@@ -395,12 +430,24 @@ def parse_faculty_directory(
         if possible_container is not None:
             structure_counts[_container_signature(possible_container)] += 1
     for anchor in root.find_all("a", href=True):
-        name = " ".join(anchor.get_text(" ", strip=True).split())
-        if len(name) > 100 or not _looks_like_person_name(name):
+        label = " ".join(anchor.get_text(" ", strip=True).split())
+        container = _smallest_person_container(anchor)
+        if container is None:
+            continue
+        if (
+            label
+            and len(label) <= 100
+            and not _PROFILE_ACTION_LABEL.fullmatch(label)
+            and _looks_like_person_name(label)
+        ):
+            name = _clean_display_person_name(label)
+        else:
+            name = _person_name_from_container(container)
+        if not name:
             continue
         if re.search(r"\b(?:contact|directory|department|faculty|home|learn|more|news|menu)\b", name, re.I):
             continue
-        if _FACULTY_ROLE.search(name) or name.casefold() in {"view profile", "read more"}:
+        if _FACULTY_ROLE.search(name):
             continue
         profile_url = urljoin(directory_url, str(anchor.get("href") or ""))
         if _canonical_profile_url(profile_url) == _canonical_profile_url(directory_url):
@@ -410,9 +457,6 @@ def parse_faculty_directory(
             profile_host == directory_host or profile_host.endswith("." + directory_host)
             or directory_host.endswith("." + profile_host)
         ):
-            continue
-        container = _smallest_person_container(anchor)
-        if container is None:
             continue
         context = " ".join((container or anchor).get_text(" ", strip=True).split())[:1000]
         heading = anchor.find_previous(["h1", "h2", "h3", "h4"])

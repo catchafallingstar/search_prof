@@ -25,7 +25,19 @@ from ingestion.ollama_evidence import (
 )
 from ingestion.websearch import SearchUnavailable, search_web
 
-PUBLICATION_HEADING = re.compile(r"\b(?:selected )?(?:publications?|papers?|articles?|bibliography|research outputs?)\b", re.I)
+PUBLICATION_HEADING = re.compile(
+    r"\b(?:"
+    r"(?:selected\s+)?(?:publications?|papers?|articles?|bibliography|research outputs?)"
+    r"|(?:selected\s+)?scholarly works?(?:\s*(?:&|and)\s*creative activities?)?"
+    r"|scholarly\s*(?:&|and)\s*creative\s*works?"
+    r")\b",
+    re.I,
+)
+PUBLICATION_CATEGORY_HEADING = re.compile(
+    r"(?:article|conference|preprint|book(?: chapter| review)?|chapter|review|report|"
+    r"other scholarly work|other scholarly works|creative work|creative works)",
+    re.I,
+)
 RESEARCH_LINK = re.compile(r"\b(?:personal|academic|research|lab(?:oratory)?|group|publications?|website|homepage)\b", re.I)
 
 BARE_SITE_EXCLUDED_ROOTS = {
@@ -64,7 +76,7 @@ NON_PROFILE_PATH = re.compile(
     r"/(?:news|events?|awards?|honors?|alumni|archive|stories?|press|jobs?)(?:/|$)",
     re.I,
 )
-PUBLICATION_DISCOVERY_VERSION = 11
+PUBLICATION_DISCOVERY_VERSION = 12
 SCHOLAR_SUFFIXES = frozenset({'com','co.uk','com.tr','de','fr','ca','com.au','co.in',
     'co.jp','com.br','es','it','nl','ch','se','no','dk','fi','at','be','pl','pt',
     'co.nz','co.za','com.mx','com.sg','com.hk','com.tw','co.kr','co.id'})
@@ -473,11 +485,30 @@ def extract_publications(html: str, url: str, source_type: str, subject_name: st
     for heading in headings:
         if not PUBLICATION_HEADING.search(heading.get_text(" ", strip=True)):
             continue
+        heading_level = (
+            int(heading.name[1])
+            if str(heading.name).startswith("h")
+            else 6
+        )
         for node in heading.find_all_next():
             if root not in node.parents:
                 break
             if node.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-                break
+                node_level = int(node.name[1])
+                if node_level <= heading_level:
+                    break
+                node_label = " ".join(node.get_text(" ", strip=True).split())
+                # A direct child heading that is neither another publication
+                # heading nor a publication category marks the next section.
+                if (
+                    node_level == heading_level + 1
+                    and not PUBLICATION_HEADING.search(node_label)
+                    and not PUBLICATION_CATEGORY_HEADING.fullmatch(
+                        node_label.strip(" :")
+                    )
+                ):
+                    break
+                continue
             if (
                 heading.name == "p"
                 and node.name == "p"
@@ -636,13 +667,27 @@ def _bare_profile_site_link(
     return visible in {host, target}
 
 
+def _research_link_context(anchor: Any) -> str:
+    """Return tightly bounded text that describes one profile link."""
+    parts = [" ".join(anchor.get_text(" ", strip=True).split())]
+    parent = anchor.find_parent(["p", "li", "dd", "td", "div", "section"])
+    if parent is not None:
+        parent_text = " ".join(parent.get_text(" ", strip=True).split())
+        if 0 < len(parent_text) <= 300:
+            parts.append(parent_text)
+    return " ".join(dict.fromkeys(part for part in parts if part))
+
+
 def linked_research_pages(html: str, profile_url: str, subject_name: str = '') -> list[str]:
     root = _main(BeautifulSoup(html, "html.parser"))
     urls = []
+    profile_root = _host_root(profile_url)
     for anchor in root.find_all("a", href=True):
         url = urljoin(profile_url, str(anchor["href"]))
-        host = (urlparse(url).hostname or "").removeprefix("www.").casefold()
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").removeprefix("www.").casefold()
         label = anchor.get_text(" ", strip=True).casefold().strip().rstrip("/")
+        context = _research_link_context(anchor).casefold()
         name_parts = _name_parts(subject_name)
         named_homepage = (
             len(name_parts) >= 2
@@ -656,15 +701,25 @@ def linked_research_pages(html: str, profile_url: str, subject_name: str = '') -
             url,
             profile_url,
         )
+        # Institutional research portals often use branded anchor text such as
+        # "FIU Discovery". Accept it only when tightly local surrounding text
+        # says Research/Publications and the destination stays under the same
+        # institution root domain.
+        contextual_research_link = (
+            bool(profile_root)
+            and _host_root(url) == profile_root
+            and bool(RESEARCH_LINK.search(context))
+        )
         if (
             not RESEARCH_LINK.search(label)
             and not named_homepage
             and not bare_profile_site
+            and not contextual_research_link
         ):
             continue
         if (
-            urlparse(url).scheme in {"http", "https"}
-            and "scholar.google." not in url.casefold()
+            parsed.scheme in {"http", "https"}
+            and not _is_scholar_profile_url(url)
         ):
             urls.append(url)
     return list(dict.fromkeys(urls))[:5]

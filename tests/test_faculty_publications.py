@@ -397,3 +397,51 @@ def test_only_group_leading_professor_roles_enter_publication_pipeline() -> None
     assert not eligible_research_group_leader("Part-Time Faculty", "PART_TIME")
     assert not eligible_research_group_leader("Adjunct Professor", "ADJUNCT")
     assert not eligible_research_group_leader("Professor Emeritus", "EMERITUS")
+
+
+
+def test_branded_institutional_publication_portal_uses_local_publications_label():
+    html = """
+    <main>
+      <h1>Valentina Dargam</h1>
+      <p>
+        <strong>Publications</strong>
+        <a href="https://discovery.fiu.edu/display/person-dargam-valentina">FIU Discovery</a>
+      </p>
+    </main>
+    """
+    assert linked_research_pages(
+        html,
+        "https://cec.fiu.edu/about/directory/profiles/valentina-dargam.html",
+        "Valentina Dargam",
+    ) == ["https://discovery.fiu.edu/display/person-dargam-valentina"]
+
+
+def test_nested_scholarly_works_categories_do_not_stop_publication_extraction():
+    html = """
+    <main>
+      <h2>Scholarly &amp; Creative Works</h2>
+      <h3>selected scholarly works &amp; creative activities</h3>
+      <h4>Article</h4>
+      <p>2025 Phosphate salt selection affects mortality and vascular calcification in mice.
+      AMERICAN JOURNAL OF PHYSIOLOGY-HEART AND CIRCULATORY PHYSIOLOGY.
+      Full Text via DOI: 10.1152/ajpheart.00534.2025</p>
+      <h4>Conference</h4>
+      <p>2024 Peripheral hemodynamic correlation changes in mice with vascular calcification.
+      Full Text via DOI: 10.1364/translational.2024.jm4a.2</p>
+      <h3>principal investigator on</h3>
+      <p>Modeling Lead and Cadmium Cardiotoxicity awarded 2025-2026.</p>
+    </main>
+    """
+    papers = extract_publications(
+        html,
+        "https://discovery.fiu.edu/display/person-dargam-valentina",
+        "INSTITUTIONAL_RESEARCH_PORTAL",
+        "Valentina Dargam",
+    )
+    assert len(papers) == 2
+    assert {paper.doi for paper in papers} == {
+        "10.1152/ajpheart.00534.2025",
+        "10.1364/translational.2024.jm4a.2",
+    }
+    assert all("Modeling Lead" not in paper.evidence for paper in papers)
