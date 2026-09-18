@@ -21,6 +21,7 @@ JOB_LABELS = {
     "CRAWL_FACULTY_DIRECTORY": "Import approved faculty roster",
     "MATCH_FACULTY_PUBLICATIONS": "Match faculty publications",
     "QWEN_REVIEW_PUBLICATION": "Review publication identity with Qwen",
+    'QWEN_REVIEW_INTERESTS': 'Review research interests with Qwen',
     "ENRICH_CLASSIFY_PAPER": "Resolve abstract and classify paper",
     "INDEX_ROSTER_TOPIC": "Match paper evidence to research area",
     "CHECK_HIRING": "Check hiring pages",
@@ -112,6 +113,15 @@ def live_panel() -> None:
                     "MATCH_FACULTY_PUBLICATIONS", "QWEN_REVIEW_PUBLICATION"
                 } else "Not linked"
             )
+            if not areas and interest_step.get('status')=='AWAITING_MODEL_REVIEW':
+                area_text = ('Interests found — awaiting Qwen review' if interest_step.get('extracted_interests')
+                             else 'Biography found — awaiting Qwen review' if interest_step.get('evidence_status')=='BIOGRAPHY_FOUND'
+                             else 'No direct interest evidence — awaiting AI suggestion review')
+            elif not areas and interest_step.get('status')=='MODEL_UNAVAILABLE':
+                area_text = 'Review unavailable in this run — interests not established'
+            elif not areas and interest_step.get('status')=='NO_SUPPORTED_INTERESTS':
+                area_text = ('No direct research interests found' if interest_step.get('evidence_status')=='NO_DIRECT_INTEREST_EVIDENCE'
+                             else 'Evidence checked — no research areas accepted')
             st.caption(f"Research area: {area_text} · "
                        f"University: {entry.get('institution_name') or 'Not available'}")
             if interest_step.get("interests"):
@@ -120,6 +130,10 @@ def live_panel() -> None:
                     if interest_step.get("evidence_method") == "AI_SUGGESTION" else
                     "Low confidence · Research areas based on website statements, not paper-level classification."
                 )
+            if interest_step.get('extracted_interests') and not interest_step.get('interests'):
+                st.caption('Extracted website interests (unreviewed): '+', '.join(interest_step['extracted_interests']))
+            if interest_step.get('status')=='AWAITING_MODEL_REVIEW':
+                st.info('Qwen review is pending. The worker retries saved evidence periodically; publication searches are not repeated.')
             if entry.get("evidence_text"):
                 st.write(f"Paper/evidence: {str(entry['evidence_text'])[:500]}")
             st.write(f"Result: {entry.get('result_status') or 'Finished successfully'}")

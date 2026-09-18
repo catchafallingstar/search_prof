@@ -811,6 +811,7 @@ def _store_interest_fallback(
     explicit: list[tuple[list[str], str, str]],
     biography_text: str, biography_url: str,
     steps: list[dict[str, Any]],
+    *, queue_on_failure: bool = True,
 ) -> None:
     """Review explicit evidence or generate clearly labeled AI suggestions."""
     supplied, source_url, source_text = (
@@ -843,18 +844,56 @@ def _store_interest_fallback(
                             + str(professor.get("department") or "Not stated")),
             confidence=confidence,
         )
+    pending = review.status in {'MODEL_UNAVAILABLE','DISABLED'}
+    job_id = None
+    if pending and queue_on_failure:
+        from radar_store import enqueue_radar_job
+        payload = {'professor': {k:professor.get(k) for k in ('name','institution_id','institution_name','department')},
+                   'explicit':explicit,'biography_text':biography_text,'biography_url':biography_url}
+        job = enqueue_radar_job('QWEN_REVIEW_INTERESTS',professor_id=professor_id,priority=60,max_attempts=3,
+                                initial_result={'interest_input':payload},delay_seconds=300)
+        job_id = job['id']
     steps.append({
         "step": "RESEARCH_INTERESTS",
         "status": (("AI_SUGGESTED" if speculative else "QWEN_REVIEWED") if count
-                   else "NO_SUPPORTED_INTERESTS" if review.status == "VALID" else review.status),
+                   else 'AWAITING_MODEL_REVIEW' if pending else "NO_SUPPORTED_INTERESTS" if review.status == "VALID" else review.status),
+        'model_status':review.status,
+        'evidence_status':'EXPLICIT_INTERESTS_FOUND' if supplied else 'BIOGRAPHY_FOUND' if source_text.strip() else 'NO_DIRECT_INTEREST_EVIDENCE',
+        'extracted_interests':supplied,
+        'review_job_id':job_id,
         "source_url": source_url,
         "evidence_method": "AI_SUGGESTION" if speculative else "WEBSITE_INTERESTS",
         "confidence": "Very low" if speculative else "Low",
         "interests": labels[:12] if count else [],
         "interests_saved": count,
         "reason": (str(review.data.get("basis_summary") or "") if count
+                   else 'Awaiting Qwen; saved evidence will be retried without repeating publication searches.' if pending
                    else "Qwen did not return validated research interests."),
     })
+
+
+def review_queued_interests(job: dict[str, Any]) -> dict[str, Any]:
+    payload = (job.get('result_json') or {}).get('interest_input')
+    if not payload:
+        raise ValueError('Research-interest review is missing its saved input')
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id,name,institution_id FROM professors WHERE id=%s AND faculty_status='VERIFIED'",(job['professor_id'],))
+            current = cursor.fetchone()
+            if not current:
+                return {'status':'NOT_APPLICABLE','steps':[]}
+            if (current['institution_id']!=payload['professor']['institution_id']
+                or not same_person_name(current['name'],payload['professor']['name'])):
+                return {'status':'REVIEW_REQUIRED','steps':[{'step':'RESEARCH_INTERESTS',
+                    'status':'STALE_EVIDENCE','reason':'Faculty identity or institution changed since extraction; fresh evidence is required.'}]}
+    steps = []
+    _store_interest_fallback(job['professor_id'],payload['professor'],payload['explicit'],
+                             payload['biography_text'],payload['biography_url'],steps,queue_on_failure=False)
+    pending = steps[-1]['status']=='AWAITING_MODEL_REVIEW'
+    retries = int((job.get('result_json') or {}).get('model_wait_count') or 0)+1
+    return {'status':'MODEL_UNAVAILABLE' if pending else 'APPROVED' if steps[-1]['interests_saved'] else 'REVIEW_REQUIRED',
+            'steps':steps,'interest_input':payload,'model_wait_count':retries,
+            'retry_after_seconds':min(3600,300*2**min(retries-1,4))}
 
 
 def _dismiss_resolved_scholar_reviews(professor_id: int) -> None:

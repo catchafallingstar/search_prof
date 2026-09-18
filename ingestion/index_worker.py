@@ -22,6 +22,7 @@ from ingestion.faculty_roster import crawl_directory
 from ingestion.publication_discovery import (
     discover_faculty_publications,
     review_queued_scholar_candidates,
+    review_queued_interests,
 )
 from ingestion.university_directory_discovery import discover_faculty_directories
 from ingestion.program_gpa import check_program_gpa_for_professor
@@ -87,6 +88,8 @@ def _scholar_retry_delay(job: dict[str, Any], result: dict[str, Any]) -> int:
 
 def _job_outcome(job_type: str, result: dict[str, Any]) -> str:
     """Describe the data result separately from successful job execution."""
+    if job_type == 'QWEN_REVIEW_INTERESTS':
+        return 'APPROVED' if result.get('status')=='APPROVED' else 'NO_CHANGE' if result.get('status')=='NOT_APPLICABLE' else 'REVIEW_REQUIRED'
     if job_type == "DISCOVER_FACULTY_DIRECTORIES":
         return "APPROVED" if result.get("directories") else "REVIEW_REQUIRED"
     if job_type == "CRAWL_FACULTY_DIRECTORY":
@@ -203,6 +206,11 @@ def _check_hiring(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 
 
 def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if job['job_type']=='QWEN_REVIEW_INTERESTS':
+        _publish_job_progress(job,'QWEN_REVIEW_INTERESTS',professor_ids=[int(job['professor_id'])],
+                              detail='Reviewing saved research-interest evidence with Qwen; no publication searches.')
+        result = review_queued_interests(job)
+        return result, result['status']=='MODEL_UNAVAILABLE'
     job_type = str(job["job_type"])
     if job_type == "DISCOVER_FACULTY_DIRECTORIES":
         institution_id = job.get("institution_id")

@@ -310,7 +310,7 @@ def _run_cached_review(*, source_type: str, source_record_key: str,
                 AND model=%s AND prompt_version=%s AND input_hash=%s""",
                 (source_type, source_record_key, model, prompt_version, input_hash))
             cached = cursor.fetchone()
-    if cached:
+    if cached and cached['validation_status'] != 'MODEL_UNAVAILABLE':
         return OllamaReview(str(cached["validation_status"]), dict(cached["parsed_response"] or {}),
                             tuple(cached["validation_errors"] or []), True)
     raw, data, errors, status = "", {}, (), "VALID"

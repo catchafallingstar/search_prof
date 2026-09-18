@@ -101,6 +101,8 @@ def enqueue_radar_job(
     requested_by: int | None = None,
     priority: int = 50,
     max_attempts: int = 5,
+    initial_result: dict[str, Any] | None = None,
+    delay_seconds: int = 0,
 ) -> dict[str, Any]:
     # A professor's hiring-page refresh is shared across all topics and users.
     dedupe_topic = "-" if job_type == "CHECK_HIRING" and professor_id else (radar_topic_id or "-")
@@ -146,8 +148,9 @@ def enqueue_radar_job(
                 """
                 INSERT INTO radar_jobs (
                     institution_id, radar_topic_id, professor_id, faculty_directory_id,
-                    paper_id, requested_by, job_type, dedupe_key, priority, max_attempts
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    paper_id, requested_by, job_type, dedupe_key, priority, max_attempts,
+                    result_json,available_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s::jsonb,NOW()+(%s*INTERVAL '1 second'))
                 RETURNING *
                 """,
                 (
@@ -160,6 +163,7 @@ def enqueue_radar_job(
                     dedupe,
                     max(0, min(100, int(priority))),
                     max(1, min(20, int(max_attempts))),
+                    json.dumps(initial_result or {}),max(0,int(delay_seconds)),
                 ),
             )
             return {**cursor.fetchone(), "reused": False}
@@ -1283,6 +1287,7 @@ def claim_next_radar_job(
 ) -> dict[str, Any] | None:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('radar_job_claim'))")
             cursor.execute(
                 """
                 UPDATE radar_jobs
@@ -1319,10 +1324,10 @@ def claim_next_radar_job(
                       -- A single local model serves all workers.  Leave later
                       -- reviews queued while one Qwen job is running.
                       AND (
-                          job_type <> 'QWEN_REVIEW_PUBLICATION'
+                          job_type NOT IN ('QWEN_REVIEW_PUBLICATION','QWEN_REVIEW_INTERESTS')
                           OR NOT EXISTS (
                               SELECT 1 FROM radar_jobs active_qwen
-                              WHERE active_qwen.job_type='QWEN_REVIEW_PUBLICATION'
+                              WHERE active_qwen.job_type IN ('QWEN_REVIEW_PUBLICATION','QWEN_REVIEW_INTERESTS')
                                 AND active_qwen.status='running'
                           )
                       )
@@ -2153,7 +2158,7 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                 WHERE job.status IN ('completed', 'failed')
                   AND job.job_type IN (
                       'DISCOVER_FACULTY_DIRECTORIES',
-                      'MATCH_FACULTY_PUBLICATIONS', 'QWEN_REVIEW_PUBLICATION',
+                      'MATCH_FACULTY_PUBLICATIONS', 'QWEN_REVIEW_PUBLICATION', 'QWEN_REVIEW_INTERESTS',
                       'ENRICH_CLASSIFY_PAPER',
                       'INDEX_ROSTER_TOPIC',
                       'CHECK_PROGRAM_GPA'
