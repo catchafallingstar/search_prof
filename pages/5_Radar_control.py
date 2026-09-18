@@ -119,7 +119,11 @@ def live_panel() -> None:
                     "MATCH_FACULTY_PUBLICATIONS", "QWEN_REVIEW_PUBLICATION"
                 } else "Not linked"
             )
-            if not areas and interest_step.get('status')=='AWAITING_MODEL_REVIEW':
+            if not areas and paper_area_step.get('status')=='AWAITING_MODEL_REVIEW':
+                area_text = 'Verified papers found — awaiting Qwen research-area review'
+            elif not areas and paper_area_step.get('status')=='NO_SUPPORTED_AREAS':
+                area_text = 'Verified papers reviewed — no broad research area accepted'
+            elif not areas and interest_step.get('status')=='AWAITING_MODEL_REVIEW':
                 area_text = ('Interests found — awaiting Qwen review' if interest_step.get('extracted_interests')
                              else 'Biography found — awaiting Qwen review' if interest_step.get('evidence_status')=='BIOGRAPHY_FOUND'
                              else 'No direct interest evidence — awaiting AI suggestion review')

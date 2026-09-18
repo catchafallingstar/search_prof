@@ -1,7 +1,10 @@
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 import pytest
 from ingestion import index_worker as worker
 from ingestion import websearch as search
+import radar_store
 
 
 def runtime(reason='Waiting for the next search slot', delay=57, blocked=0):
@@ -73,3 +76,56 @@ def test_finished_jobs_report_data_outcome_separately() -> None:
     assert worker._job_outcome(
         "MATCH_FACULTY_PUBLICATIONS", {"status": "SCHOLAR_VERIFIED"}
     ) == "APPROVED"
+
+def test_existing_verified_papers_queue_paper_summary_backfill(monkeypatch):
+    rowsets = [
+        [{
+            'id': 42,
+            'name': 'Jane Smith',
+            'institution_id': 7,
+            'institution_name': 'Example University',
+            'department': 'Computer Science',
+            'source_url': 'https://scholar.google.com/citations?user=abc',
+        }],
+        [
+            {'title':'Recent paper one','year':2026,'venue':'Journal A','source_url':'https://example.org/1'},
+            {'title':'Recent paper two','year':2025,'venue':'Journal B','source_url':'https://example.org/2'},
+        ],
+    ]
+
+    class Cursor:
+        def __init__(self, rows): self.rows = rows
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def execute(self, *args, **kwargs): pass
+        def fetchall(self): return self.rows
+
+    class Connection:
+        def __init__(self, rows): self.rows = rows
+        def cursor(self): return Cursor(self.rows)
+
+    @contextmanager
+    def connection():
+        assert rowsets, 'unexpected database call'
+        yield Connection(rowsets.pop(0))
+
+    queued=[]
+    monkeypatch.setattr(radar_store, 'get_db_connection', connection)
+    monkeypatch.setattr(
+        radar_store, 'enqueue_radar_job',
+        lambda job_type, **kwargs: queued.append((job_type, kwargs)) or {'reused':False},
+    )
+
+    assert radar_store._enqueue_paper_summary_backfill(20) == 1
+    assert not rowsets
+    assert len(queued) == 1
+    job_type, kwargs = queued[0]
+    assert job_type == 'QWEN_REVIEW_INTERESTS'
+    assert kwargs['professor_id'] == 42
+    payload = kwargs['initial_result']['interest_input']
+    assert payload['mode'] == 'PAPER_SUMMARY'
+    assert payload['source_url'].startswith('https://scholar.google.com/')
+    assert [paper['title'] for paper in payload['papers']] == [
+        'Recent paper one', 'Recent paper two'
+    ]
+

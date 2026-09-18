@@ -78,7 +78,7 @@ def test_retry_is_delayed_and_bounded():
     assert not _scholar_retry_delay(job,{'status':'REVIEW_REQUIRED'})
 
 
-def setup_review(monkeypatch, *, official=True, affiliation="Example University"):
+def setup_review(monkeypatch, *, official=True, affiliation="Example University", suppress_paper_summary=True):
     professor=dict(id=1,name='Jane Smith',institution_id=1,institution_name='Example University',
                    faculty_source_url='https://example.edu/jane',official_institution_domain='example.edu',department='CS')
     queries=[]
@@ -99,7 +99,8 @@ def setup_review(monkeypatch, *, official=True, affiliation="Example University"
     monkeypatch.setattr(pub,'_status',lambda pid,value:statuses.append(value))
     monkeypatch.setattr(pub,'_save',lambda pid,papers,callback:saved.extend(papers) or len(papers))
     monkeypatch.setattr(pub,'_dismiss_resolved_scholar_reviews',lambda _:None)
-    monkeypatch.setattr(pub,'_store_paper_research_summary',lambda *args,**kwargs:None)
+    if suppress_paper_summary:
+        monkeypatch.setattr(pub,'_store_paper_research_summary',lambda *args,**kwargs:None)
     scholar=dict(name='Jane Smith',affiliation=affiliation,verified_email='',homepage='',
                  papers=[pub.Publication('A real research paper',2024,'',URL,'GOOGLE_SCHOLAR','evidence')],
                  pagination_status='END_OF_LIST',pages_fetched=1,works_limit=300)
@@ -184,3 +185,24 @@ def test_http_outage_is_not_an_identity_review(monkeypatch):
     assert result['status']=='SOURCE_UNAVAILABLE'
     assert result['retry_after_seconds']==86400
     assert not saved and not any('INSERT INTO professor_identity_review_queue' in q for q in queries)
+
+def test_verified_scholar_runs_paper_research_summary(monkeypatch):
+    sources,statuses,saved,queries=setup_review(
+        monkeypatch, suppress_paper_summary=False
+    )
+    calls=[]
+    def summarize(professor_id, professor, papers, source_url, steps, **kwargs):
+        calls.append((professor_id, [paper.title for paper in papers], source_url))
+        steps.append({
+            'step':'PAPER_RESEARCH_AREAS',
+            'status':'QWEN_REVIEWED',
+            'interests':['Machine learning'],
+            'interests_saved':1,
+        })
+    monkeypatch.setattr(pub,'_store_paper_research_summary',summarize)
+    monkeypatch.setattr(pub,'review_publication_identity',lambda **kwargs:pytest.fail('Qwen identity not needed'))
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='SCHOLAR_VERIFIED'
+    assert calls == [(1, ['A real research paper'], URL)]
+    assert any(step.get('step')=='PAPER_RESEARCH_AREAS' for step in result['steps'])
+

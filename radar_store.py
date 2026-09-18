@@ -1508,6 +1508,138 @@ def stop_worker_heartbeat(worker_id: str) -> None:
             )
 
 
+def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
+    """Queue Qwen paper-area summaries for verified professors with legacy papers.
+
+    This intentionally reuses already imported papers.  It does not repeat
+    Google Scholar discovery, official-page crawling, or publication identity
+    review.  New publication imports already run the same summary inline; this
+    maintenance path exists for professors whose papers predate that feature.
+    """
+    bounded_limit = max(1, min(100, int(limit)))
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT p.id, p.name, p.institution_id, p.institution_name,
+                          p.department,
+                          COALESCE(
+                              (SELECT source.source_url
+                               FROM professor_publication_sources source
+                               WHERE source.professor_id = p.id
+                                 AND source.source_type = 'GOOGLE_SCHOLAR'
+                                 AND source.identity_status = 'VERIFIED'
+                               ORDER BY source.checked_at DESC
+                               LIMIT 1),
+                              p.faculty_source_url,
+                              ''
+                          ) AS source_url
+                   FROM professors p
+                   WHERE p.faculty_status = 'VERIFIED'
+                     AND p.data_origin = 'OFFICIAL_DIRECTORY'
+                     AND p.canonical_rank IN (
+                         'ASSISTANT_PROFESSOR','ASSOCIATE_PROFESSOR','PROFESSOR'
+                     )
+                     AND p.faculty_title !~* '\\m(adjunct|affiliate|affiliated|visiting|emeritus|emerita|part[- ]time|teaching|lecturer|instructor)\\M'
+                     AND EXISTS (
+                         SELECT 1 FROM professor_papers pp
+                         WHERE pp.professor_id = p.id
+                     )
+                     AND EXISTS (
+                         SELECT 1 FROM roster_member_candidates candidate
+                         WHERE candidate.professor_id = p.id
+                           AND candidate.validation_status IN (
+                               'PROFILE_VERIFIED', 'ROSTER_VERIFIED'
+                           )
+                     )
+                     AND EXISTS (
+                         SELECT 1
+                         FROM faculty_directory_memberships membership
+                         JOIN faculty_directories directory
+                           ON directory.id = membership.directory_id
+                         WHERE membership.professor_id = p.id
+                           AND membership.currently_listed = TRUE
+                           AND directory.active = TRUE
+                           AND directory.validation_status = 'APPROVED'
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM professor_research_interests interest
+                         WHERE interest.professor_id = p.id
+                           AND interest.evidence_method = 'QWEN_PAPER_SUMMARY'
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM radar_jobs job
+                         WHERE job.professor_id = p.id
+                           AND job.job_type = 'QWEN_REVIEW_INTERESTS'
+                           AND job.result_json->'interest_input'->>'mode' = 'PAPER_SUMMARY'
+                           AND job.status IN ('queued', 'running', 'completed')
+                     )
+                   ORDER BY p.publication_checked_at NULLS FIRST, p.id
+                   LIMIT %s""",
+                (bounded_limit,),
+            )
+            professors = [dict(row) for row in cursor.fetchall()]
+
+    queued = 0
+    for professor in professors:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT paper.title, paper.publication_year AS year,
+                              COALESCE(paper.venue, '') AS venue, paper.source_url
+                       FROM professor_papers link
+                       JOIN papers paper ON paper.id = link.paper_id
+                       WHERE link.professor_id = %s
+                         AND NULLIF(BTRIM(paper.title), '') IS NOT NULL
+                       ORDER BY paper.publication_year DESC NULLS LAST,
+                                paper.id DESC
+                       LIMIT 30""",
+                    (int(professor['id']),),
+                )
+                paper_rows = [dict(row) for row in cursor.fetchall()]
+        if not paper_rows:
+            continue
+
+        source_url = str(professor.get('source_url') or '').strip()
+        if not source_url:
+            source_url = next(
+                (str(row.get('source_url') or '').strip()
+                 for row in paper_rows if str(row.get('source_url') or '').strip()),
+                '',
+            )
+
+        payload = {
+            'mode': 'PAPER_SUMMARY',
+            'summary_version': 1,
+            'professor': {
+                'name': professor.get('name'),
+                'institution_id': professor.get('institution_id'),
+                'institution_name': professor.get('institution_name'),
+                'department': professor.get('department'),
+            },
+            'papers': [
+                {
+                    'title': str(row.get('title') or ''),
+                    'year': row.get('year'),
+                    'venue': str(row.get('venue') or ''),
+                }
+                for row in paper_rows
+            ],
+            'source_url': source_url,
+            'scholar_interests': [],
+        }
+        job = enqueue_radar_job(
+            'QWEN_REVIEW_INTERESTS',
+            professor_id=int(professor['id']),
+            priority=62,
+            max_attempts=3,
+            initial_result={'interest_input': payload},
+        )
+        queued += int(not job.get('reused'))
+    return queued
+
+
 def enqueue_due_maintenance(limit: int = 20) -> int:
     queued = 0
     # Stage 1: discover approved official faculty directories from the US
@@ -1636,6 +1768,11 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
             max_attempts=8,
         )
         queued += int(not job.get("reused"))
+
+    # Stage 3a: backfill the paper-based Qwen research-area summary for
+    # professors whose verified papers were imported before this feature
+    # existed.  This uses only local paper rows and never repeats discovery.
+    queued += _enqueue_paper_summary_backfill(limit)
 
     # Stage 3b: resolve abstracts from known DOI/source URLs and classify each
     # paper once. This never performs a general person or paper web search.
@@ -2143,7 +2280,11 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                        NULL::TEXT AS observed_institution,
                        job.result_json->>'paper_title' AS evidence_text,
                        job.result_json->'steps' AS audit_steps,
-                       ARRAY_REMOVE(ARRAY[topic.requested_query], NULL) AS research_areas
+                       COALESCE(
+                           durable_area.research_areas,
+                           ARRAY_REMOVE(ARRAY[topic.requested_query], NULL),
+                           ARRAY[]::TEXT[]
+                       ) AS research_areas
                 FROM radar_jobs job
                 LEFT JOIN professors professor ON professor.id = job.professor_id
                 LEFT JOIN papers paper ON paper.id = job.paper_id
@@ -2155,6 +2296,40 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                       professor.institution_id
                   )
                 LEFT JOIN radar_topics topic ON topic.id = job.radar_topic_id
+                LEFT JOIN LATERAL (
+                    SELECT ARRAY_AGG(ranked.label ORDER BY ranked.score DESC, ranked.label)
+                               AS research_areas
+                    FROM (
+                        SELECT candidate.label, MAX(candidate.score) AS score
+                        FROM (
+                            SELECT interest.display_interest AS label,
+                                   COALESCE(interest.confidence, 0) * 100.0 AS score
+                            FROM professor_research_interests interest
+                            WHERE interest.professor_id = professor.id
+
+                            UNION ALL
+
+                            SELECT category.canonical_name AS label,
+                                   GREATEST(
+                                       COALESCE(profile.current_activity_score, 0),
+                                       COALESCE(profile.expertise_score, 0)
+                                   ) AS score
+                            FROM professor_research_categories profile
+                            JOIN research_categories category
+                              ON category.id = profile.category_id
+                            WHERE profile.professor_id = professor.id
+                              AND profile.status IN (
+                                  'CURRENTLY_ACTIVE',
+                                  'EMERGING_AREA',
+                                  'ESTABLISHED_EXPERTISE'
+                              )
+                        ) candidate
+                        WHERE NULLIF(BTRIM(candidate.label), '') IS NOT NULL
+                        GROUP BY candidate.label
+                        ORDER BY MAX(candidate.score) DESC, candidate.label
+                        LIMIT 8
+                    ) ranked
+                ) durable_area ON professor.id IS NOT NULL
                 WHERE job.status IN ('completed', 'failed')
                   AND job.job_type IN (
                       'DISCOVER_FACULTY_DIRECTORIES',
