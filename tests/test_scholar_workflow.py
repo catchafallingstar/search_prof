@@ -78,7 +78,7 @@ def test_retry_is_delayed_and_bounded():
     assert not _scholar_retry_delay(job,{'status':'REVIEW_REQUIRED'})
 
 
-def setup_review(monkeypatch, *, official=True):
+def setup_review(monkeypatch, *, official=True, affiliation="Example University"):
     professor=dict(id=1,name='Jane Smith',institution_id=1,institution_name='Example University',
                    faculty_source_url='https://example.edu/jane',official_institution_domain='example.edu',department='CS')
     queries=[]
@@ -99,7 +99,8 @@ def setup_review(monkeypatch, *, official=True):
     monkeypatch.setattr(pub,'_status',lambda pid,value:statuses.append(value))
     monkeypatch.setattr(pub,'_save',lambda pid,papers,callback:saved.extend(papers) or len(papers))
     monkeypatch.setattr(pub,'_dismiss_resolved_scholar_reviews',lambda _:None)
-    scholar=dict(name='Jane Smith',affiliation='Example University',verified_email='',homepage='',
+    monkeypatch.setattr(pub,'_store_paper_research_summary',lambda *args,**kwargs:None)
+    scholar=dict(name='Jane Smith',affiliation=affiliation,verified_email='',homepage='',
                  papers=[pub.Publication('A real research paper',2024,'',URL,'GOOGLE_SCHOLAR','evidence')],
                  pagination_status='END_OF_LIST',pages_fetched=1,works_limit=300)
     monkeypatch.setattr(pub,'fetch_scholar_profile',lambda *args,**kwargs:scholar)
@@ -121,6 +122,58 @@ def test_affiliation_alone_cannot_bypass_unavailable_qwen(monkeypatch):
     assert result['status']=='SOURCE_UNAVAILABLE' and not saved
     assert not any('INSERT INTO professor_identity_review_queue' in q for q in queries)
 
+
+
+def test_grounded_qwen_yes_can_promote_name_only_candidate(monkeypatch):
+    sources,statuses,saved,queries=setup_review(
+        monkeypatch, official=False, affiliation='Other University'
+    )
+    monkeypatch.setattr(
+        pub, 'review_publication_identity',
+        lambda **kwargs: SimpleNamespace(
+            status='VALID',
+            data={
+                'same_person':'YES',
+                'official_evidence':['machine learning'],
+                'scholar_evidence':['A real research paper'],
+                'matching_signals':['official research overlaps representative papers'],
+                'conflicts':[],
+                'confidence':0.93,
+            },
+            errors=[],
+        ),
+    )
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='SCHOLAR_VERIFIED'
+    assert len(saved)==1
+    qwen_step=next(step for step in result['steps'] if step['step']=='QWEN_SCHOLAR_REVIEW')
+    assert qwen_step['deterministic_decision']=='VERIFIED'
+    assert 'qwen_correlated_identity' in qwen_step['decision_signals']
+    assert qwen_step['qwen_same_person']=='YES'
+
+
+def test_qwen_yes_below_confidence_threshold_stays_review(monkeypatch):
+    sources,statuses,saved,queries=setup_review(
+        monkeypatch, official=False, affiliation='Other University'
+    )
+    monkeypatch.setattr(
+        pub, 'review_publication_identity',
+        lambda **kwargs: SimpleNamespace(
+            status='VALID',
+            data={
+                'same_person':'YES',
+                'official_evidence':['machine learning'],
+                'scholar_evidence':['A real research paper'],
+                'matching_signals':['possible topical overlap'],
+                'conflicts':[],
+                'confidence':0.65,
+            },
+            errors=[],
+        ),
+    )
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='REVIEW_REQUIRED'
+    assert not saved
 
 def test_http_outage_is_not_an_identity_review(monkeypatch):
     sources,statuses,saved,queries=setup_review(monkeypatch)

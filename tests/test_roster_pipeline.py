@@ -2,6 +2,7 @@ from ingestion import faculty_roster
 from ingestion.faculty_roster import (
     RosterMember,
     classify_faculty_page,
+    eligible_research_group_leader,
     parse_faculty_directory,
     validate_faculty_directory,
     validate_directory_detail,
@@ -366,3 +367,63 @@ def test_broad_taxonomy_is_not_topic_evidence() -> None:
     )
     assert score == 0
     assert text == ""
+
+
+
+def test_albany_style_table_uses_name_column_not_see_profile_action():
+    html = """
+    <title>Faculty &amp; Staff - Albany State University</title>
+    <main><h1>Faculty &amp; Staff</h1>
+    <table>
+      <tr><th>NAME</th><th>POSITION</th><th>E-MAIL</th><th>PROFILE</th></tr>
+      <tr><td>Jain, Ashok</td><td>Professor</td><td>ashok.jain@asurams.edu</td>
+          <td><a href="/profiles/ashok-jain">See Profile</a></td></tr>
+      <tr><td>Kabir, Md Niamul</td><td>Assistant Professor</td><td>kabir@asurams.edu</td>
+          <td><a href="/profiles/md-niamul-kabir">See Profile</a></td></tr>
+      <tr><td>Lee, Yong Jin</td><td>Professor</td><td>yong.lee@asurams.edu</td>
+          <td><a href="/profiles/yong-jin-lee">See Profile</a></td></tr>
+    </table></main>
+    """
+    members = parse_faculty_directory(
+        html,
+        "https://www.asurams.edu/academic-affairs/faculty-staff.php",
+    )
+    assert [member.name for member in members] == [
+        "Ashok Jain",
+        "Md Niamul Kabir",
+        "Yong Jin Lee",
+    ]
+    assert all(member.name.casefold() != "see profile" for member in members)
+
+
+def test_action_profile_link_recovers_name_from_same_card():
+    html = """
+    <title>Faculty Directory</title><main><h1>College Faculty</h1>
+      <div class="faculty-card"><h3>Jane Doe</h3><p>Associate Professor</p>
+        <a href="/faculty/jane-doe">See Profile</a></div>
+      <div class="faculty-card"><h3>John Smith</h3><p>Assistant Professor</p>
+        <a href="/faculty/john-smith">View Profile</a></div>
+      <div class="faculty-card"><h3>Mary Jones</h3><p>Professor</p>
+        <a href="/faculty/mary-jones">Read More</a></div>
+    </main>
+    """
+    members = parse_faculty_directory(html, "https://example.edu/faculty-directory")
+    assert [member.name for member in members] == ["Jane Doe", "John Smith", "Mary Jones"]
+
+
+def test_teaching_professor_tracks_do_not_enter_research_group_pipeline() -> None:
+    assert not eligible_research_group_leader(
+        "Assistant Teaching Professor", "PRIMARY"
+    )
+    assert not eligible_research_group_leader(
+        "Associate Teaching Professor", "PRIMARY"
+    )
+    assert not eligible_research_group_leader(
+        "Teaching Professor", "PRIMARY"
+    )
+    assert eligible_research_group_leader(
+        "Assistant Professor", "PRIMARY"
+    )
+    assert eligible_research_group_leader(
+        "Research Professor", "RESEARCH"
+    )

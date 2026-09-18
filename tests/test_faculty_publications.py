@@ -397,6 +397,8 @@ def test_only_group_leading_professor_roles_enter_publication_pipeline() -> None
     assert not eligible_research_group_leader("Part-Time Faculty", "PART_TIME")
     assert not eligible_research_group_leader("Adjunct Professor", "ADJUNCT")
     assert not eligible_research_group_leader("Professor Emeritus", "EMERITUS")
+    assert not eligible_research_group_leader("Assistant Teaching Professor", "PRIMARY")
+    assert not eligible_research_group_leader("Associate Teaching Professor", "PRIMARY")
 
 
 
@@ -445,3 +447,30 @@ def test_nested_scholarly_works_categories_do_not_stop_publication_extraction():
         "10.1364/translational.2024.jm4a.2",
     }
     assert all("Modeling Lead" not in paper.evidence for paper in papers)
+
+
+def test_research_interest_extraction_rejects_profile_navigation_labels() -> None:
+    html = """
+    <main>
+      <h2>Research Interests</h2>
+      <ul>
+        <li>Additive manufacturing</li>
+        <li>Cold spray</li>
+        <li>Wire arc additive manufacturing (WAAM)</li>
+        <li>Additive friction stir deposition (AFSD)</li>
+        <li>Nanomaterials</li>
+        <li>Multi-functional composites</li>
+        <li>Ultra high temperature ceramics (UHTCs)</li>
+        <li>Defense-tech</li>
+        <li>Resources</li>
+        <li>Quick Links</li>
+        <li>College of Engineering &amp; Computing</li>
+      </ul>
+    </main>
+    """
+    interests, _ = extract_research_interests(html)
+    assert "Additive manufacturing" in interests
+    assert "Cold spray" in interests
+    assert "Resources" not in interests
+    assert "Quick Links" not in interests
+    assert "College of Engineering & Computing" not in interests

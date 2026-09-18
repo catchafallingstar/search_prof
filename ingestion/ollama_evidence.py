@@ -13,8 +13,9 @@ from settings import setting, setting_bool, setting_int
 
 
 PROMPT_VERSION = "faculty-evidence-v1"
-PUBLICATION_PROMPT_VERSION = "publication-identity-v2"
+PUBLICATION_PROMPT_VERSION = "publication-identity-v3"
 RESEARCH_INTEREST_PROMPT_VERSION = "research-interest-v2"
+PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v1"
 ALLOWED_RECORD_TYPES = {
     "FACULTY", "EMERITUS", "ADJUNCT", "VISITING", "RESEARCH_FACULTY",
     "LECTURER", "INSTRUCTOR", "STUDENT", "POSTDOC", "STAFF",
@@ -180,12 +181,22 @@ def review(
     return OllamaReview(status, data, errors)
 
 
+def _normalized_evidence_text(value: object) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
 def review_publication_identity(
     *, source_record_key: str, institution_id: int, professor_name: str,
     institution: str, department: str, official_email_domain: str,
     known_pages: list[str], scholar_profile: dict[str, Any],
+    official_biography: str = "", official_interests: list[str] | None = None,
 ) -> OllamaReview:
-    """Ask Qwen to structure one Scholar candidate; code makes the decision."""
+    """Correlate one Scholar profile with already verified official evidence.
+
+    Qwen may provide a second identity signal, but only when it returns
+    source-grounded evidence from both the official faculty record and the
+    Scholar record. A name match by itself can never verify a profile.
+    """
     papers = scholar_profile.get("papers") or []
     source = {
         "official_professor_name": professor_name,
@@ -193,6 +204,8 @@ def review_publication_identity(
         "official_department": department,
         "official_email_domain": official_email_domain,
         "official_profile_or_personal_pages": known_pages,
+        "official_research_interests": official_interests or [],
+        "official_biography": official_biography[:12000],
         "scholar_profile_name": scholar_profile.get("name", ""),
         "scholar_verified_email": scholar_profile.get("verified_email", ""),
         "scholar_affiliation": scholar_profile.get("affiliation", ""),
@@ -201,26 +214,211 @@ def review_publication_identity(
         "representative_papers": [
             {"title": getattr(p, "title", ""), "authors": getattr(p, "authors", ""),
              "venue": getattr(p, "venue", ""), "year": getattr(p, "year", None)}
-            for p in papers[:12]
+            for p in papers[:20]
         ],
     }
     source_text = json.dumps(source, ensure_ascii=False)
-    prompt = f"""Review whether ONE Google Scholar profile can belong to ONE already verified faculty member.
-Do not establish faculty employment. Do not guess. The supplied profile data is
-stored separately, so do not repeat names, pages, interests, or papers.
+    prompt = f"""Review whether ONE Google Scholar profile belongs to ONE already verified faculty member.
+Do not establish employment and do not guess. A compatible name alone is never
+enough. Correlate independent facts such as affiliation, verified email domain,
+homepage, official research interests/biography, and the subjects of representative
+papers. Evidence must be copied exactly from SOURCE_JSON values.
+
 Return one concise JSON object only:
-{{"same_person":"YES|NO|UNCLEAR","matching_signals":["short signal"],
-"conflicts":["short conflict"],"confidence":0.0}}
-A name match alone is insufficient. Keep the whole answer below 300 tokens.
+{{"same_person":"YES|NO|UNCLEAR",
+  "official_evidence":["exact official-side text"],
+  "scholar_evidence":["exact Scholar-side text or exact paper title"],
+  "matching_signals":["short explanation"],
+  "conflicts":["short conflict"],
+  "confidence":0.0}}
+
+For YES, include at least one non-name official evidence item and at least one
+non-name Scholar evidence item. If that cannot be done, return UNCLEAR.
 SOURCE_JSON:
 {source_text}
 """
-    return _run_cached_review(
+    review = _run_cached_review(
         source_type="SCHOLAR_IDENTITY", source_record_key=source_record_key,
         institution_id=institution_id, prompt_version=PUBLICATION_PROMPT_VERSION,
         source_text=source_text, prompt=prompt,
     )
+    if review.status != "VALID":
+        return review
 
+    data = dict(review.data)
+    errors: list[str] = []
+    same_person = str(data.get("same_person") or "").upper()
+    if same_person not in {"YES", "NO", "UNCLEAR"}:
+        errors.append("same_person must be YES, NO, or UNCLEAR")
+
+    official_evidence = data.get("official_evidence") or []
+    scholar_evidence = data.get("scholar_evidence") or []
+    if not isinstance(official_evidence, list):
+        errors.append("official_evidence must be a list")
+        official_evidence = []
+    if not isinstance(scholar_evidence, list):
+        errors.append("scholar_evidence must be a list")
+        scholar_evidence = []
+    if not isinstance(data.get("matching_signals", []), list):
+        errors.append("matching_signals must be a list")
+    if not isinstance(data.get("conflicts", []), list):
+        errors.append("conflicts must be a list")
+
+    try:
+        confidence = float(data.get("confidence") or 0)
+        if not 0 <= confidence <= 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        confidence = 0.0
+        errors.append("confidence must be between 0 and 1")
+
+    # For a model-only promotion, require subject-specific official evidence.
+    # Generic institution names, domains, and profile URLs are provenance, not
+    # enough to correlate a name-only Scholar candidate.
+    official_text = _normalized_evidence_text(" ".join([
+        department, *(official_interests or []), official_biography,
+    ]))
+    scholar_parts = [
+        scholar_profile.get("affiliation", ""), scholar_profile.get("verified_email", ""),
+        scholar_profile.get("homepage", ""), *(scholar_profile.get("research_interests") or []),
+    ]
+    for paper in papers[:20]:
+        scholar_parts.extend([
+            getattr(paper, "title", ""), getattr(paper, "authors", ""),
+            getattr(paper, "venue", ""),
+        ])
+    scholar_text = _normalized_evidence_text(" ".join(str(v or "") for v in scholar_parts))
+    normalized_name = _normalized_evidence_text(professor_name)
+
+    valid_official = []
+    for value in official_evidence:
+        normalized = _normalized_evidence_text(value)
+        if not normalized or normalized == normalized_name or normalized not in official_text:
+            errors.append("official_evidence is not grounded in official source data")
+        else:
+            valid_official.append(str(value))
+    valid_scholar = []
+    for value in scholar_evidence:
+        normalized = _normalized_evidence_text(value)
+        if not normalized or normalized == normalized_name or normalized not in scholar_text:
+            errors.append("scholar_evidence is not grounded in Scholar source data")
+        else:
+            valid_scholar.append(str(value))
+
+    if same_person == "YES" and (not valid_official or not valid_scholar):
+        errors.append("YES requires grounded evidence from both official and Scholar data")
+
+    data["same_person"] = same_person
+    data["official_evidence"] = valid_official
+    data["scholar_evidence"] = valid_scholar
+    data["confidence"] = confidence
+    if errors:
+        return OllamaReview("INVALID_EVIDENCE", data, tuple(dict.fromkeys(errors)), review.cached)
+    return OllamaReview("VALID", data, (), review.cached)
+
+
+def review_paper_research_summary(
+    *, source_record_key: str, institution_id: int, professor_name: str,
+    institution: str, papers: list[dict[str, Any]],
+    scholar_interests: list[str] | None = None,
+) -> OllamaReview:
+    """Summarize broad research areas from already identity-verified papers.
+
+    Every returned area must cite exact paper titles from the supplied set so
+    callers can audit the model output. This function never verifies identity.
+    """
+    clean_papers = []
+    for paper in papers[:30]:
+        title = " ".join(str(paper.get("title") or "").split())
+        if not title:
+            continue
+        clean_papers.append({
+            "title": title,
+            "year": paper.get("year"),
+            "venue": " ".join(str(paper.get("venue") or "").split()),
+        })
+    if not clean_papers:
+        return OllamaReview("INVALID_EVIDENCE", {}, ("no paper titles supplied",))
+
+    source = {
+        "professor_name": professor_name,
+        "institution": institution,
+        "scholar_self_listed_interests": scholar_interests or [],
+        "verified_papers": clean_papers,
+    }
+    source_text = json.dumps(source, ensure_ascii=False)
+    prompt = f"""Infer broad CURRENT OR ESTABLISHED research areas for ONE already
+identity-verified faculty member using only the supplied verified paper titles,
+venues, years, and optional Scholar self-listed interests. Do not infer from the
+person's name or university. Prefer stable subject areas over one-off methods.
+
+Return JSON only:
+{{"research_areas":[
+  {{"label":"2 to 8 word broad research area",
+    "supporting_titles":["exact supplied paper title","exact supplied paper title"]}}
+],"basis_summary":"one short explanation"}}
+
+Return at most 8 areas. Each area must have at least two different exact paper
+titles when at least two papers are supplied. Do not invent or paraphrase titles.
+SOURCE_JSON:
+{source_text}
+"""
+    review = _run_cached_review(
+        source_type="PAPER_RESEARCH_SUMMARY", source_record_key=source_record_key,
+        institution_id=institution_id, prompt_version=PAPER_RESEARCH_PROMPT_VERSION,
+        source_text=source_text, prompt=prompt,
+    )
+    if review.status != "VALID":
+        return review
+
+    data = dict(review.data)
+    areas = data.get("research_areas")
+    errors: list[str] = []
+    if not isinstance(areas, list):
+        return OllamaReview("INVALID_EVIDENCE", data, ("research_areas must be a list",), review.cached)
+    if len(areas) > 8:
+        errors.append("at most 8 research areas are permitted")
+
+    title_lookup = {
+        _normalized_evidence_text(item["title"]): item["title"]
+        for item in clean_papers
+    }
+    normalized_areas: list[dict[str, Any]] = []
+    for area in areas[:8]:
+        if not isinstance(area, dict):
+            errors.append("each research area must be an object")
+            continue
+        label = " ".join(str(area.get("label") or "").split())
+        titles = area.get("supporting_titles") or []
+        if not 2 <= len(label) <= 80 or len(label.split()) > 8:
+            errors.append("research area labels must be 2-80 characters and at most 8 words")
+            continue
+        if not isinstance(titles, list):
+            errors.append("supporting_titles must be a list")
+            continue
+        grounded: list[str] = []
+        for title in titles:
+            match = title_lookup.get(_normalized_evidence_text(title))
+            if match and match not in grounded:
+                grounded.append(match)
+            else:
+                errors.append("supporting title is not an exact supplied paper title")
+        required = 2 if len(clean_papers) >= 2 else 1
+        if len(grounded) < required:
+            errors.append("each research area requires enough distinct supporting papers")
+            continue
+        normalized_areas.append({"label": label, "supporting_titles": grounded[:5]})
+
+    if not normalized_areas and areas:
+        errors.append("no research areas had valid paper support")
+    data["research_areas"] = normalized_areas
+    data["research_interests"] = [item["label"] for item in normalized_areas]
+    data["supporting_evidence"] = {
+        item["label"]: item["supporting_titles"] for item in normalized_areas
+    }
+    if errors:
+        return OllamaReview("INVALID_EVIDENCE", data, tuple(dict.fromkeys(errors)), review.cached)
+    return OllamaReview("VALID", data, (), review.cached)
 
 def review_research_interest_summary(
     *, source_record_key: str, institution_id: int, professor_name: str,
@@ -280,9 +478,9 @@ SOURCE_JSON:
     errors: list[str] = []
     if not isinstance(labels, list):
         errors.append("research_interests must be a list")
+        labels = []
     else:
-        if len(labels) > 8:
-            errors.append("at most 8 labels are permitted")
+        labels = labels[:8]
         for label in labels:
             words = str(label or "").split()
             if not isinstance(label, str) or not 2 <= len(label.strip()) <= 80:
@@ -291,7 +489,9 @@ SOURCE_JSON:
                 errors.append("each research interest must contain at most 8 words")
     if errors:
         return OllamaReview("INVALID_EVIDENCE", review.data, tuple(errors), review.cached)
-    return review
+    data = dict(review.data)
+    data["research_interests"] = labels
+    return OllamaReview("VALID", data, (), review.cached)
 
 
 def _run_cached_review(*, source_type: str, source_record_key: str,

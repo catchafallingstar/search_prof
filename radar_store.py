@@ -1606,7 +1606,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                      AND p.canonical_rank IN (
                          'ASSISTANT_PROFESSOR','ASSOCIATE_PROFESSOR','PROFESSOR'
                      )
-                     AND p.faculty_title !~* '\\m(adjunct|affiliate|affiliated|visiting|emeritus|emerita|part[- ]time|lecturer|instructor)\\M'
+                     AND p.faculty_title !~* '\\m(adjunct|affiliate|affiliated|visiting|emeritus|emerita|part[- ]time|teaching|lecturer|instructor)\\M'
                      AND EXISTS (
                          SELECT 1 FROM roster_member_candidates candidate
                          WHERE candidate.professor_id = p.id
@@ -1614,7 +1614,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                      )
                      AND (
                          p.publication_status = 'NOT_CHECKED'
-                         OR (p.publication_discovery_version < 10
+                         OR (p.publication_discovery_version < 13
                              AND NOT EXISTS (SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id))
                      )
                      AND NOT EXISTS (
@@ -2830,7 +2830,7 @@ def requeue_unresolved_publication_reviews(owner_user_id: int) -> int:
                      AND p.canonical_rank IN (
                        'ASSISTANT_PROFESSOR','ASSOCIATE_PROFESSOR','PROFESSOR'
                      )
-                     AND p.faculty_title !~* '\\m(adjunct|affiliate|affiliated|visiting|emeritus|emerita|part[- ]time|lecturer|instructor)\\M'
+                     AND p.faculty_title !~* '\\m(adjunct|affiliate|affiliated|visiting|emeritus|emerita|part[- ]time|teaching|lecturer|instructor)\\M'
                      AND (
                        p.publication_status IN ('REVIEW_REQUIRED','SOURCE_UNAVAILABLE')
                        OR EXISTS (

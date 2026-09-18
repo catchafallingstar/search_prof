@@ -377,7 +377,7 @@ CREATE TABLE IF NOT EXISTS roster_member_candidates (
         'REJECTED', 'NEEDS_REVIEW')),
     validation_reason TEXT,
     profile_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-    validation_version INTEGER NOT NULL DEFAULT 2,
+    validation_version INTEGER NOT NULL DEFAULT 3,
     professor_id BIGINT REFERENCES professors(id) ON DELETE SET NULL,
     checked_at TIMESTAMPTZ,
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -386,6 +386,7 @@ CREATE TABLE IF NOT EXISTS roster_member_candidates (
 );
 ALTER TABLE roster_member_candidates DROP CONSTRAINT IF EXISTS roster_member_candidates_validation_status_check;
 ALTER TABLE roster_member_candidates ADD COLUMN IF NOT EXISTS validation_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE roster_member_candidates ALTER COLUMN validation_version SET DEFAULT 3;
 ALTER TABLE roster_member_candidates ADD CONSTRAINT roster_member_candidates_validation_status_check
     CHECK (validation_status IN ('PENDING', 'PROFILE_VERIFIED', 'ROSTER_VERIFIED',
         'ROSTER_CONFIRMED_PROFILE_UNAVAILABLE', 'NAME_MISMATCH', 'ROLE_UNCLEAR',
@@ -396,7 +397,7 @@ SET last_success_at = NULL, updated_at = NOW()
 WHERE EXISTS (
     SELECT 1 FROM roster_member_candidates candidate
     WHERE candidate.directory_id=directory.id
-      AND candidate.validation_version < 2
+      AND candidate.validation_version < 3
 );
 CREATE INDEX IF NOT EXISTS roster_member_candidates_status_idx
     ON roster_member_candidates (validation_status, checked_at);

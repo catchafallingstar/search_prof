@@ -20,6 +20,7 @@ from ingestion.institution_domains import institutions_equivalent
 from ingestion.faculty_roster import eligible_research_group_leader
 from ingestion.name_normalization import fold_name_text, name_tokens
 from ingestion.ollama_evidence import (
+    review_paper_research_summary,
     review_publication_identity,
     review_research_interest_summary,
 )
@@ -76,7 +77,7 @@ NON_PROFILE_PATH = re.compile(
     r"/(?:news|events?|awards?|honors?|alumni|archive|stories?|press|jobs?)(?:/|$)",
     re.I,
 )
-PUBLICATION_DISCOVERY_VERSION = 12
+PUBLICATION_DISCOVERY_VERSION = 13
 SCHOLAR_SUFFIXES = frozenset({'com','co.uk','com.tr','de','fr','ca','com.au','co.in',
     'co.jp','com.br','es','it','nl','ch','se','no','dk','fi','at','be','pl','pt',
     'co.nz','co.za','com.mx','com.sg','com.hk','com.tw','co.kr','co.id'})
@@ -116,6 +117,12 @@ PROFILE_ASIDE_CLASS = re.compile(
 )
 BIOGRAPHY_HEADING = re.compile(
     r"\b(?:biography|bio|about(?: me)?|profile|professional background)\b", re.I
+)
+NON_RESEARCH_INTEREST_LABEL = re.compile(
+    r"^(?:resources?|quick links?|contact(?: information)?|education|teaching|"
+    r"publications?|office|email|phone|college of .+|school of .+|"
+    r"department of .+|.+ university)$",
+    re.I,
 )
 BLOCK_PAGE_TITLE = re.compile(
     r"^(?:access denied|forbidden|request rejected|just a moment|"
@@ -328,6 +335,8 @@ def _interest_labels(section_text: str) -> list[str]:
         for chunk in chunks:
             value = " ".join(chunk.strip(" .:;-–—").split())
             words = value.split()
+            if NON_RESEARCH_INTEREST_LABEL.fullmatch(value):
+                continue
             if 2 <= len(value) <= 80 and 1 <= len(words) <= 8:
                 values.append(value)
     return list(dict.fromkeys(values))[:12]
@@ -380,6 +389,7 @@ def _normalize_interest(value: str) -> str:
 def _save_research_interests(
     professor_id: int, interests: list[str], *, method: str,
     source_url: str, source_excerpt: str, confidence: float,
+    replace_all: bool = True,
 ) -> int:
     clean = [(value.strip(), _normalize_interest(value)) for value in interests]
     clean = [(display, normalized) for display, normalized in clean if normalized]
@@ -387,10 +397,19 @@ def _save_research_interests(
         return 0
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM professor_research_interests WHERE professor_id=%s",
-                (professor_id,),
-            )
+            if replace_all:
+                cursor.execute(
+                    "DELETE FROM professor_research_interests WHERE professor_id=%s",
+                    (professor_id,),
+                )
+            else:
+                # Paper-derived summaries supplement official website evidence.
+                # Refresh only prior rows produced by the same evidence method.
+                cursor.execute(
+                    "DELETE FROM professor_research_interests "
+                    "WHERE professor_id=%s AND evidence_method=%s",
+                    (professor_id, method),
+                )
             for display, normalized in clean[:12]:
                 cursor.execute(
                     """INSERT INTO professor_research_interests
@@ -652,12 +671,14 @@ def _bare_profile_site_link(
     if _host_root(target_url) in BARE_SITE_EXCLUDED_ROOTS:
         return False
 
-    # Same-institution subdomains can be legitimate labs, but reject obvious
-    # university-wide service/navigation hosts.
-    if _host_root(target_url) == _host_root(profile_url):
-        first_label = host.split(".", 1)[0]
-        if first_label in GENERIC_INSTITUTION_SUBDOMAINS:
-            return False
+    # A bare URL label is strong enough only inside the same institution root.
+    # External personal sites are handled separately by named_homepage, while
+    # explicitly labelled external labs still match RESEARCH_LINK.
+    if _host_root(target_url) != _host_root(profile_url):
+        return False
+    first_label = host.split(".", 1)[0]
+    if first_label in GENERIC_INSTITUTION_SUBDOMAINS:
+        return False
 
     visible = label.strip().casefold()
     visible = re.sub(r"^https?://", "", visible)
@@ -989,7 +1010,7 @@ def _queue_linked_scholar_review(professor_id: int, urls: list[str],
             "QWEN_REVIEW_PUBLICATION",
             professor_id=professor_id,
             priority=70,
-            max_attempts=3,
+            max_attempts=5,
         )
 
         steps.append({
@@ -999,6 +1020,94 @@ def _queue_linked_scholar_review(professor_id: int, urls: list[str],
             "reason": "Supplemental Scholar review; existing publications retained.",
             "candidate_count": len(pending),
         })
+
+def _paper_summary_payload(papers: list[Publication]) -> list[dict[str, Any]]:
+    """Keep a bounded, auditable set of representative verified papers."""
+    ordered = sorted(
+        papers,
+        key=lambda paper: (paper.year or 0, paper.title.casefold()),
+        reverse=True,
+    )
+    return [
+        {"title": paper.title, "year": paper.year, "venue": paper.venue}
+        for paper in ordered[:30]
+        if paper.title.strip()
+    ]
+
+
+def _store_paper_research_summary(
+    professor_id: int, professor: dict[str, Any], papers: list[Publication],
+    source_url: str, steps: list[dict[str, Any]], *,
+    scholar_interests: list[str] | None = None,
+    queue_on_failure: bool = True,
+) -> None:
+    """Create broad areas from identity-verified papers with title-level support."""
+    paper_payload = _paper_summary_payload(papers)
+    if not paper_payload:
+        return
+    review = review_paper_research_summary(
+        source_record_key=f"{professor_id}:{source_url}:papers",
+        institution_id=int(professor["institution_id"]),
+        professor_name=str(professor["name"]),
+        institution=str(professor["institution_name"]),
+        papers=paper_payload,
+        scholar_interests=scholar_interests or [],
+    )
+    labels = review.data.get("research_interests") if review.status == "VALID" else []
+    labels = [str(value).strip() for value in labels or [] if str(value).strip()]
+    support = review.data.get("supporting_evidence") if review.status == "VALID" else {}
+    count = 0
+    if labels:
+        excerpt_parts = []
+        for label in labels:
+            titles = [str(value) for value in (support or {}).get(label, [])]
+            excerpt_parts.append(f"{label}: " + " | ".join(titles[:5]))
+        count = _save_research_interests(
+            professor_id, labels,
+            method="QWEN_PAPER_SUMMARY",
+            source_url=source_url,
+            source_excerpt="\n".join(excerpt_parts),
+            confidence=0.65,
+            replace_all=False,
+        )
+
+    pending = review.status in {"MODEL_UNAVAILABLE", "MODEL_COOLDOWN"}
+    job_id = None
+    if pending and queue_on_failure:
+        from radar_store import enqueue_radar_job
+        payload = {
+            "mode": "PAPER_SUMMARY",
+            "professor": {k: professor.get(k) for k in
+                          ("name", "institution_id", "institution_name", "department")},
+            "papers": paper_payload,
+            "source_url": source_url,
+            "scholar_interests": scholar_interests or [],
+        }
+        job = enqueue_radar_job(
+            "QWEN_REVIEW_INTERESTS", professor_id=professor_id, priority=62,
+            max_attempts=3, initial_result={"interest_input": payload},
+            delay_seconds=300,
+        )
+        job_id = job["id"]
+
+    steps.append({
+        "step": "PAPER_RESEARCH_AREAS",
+        "status": ("QWEN_REVIEWED" if count else
+                   "AWAITING_MODEL_REVIEW" if pending else
+                   "NO_SUPPORTED_AREAS" if review.status == "VALID" else review.status),
+        "model_status": review.status,
+        "source_url": source_url,
+        "evidence_method": "QWEN_PAPER_SUMMARY",
+        "confidence": "Medium",
+        "interests": labels[:8] if count else [],
+        "interests_saved": count,
+        "supporting_evidence": support if count else {},
+        "review_job_id": job_id,
+        "reason": (str(review.data.get("basis_summary") or "") if count else
+                   "Awaiting Qwen paper-area review; verified paper evidence is saved." if pending else
+                   "Qwen did not return research areas with sufficient exact paper-title support."),
+    })
+
 
 def _store_interest_fallback(
     professor_id: int, professor: dict[str, Any],
@@ -1072,23 +1181,54 @@ def review_queued_interests(job: dict[str, Any]) -> dict[str, Any]:
         raise ValueError('Research-interest review is missing its saved input')
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id,name,institution_id FROM professors WHERE id=%s AND faculty_status='VERIFIED'",(job['professor_id'],))
+            cursor.execute(
+                "SELECT id,name,institution_id FROM professors "
+                "WHERE id=%s AND faculty_status='VERIFIED'",
+                (job['professor_id'],),
+            )
             current = cursor.fetchone()
             if not current:
                 return {'status':'NOT_APPLICABLE','steps':[]}
-            if (current['institution_id']!=payload['professor']['institution_id']
-                or not same_person_name(current['name'],payload['professor']['name'])):
+            if (current['institution_id'] != payload['professor']['institution_id']
+                    or not same_person_name(current['name'], payload['professor']['name'])):
                 return {'status':'REVIEW_REQUIRED','steps':[{'step':'RESEARCH_INTERESTS',
-                    'status':'STALE_EVIDENCE','reason':'Faculty identity or institution changed since extraction; fresh evidence is required.'}]}
-    steps = []
-    _store_interest_fallback(job['professor_id'],payload['professor'],payload['explicit'],
-                             payload['biography_text'],payload['biography_url'],steps,queue_on_failure=False)
-    pending = steps[-1]['status']=='AWAITING_MODEL_REVIEW'
-    retries = int((job.get('result_json') or {}).get('model_wait_count') or 0)+1
-    return {'status':'MODEL_UNAVAILABLE' if pending else 'APPROVED' if steps[-1]['interests_saved'] else 'REVIEW_REQUIRED',
-            'steps':steps,'interest_input':payload,'model_wait_count':retries,
-            'retry_after_seconds':min(3600,300*2**min(retries-1,4))}
+                    'status':'STALE_EVIDENCE',
+                    'reason':'Faculty identity or institution changed since extraction; fresh evidence is required.'}]}
 
+    steps: list[dict[str, Any]] = []
+    if payload.get('mode') == 'PAPER_SUMMARY':
+        paper_objects = [
+            Publication(
+                str(item.get('title') or ''),
+                int(item['year']) if item.get('year') else None,
+                '', str(payload.get('source_url') or ''),
+                'VERIFIED_PAPER_SET', str(item.get('title') or ''),
+                venue=str(item.get('venue') or ''),
+            )
+            for item in payload.get('papers') or []
+            if str(item.get('title') or '').strip()
+        ]
+        _store_paper_research_summary(
+            int(job['professor_id']), payload['professor'], paper_objects,
+            str(payload.get('source_url') or ''), steps,
+            scholar_interests=[str(v) for v in payload.get('scholar_interests') or []],
+            queue_on_failure=False,
+        )
+    else:
+        _store_interest_fallback(
+            int(job['professor_id']), payload['professor'], payload['explicit'],
+            payload['biography_text'], payload['biography_url'], steps,
+            queue_on_failure=False,
+        )
+
+    pending = bool(steps and steps[-1]['status'] == 'AWAITING_MODEL_REVIEW')
+    retries = int((job.get('result_json') or {}).get('model_wait_count') or 0) + 1
+    saved = int(steps[-1].get('interests_saved') or 0) if steps else 0
+    return {
+        'status':'MODEL_UNAVAILABLE' if pending else 'APPROVED' if saved else 'REVIEW_REQUIRED',
+        'steps':steps, 'interest_input':payload, 'model_wait_count':retries,
+        'retry_after_seconds':min(3600, 300 * 2 ** min(retries - 1, 4)),
+    }
 
 def _dismiss_resolved_scholar_reviews(professor_id: int) -> None:
     """Remove obsolete staff alerts after one Scholar identity is verified."""
@@ -1277,6 +1417,10 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
         if explicit_interests:
             _store_interest_fallback(professor_id, professor, explicit_interests,
                                      biography_text, biography_url, steps)
+        _store_paper_research_summary(
+            professor_id, dict(professor), papers,
+            papers[0].source_url or profile_url, steps,
+        )
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                       "papers_found": len(papers), "papers_imported": imported,
                       "papers_already_linked": len(papers)-imported})
@@ -1345,6 +1489,15 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
         _queue_linked_scholar_review(professor_id,
             [u for u in linked_site_scholar_urls if _scholar_profile_key(u) not in {_scholar_profile_key(v) for v in official_scholar_urls}],
             steps, discovered_by='LINKED_RESEARCH_PAGE')
+        if explicit_interests:
+            _store_interest_fallback(
+                professor_id, dict(professor), explicit_interests,
+                biography_text, biography_url, steps,
+            )
+        _store_paper_research_summary(
+            professor_id, dict(professor), papers,
+            papers[0].source_url or profile_url, steps,
+        )
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                       "papers_found": len(papers), "papers_imported": imported,
                       "papers_already_linked": len(papers)-imported})
@@ -1462,6 +1615,8 @@ def review_queued_scholar_candidates(
     # Re-establish direct provenance from today's official page. Older rows
     # may have incorrectly labelled personal-site links as official links.
     official_scholar_urls: set[str] = set()
+    official_biography = ""
+    official_interests: list[str] = []
     saved_official_urls = _official_profile_scholar_candidates(professor_id)
     headers = {"User-Agent": "Mozilla/5.0 ScholarRadar/2.0 evidence-review"}
     # Re-read the authoritative profile so provenance survives retries even if
@@ -1476,6 +1631,15 @@ def review_queued_scholar_candidates(
                 official_scholar_urls.update(linked_scholar_profiles(
                     official_response.text, str(official_response.url)
                 ))
+                official_interests, _ = extract_research_interests(
+                    official_response.text
+                )
+                official_biography = extract_biography_text(official_response.text)
+                known_urls.extend(linked_research_pages(
+                    official_response.text, str(official_response.url),
+                    str(professor["name"]),
+                ))
+                known_urls = list(dict.fromkeys(value for value in known_urls if value))
         except requests.RequestException:
             pass
     urls = _dedupe_scholar_profiles([
@@ -1523,6 +1687,8 @@ def review_queued_scholar_candidates(
                     ),
                     known_pages=known_urls,
                     scholar_profile=scholar,
+                    official_biography=official_biography,
+                    official_interests=official_interests,
                 )
 
                 if model.status != "VALID":
@@ -1533,13 +1699,35 @@ def review_queued_scholar_candidates(
                         decision = "SOURCE_UNAVAILABLE"
                     else:
                         decision = "REVIEW_REQUIRED"
-
-                elif str(model.data.get("same_person") or "").upper() != "YES":
-                    decision = (
-                        "PROFILE_NAME_CONFLICT"
-                        if str(model.data.get("same_person") or "").upper() == "NO"
-                        else "REVIEW_REQUIRED"
-                    )
+                else:
+                    same_person = str(model.data.get("same_person") or "").upper()
+                    if same_person == "NO":
+                        decision = "PROFILE_NAME_CONFLICT"
+                    elif same_person != "YES":
+                        decision = "REVIEW_REQUIRED"
+                    else:
+                        conflicts = [
+                            str(value).strip()
+                            for value in model.data.get("conflicts") or []
+                            if str(value).strip()
+                        ]
+                        try:
+                            confidence = float(model.data.get("confidence") or 0)
+                        except (TypeError, ValueError):
+                            confidence = 0.0
+                        grounded = bool(model.data.get("official_evidence")) and bool(
+                            model.data.get("scholar_evidence")
+                        )
+                        if (
+                            decision == "REVIEW_REQUIRED"
+                            and grounded
+                            and not conflicts
+                            and confidence >= 0.80
+                        ):
+                            decision = "VERIFIED"
+                            reasons.append("qwen_correlated_identity")
+                        elif decision != "VERIFIED":
+                            decision = "REVIEW_REQUIRED"
 
             qwen_status = model.status if model is not None else "NOT_NEEDED"
             qwen_data = model.data if model is not None else {}
@@ -1566,13 +1754,24 @@ def review_queued_scholar_candidates(
             steps.append({"step": "QWEN_SCHOLAR_REVIEW", "status": qwen_status,
                           "source_url": url,
                           "deterministic_decision": decision,
-                          "decision_signals": reasons})
+                          "decision_signals": reasons,
+                          "qwen_same_person": qwen_data.get("same_person"),
+                          "qwen_confidence": qwen_data.get("confidence"),
+                          "qwen_matching_signals": qwen_data.get("matching_signals") or [],
+                          "qwen_conflicts": qwen_data.get("conflicts") or []})
             if decision == "VERIFIED":
                 scholar_papers = list(scholar["papers"])[:max_works]
                 imported = _save(professor_id, scholar_papers, progress_callback)
                 value = "SCHOLAR_VERIFIED" if scholar_papers else "NO_PUBLICATIONS_FOUND"
                 _status(professor_id, value)
                 _dismiss_resolved_scholar_reviews(professor_id)
+                if scholar_papers:
+                    _store_paper_research_summary(
+                        professor_id, dict(professor), scholar_papers, url, steps,
+                        scholar_interests=[
+                            str(value) for value in scholar.get("research_interests") or []
+                        ],
+                    )
                 steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                               "papers_found": len(scholar_papers),
                               "papers_imported": imported,

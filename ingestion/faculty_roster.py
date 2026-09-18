@@ -124,6 +124,10 @@ def _appointment_type(text: str) -> str:
 
 def _canonical_rank(text: str) -> str | None:
     lowered = text.casefold()
+    # Teaching-professor tracks are valid faculty records, but this product's
+    # research-group pipeline must not treat them as research-group leaders.
+    if re.search(r"\b(?:assistant|associate)?\s*teaching professor\b", lowered):
+        return "FACULTY_OTHER"
     if "assistant professor" in lowered:
         return "ASSISTANT_PROFESSOR"
     if "associate professor" in lowered:
@@ -150,7 +154,7 @@ def eligible_research_group_leader(
     combined = f"{title} | {role_context}"
     if re.search(
         r"\b(?:adjunct|affiliate|affiliated|visiting|emerit(?:us|a)|"
-        r"part[- ]time|lecturer|instructor)\b",
+        r"part[- ]time|teaching|lecturer|instructor)\b",
         combined,
         re.I,
     ):
@@ -992,7 +996,7 @@ def crawl_directory(
                            section_heading, appointment_type, source_excerpt,
                            validation_status, validation_reason, profile_evidence,
                            validation_version, checked_at, last_seen_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,2,NOW(),NOW())
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,3,NOW(),NOW())
                        ON CONFLICT (directory_id, canonical_profile_url) DO UPDATE SET
                            displayed_name=EXCLUDED.displayed_name,
                            displayed_title=EXCLUDED.displayed_title,
@@ -1001,7 +1005,7 @@ def crawl_directory(
                            validation_status=EXCLUDED.validation_status,
                            validation_reason=EXCLUDED.validation_reason,
                            profile_evidence=EXCLUDED.profile_evidence,
-                           validation_version=2,
+                           validation_version=3,
                            checked_at=NOW(), last_seen_at=NOW()
                        RETURNING id""",
                     (directory_id, member.name, name_key, member.title,

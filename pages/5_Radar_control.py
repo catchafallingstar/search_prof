@@ -104,12 +104,18 @@ def live_panel() -> None:
             subject = entry.get("name") or entry.get("institution_name") or "Shared index"
             st.markdown(f"**{_local_time(entry.get('activity_at'))} · {stage} · {subject}**")
             areas = entry.get("research_areas") or []
-            interest_step = next((step for step in reversed(entry.get("audit_steps") or [])
+            audit_steps = entry.get("audit_steps") or []
+            interest_step = next((step for step in reversed(audit_steps)
                                   if step.get("step") == "RESEARCH_INTERESTS"), {})
-            if interest_step.get("interests"):
-                areas = interest_step["interests"]
+            paper_area_step = next((step for step in reversed(audit_steps)
+                                    if step.get("step") == "PAPER_RESEARCH_AREAS"), {})
+            display_area_step = (
+                paper_area_step if paper_area_step.get("interests") else interest_step
+            )
+            if display_area_step.get("interests"):
+                areas = display_area_step["interests"]
             area_text = ", ".join(areas) if areas else (
-                "Not established" if str(entry.get("stage") or "") in {
+                "Not established yet" if str(entry.get("stage") or "") in {
                     "MATCH_FACULTY_PUBLICATIONS", "QWEN_REVIEW_PUBLICATION"
                 } else "Not linked"
             )
@@ -124,7 +130,12 @@ def live_panel() -> None:
                              else 'Evidence checked — no research areas accepted')
             st.caption(f"Research area: {area_text} · "
                        f"University: {entry.get('institution_name') or 'Not available'}")
-            if interest_step.get("interests"):
+            if paper_area_step.get("interests"):
+                st.caption(
+                    "Medium confidence · Research areas summarized from identity-verified papers; "
+                    "supporting paper titles are retained in the audit step."
+                )
+            elif interest_step.get("interests"):
                 st.caption(
                     "Very low confidence · No direct interest found; possible research area created by AI."
                     if interest_step.get("evidence_method") == "AI_SUGGESTION" else
@@ -134,6 +145,8 @@ def live_panel() -> None:
                 st.caption('Extracted website interests (unreviewed): '+', '.join(interest_step['extracted_interests']))
             if interest_step.get('status')=='AWAITING_MODEL_REVIEW':
                 st.info('Qwen review is pending. The worker retries saved evidence periodically; publication searches are not repeated.')
+            if paper_area_step.get('status')=='AWAITING_MODEL_REVIEW':
+                st.info('Verified papers are saved. Qwen paper-area summarization will retry without repeating publication discovery.')
             if entry.get("evidence_text"):
                 st.write(f"Paper/evidence: {str(entry['evidence_text'])[:500]}")
             st.write(f"Result: {entry.get('result_status') or 'Finished successfully'}")
@@ -165,6 +178,22 @@ def live_panel() -> None:
                 if step.get("decision_signals"):
                     details.append(
                         "signals: " + ", ".join(step["decision_signals"])
+                    )
+                if step.get("qwen_same_person"):
+                    details.append(f"Qwen same person: {step['qwen_same_person']}")
+                if step.get("qwen_confidence") is not None:
+                    details.append(f"Qwen confidence: {step['qwen_confidence']}")
+                if step.get("qwen_matching_signals"):
+                    details.append(
+                        "Qwen evidence: " + ", ".join(
+                            str(value) for value in step["qwen_matching_signals"]
+                        )
+                    )
+                if step.get("qwen_conflicts"):
+                    details.append(
+                        "Qwen conflicts: " + ", ".join(
+                            str(value) for value in step["qwen_conflicts"]
+                        )
                     )
                 if step.get("interests"):
                     details.append(
