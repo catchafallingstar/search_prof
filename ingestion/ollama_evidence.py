@@ -15,13 +15,22 @@ from settings import setting, setting_bool, setting_int
 PROMPT_VERSION = "faculty-evidence-v1"
 PUBLICATION_PROMPT_VERSION = "publication-identity-v3"
 RESEARCH_INTEREST_PROMPT_VERSION = "research-interest-v2"
-PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v1"
+PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v2"
 ALLOWED_RECORD_TYPES = {
     "FACULTY", "EMERITUS", "ADJUNCT", "VISITING", "RESEARCH_FACULTY",
     "LECTURER", "INSTRUCTOR", "STUDENT", "POSTDOC", "STAFF",
     "ADMINISTRATOR", "OTHER", "UNCLEAR",
 }
 NONFACULTY_TYPES = {"STUDENT", "POSTDOC", "STAFF", "ADMINISTRATOR", "OTHER"}
+
+# Structured Qwen calls need enough output and total context budget to finish
+# one complete JSON object. The paper-area reviewer can return several exact
+# paper titles, so the old 400-token output cap was too small and could cut a
+# response off mid-object. One immediate repair retry is allowed only for
+# malformed/truncated JSON; evidence-validation failures are not retried.
+OLLAMA_JSON_NUM_CTX = 8192
+OLLAMA_JSON_NUM_PREDICT = 1900
+OLLAMA_INVALID_JSON_RETRIES = 1
 _unavailable_until = 0.0
 
 
@@ -91,6 +100,66 @@ SOURCE_RECORD:
 """
 
 
+def _request_json_object(*, model: str, prompt: str) -> tuple[str, dict[str, Any], tuple[str, ...]]:
+    """Request one complete JSON object, retrying malformed output once.
+
+    Ollama already runs in JSON mode, but a response can still be incomplete if
+    generation reaches an output/context limit.  A single immediate repair
+    retry uses the same evidence and a stricter completion instruction.  If
+    that retry also fails, callers receive INVALID_RESPONSE and can route the
+    evidence to staff review instead of looping indefinitely.
+    """
+    last_raw = ""
+    last_error = "INVALID_RESPONSE"
+    retry_suffix = (
+        "\n\nIMPORTANT JSON REPAIR RETRY: The previous model response was incomplete "
+        "or invalid JSON. Return exactly ONE complete JSON object and nothing "
+        "else. Do not use Markdown or code fences. Keep the response concise. "
+        "Close every string, array, and object. Do not repeat the source input "
+        "outside the requested JSON fields."
+    )
+    for attempt in range(OLLAMA_INVALID_JSON_RETRIES + 1):
+        attempt_prompt = prompt if attempt == 0 else prompt + retry_suffix
+        response = requests.post(
+            setting("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/api/chat",
+            json={
+                "model": model,
+                "stream": False,
+                "format": "json",
+                "think": False,
+                "messages": [{"role": "user", "content": attempt_prompt}],
+                "keep_alive": "10m",
+                "options": {
+                    "temperature": 0,
+                    "num_ctx": OLLAMA_JSON_NUM_CTX,
+                    "num_predict": OLLAMA_JSON_NUM_PREDICT,
+                },
+            },
+            timeout=setting_int("OLLAMA_TIMEOUT_SECONDS", 300, 10, 300),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        last_raw = str(
+            (payload.get("message") or {}).get("content")
+            or payload.get("response")
+            or ""
+        )
+        done_reason = str(payload.get("done_reason") or "").casefold()
+        try:
+            if done_reason in {"length", "max_tokens"}:
+                raise ValueError("Ollama output was truncated before JSON completed")
+            return last_raw, _clean_json(last_raw), ()
+        except (ValueError, json.JSONDecodeError) as error:
+            last_error = (
+                "OUTPUT_TRUNCATED"
+                if done_reason in {"length", "max_tokens"}
+                else type(error).__name__
+            )
+            if attempt < OLLAMA_INVALID_JSON_RETRIES:
+                continue
+    return last_raw, {}, (last_error, "JSON_RETRY_EXHAUSTED")
+
+
 def review(
     *, source_type: str, source_record_key: str, institution_id: int,
     institution: str, directory_url: str, source_text: str,
@@ -126,7 +195,9 @@ def review(
                     return OllamaReview(
                         "MODEL_COOLDOWN", {}, ("persistent circuit breaker is open",)
                     )
-    if cached:
+    if cached and cached["validation_status"] not in {
+        "MODEL_UNAVAILABLE", "INVALID_RESPONSE"
+    }:
         return OllamaReview(
             str(cached["validation_status"]), dict(cached["parsed_response"] or {}),
             tuple(cached["validation_errors"] or []), True,
@@ -137,29 +208,18 @@ def review(
     errors: tuple[str, ...] = ()
     status = "VALID"
     try:
-        response = requests.post(
-            setting("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/api/chat",
-            json={
-                "model": model, "stream": False, "format": "json", "think": False,
-                "messages": [{"role": "user", "content": _prompt(
-                    source_type, institution, directory_url, source_text
-                )}],
-                "keep_alive": "10m",
-                "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 700},
-            },
-            timeout=setting_int("OLLAMA_TIMEOUT_SECONDS", 300, 10, 300),
+        raw, data, response_errors = _request_json_object(
+            model=model,
+            prompt=_prompt(source_type, institution, directory_url, source_text),
         )
-        response.raise_for_status()
-        payload = response.json()
-        raw = str((payload.get("message") or {}).get("content") or payload.get("response") or "")
-        data = _clean_json(raw)
-        errors = validate_review(data, source_text)
-        status = "VALID" if not errors else "INVALID_EVIDENCE"
+        if response_errors:
+            status, errors = "INVALID_RESPONSE", response_errors
+        else:
+            errors = validate_review(data, source_text)
+            status = "VALID" if not errors else "INVALID_EVIDENCE"
     except requests.RequestException as error:
         status, errors = "MODEL_UNAVAILABLE", (type(error).__name__,)
         _unavailable_until = time.monotonic() + cooldown_seconds
-    except (ValueError, json.JSONDecodeError) as error:
-        status, errors = "INVALID_RESPONSE", (type(error).__name__,)
 
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
@@ -358,8 +418,10 @@ Return JSON only:
     "supporting_titles":["exact supplied paper title","exact supplied paper title"]}}
 ],"basis_summary":"one short explanation"}}
 
-Return at most 8 areas. Each area must have at least two different exact paper
-titles when at least two papers are supplied. Do not invent or paraphrase titles.
+Return at most 8 areas. When at least two papers are supplied, use exactly two
+different exact supplied paper titles per area; use one only when the entire input
+has one paper. Do not invent or paraphrase titles. Keep basis_summary under 30
+words and return no commentary outside the JSON object.
 SOURCE_JSON:
 {source_text}
 """
@@ -510,24 +572,22 @@ def _run_cached_review(*, source_type: str, source_record_key: str,
                 AND model=%s AND prompt_version=%s AND input_hash=%s""",
                 (source_type, source_record_key, model, prompt_version, input_hash))
             cached = cursor.fetchone()
-    if cached and cached['validation_status'] != 'MODEL_UNAVAILABLE':
-        return OllamaReview(str(cached["validation_status"]), dict(cached["parsed_response"] or {}),
-                            tuple(cached["validation_errors"] or []), True)
+    if cached and cached["validation_status"] not in {
+        "MODEL_UNAVAILABLE", "INVALID_RESPONSE"
+    }:
+        return OllamaReview(
+            str(cached["validation_status"]), dict(cached["parsed_response"] or {}),
+            tuple(cached["validation_errors"] or []), True,
+        )
     raw, data, errors, status = "", {}, (), "VALID"
     try:
-        response = requests.post(
-            setting("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/api/chat",
-            json={"model": model, "stream": False, "format": "json", "think": False,
-                  "messages": [{"role": "user", "content": prompt}], "keep_alive": "10m",
-                  "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 400}},
-            timeout=setting_int("OLLAMA_TIMEOUT_SECONDS", 300, 10, 300))
-        response.raise_for_status()
-        raw = str((response.json().get("message") or {}).get("content") or "")
-        data = _clean_json(raw)
+        raw, data, response_errors = _request_json_object(
+            model=model, prompt=prompt,
+        )
+        if response_errors:
+            status, errors = "INVALID_RESPONSE", response_errors
     except requests.RequestException as error:
         status, errors = "MODEL_UNAVAILABLE", (type(error).__name__,)
-    except (ValueError, json.JSONDecodeError) as error:
-        status, errors = "INVALID_RESPONSE", (type(error).__name__,)
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute("""INSERT INTO ollama_extraction_runs

@@ -139,3 +139,105 @@ def test_paper_research_summary_requires_exact_supporting_titles(monkeypatch) ->
     )
     assert review.status == "VALID"
     assert review.data["research_interests"] == ["Biomedical signal processing"]
+
+
+def test_json_request_retries_once_after_truncated_response(monkeypatch) -> None:
+    calls = []
+    responses = [
+        {
+            "message": {"content": '{"research_areas": ['},
+            "done_reason": "length",
+        },
+        {
+            "message": {
+                "content": '{"research_areas": [], "basis_summary": "No areas."}'
+            },
+            "done_reason": "stop",
+        },
+    ]
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs["json"])
+        payload = responses.pop(0)
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: payload,
+        )
+
+    monkeypatch.setattr(ollama_evidence.requests, "post", fake_post)
+    raw, data, errors = ollama_evidence._request_json_object(
+        model="qwen2.5-coder:7b",
+        prompt="Return JSON only.",
+    )
+
+    assert errors == ()
+    assert data == {"research_areas": [], "basis_summary": "No areas."}
+    assert len(calls) == 2
+    assert calls[0]["options"]["num_predict"] == 1900
+    assert calls[0]["options"]["num_ctx"] == 8192
+    assert "JSON REPAIR RETRY" in calls[1]["messages"][0]["content"]
+    assert raw.endswith('"No areas."}')
+
+
+def test_json_request_stops_after_one_repair_retry(monkeypatch) -> None:
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs["json"])
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "message": {"content": '{"research_areas": ['},
+                "done_reason": "stop",
+            },
+        )
+
+    monkeypatch.setattr(ollama_evidence.requests, "post", fake_post)
+    _raw, data, errors = ollama_evidence._request_json_object(
+        model="qwen2.5-coder:7b",
+        prompt="Return JSON only.",
+    )
+
+    assert data == {}
+    assert len(calls) == 2
+    assert errors[-1] == "JSON_RETRY_EXHAUSTED"
+
+
+def test_paper_research_invalid_json_routes_to_staff_review(monkeypatch) -> None:
+    from ingestion import publication_discovery as publications
+
+    monkeypatch.setattr(
+        publications,
+        "review_paper_research_summary",
+        lambda **kwargs: OllamaReview(
+            "INVALID_RESPONSE", {}, ("JSON_RETRY_EXHAUSTED",)
+        ),
+    )
+    steps = []
+    publications._store_paper_research_summary(
+        1,
+        {
+            "name": "Jane Smith",
+            "institution_id": 1,
+            "institution_name": "Example University",
+            "department": "Computer Science",
+        },
+        [
+            publications.Publication(
+                "A verified research paper",
+                2025,
+                "",
+                "https://scholar.google.com/citations?user=test",
+                "GOOGLE_SCHOLAR",
+                "A verified research paper",
+                venue="Journal A",
+            )
+        ],
+        "https://scholar.google.com/citations?user=test",
+        steps,
+    )
+
+    assert steps[-1]["step"] == "PAPER_RESEARCH_AREAS"
+    assert steps[-1]["status"] == "REVIEW_REQUIRED"
+    assert steps[-1]["model_status"] == "INVALID_RESPONSE"
+    assert "staff review" in steps[-1]["reason"]

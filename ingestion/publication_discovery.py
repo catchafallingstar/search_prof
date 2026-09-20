@@ -1071,7 +1071,12 @@ def _store_paper_research_summary(
             replace_all=False,
         )
 
+    # Network/model outages can be retried later from saved evidence. Malformed
+    # JSON is already retried once inside ollama_evidence; a second malformed
+    # response is therefore routed to staff review instead of creating an
+    # automatic retry loop. Evidence-validation failures also require review.
     pending = review.status in {"MODEL_UNAVAILABLE", "MODEL_COOLDOWN"}
+    manual_review = review.status in {"INVALID_RESPONSE", "INVALID_EVIDENCE"}
     job_id = None
     if pending and queue_on_failure:
         from radar_store import enqueue_radar_job
@@ -1094,6 +1099,7 @@ def _store_paper_research_summary(
         "step": "PAPER_RESEARCH_AREAS",
         "status": ("QWEN_REVIEWED" if count else
                    "AWAITING_MODEL_REVIEW" if pending else
+                   "REVIEW_REQUIRED" if manual_review else
                    "NO_SUPPORTED_AREAS" if review.status == "VALID" else review.status),
         "model_status": review.status,
         "source_url": source_url,
@@ -1105,6 +1111,12 @@ def _store_paper_research_summary(
         "review_job_id": job_id,
         "reason": (str(review.data.get("basis_summary") or "") if count else
                    "Awaiting Qwen paper-area review; verified paper evidence is saved." if pending else
+                   "Qwen returned malformed JSON after one automatic repair retry; "
+                   "verified papers are saved for staff review."
+                   if review.status == "INVALID_RESPONSE" else
+                   "Qwen returned valid JSON, but the proposed areas failed exact "
+                   "paper-evidence validation; verified papers are saved for staff review."
+                   if review.status == "INVALID_EVIDENCE" else
                    "Qwen did not return research areas with sufficient exact paper-title support."),
     })
 

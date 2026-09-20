@@ -416,12 +416,26 @@ CREATE TABLE IF NOT EXISTS ollama_extraction_runs (
     raw_response TEXT,
     parsed_response JSONB NOT NULL DEFAULT '{}'::jsonb,
     validation_status TEXT NOT NULL CHECK (
-        validation_status IN ('VALID', 'INVALID_EVIDENCE', 'MODEL_UNAVAILABLE')
+        validation_status IN (
+            'VALID', 'INVALID_EVIDENCE', 'INVALID_RESPONSE', 'MODEL_UNAVAILABLE'
+        )
     ),
     validation_errors TEXT[] NOT NULL DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (source_type, source_record_key, model, prompt_version, input_hash)
 );
+-- Keep the validation-status constraint aligned with every status that the
+-- Ollama evidence layer can persist.  This ALTER is required for databases
+-- created by an older schema because CREATE TABLE IF NOT EXISTS does not
+-- update an existing CHECK constraint.
+ALTER TABLE ollama_extraction_runs
+    DROP CONSTRAINT IF EXISTS ollama_extraction_runs_validation_status_check;
+ALTER TABLE ollama_extraction_runs
+    ADD CONSTRAINT ollama_extraction_runs_validation_status_check
+    CHECK (validation_status IN (
+        'VALID', 'INVALID_EVIDENCE', 'INVALID_RESPONSE', 'MODEL_UNAVAILABLE'
+    ));
+
 CREATE INDEX IF NOT EXISTS ollama_extraction_runs_source_idx
     ON ollama_extraction_runs (source_type, source_record_key, created_at DESC);
 
