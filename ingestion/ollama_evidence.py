@@ -14,8 +14,8 @@ from settings import setting, setting_bool, setting_int
 
 PROMPT_VERSION = "faculty-evidence-v1"
 PUBLICATION_PROMPT_VERSION = "publication-identity-v3"
-RESEARCH_INTEREST_PROMPT_VERSION = "research-interest-v2"
-PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v2"
+RESEARCH_INTEREST_PROMPT_VERSION = "research-interest-v3"
+PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v3"
 SCHOLAR_PUBLICATION_FILTER_PROMPT_VERSION = "scholar-publication-filter-v1"
 ALLOWED_RECORD_TYPES = {
     "FACULTY", "EMERITUS", "ADJUNCT", "VISITING", "RESEARCH_FACULTY",
@@ -515,10 +515,12 @@ venues, years, and optional Scholar self-listed interests. Do not infer from the
 person's name or university. Prefer stable subject areas over one-off methods.
 
 Return JSON only:
-{{"research_areas":[
-  {{"label":"2 to 8 word broad research area",
-    "supporting_titles":["exact supplied paper title","exact supplied paper title"]}}
-],"basis_summary":"one short explanation"}}
+{{"primary_field":"1 to 6 word broad academic field",
+  "research_areas":[
+    {{"label":"2 to 8 word broad research area",
+      "supporting_titles":["exact supplied paper title","exact supplied paper title"]}}
+  ],
+  "basis_summary":"one short explanation"}}
 
 Return at most 8 areas. When at least two papers are supplied, use exactly two
 different exact supplied paper titles per area; use one only when the entire input
@@ -536,8 +538,13 @@ SOURCE_JSON:
         return review
 
     data = dict(review.data)
-    areas = data.get("research_areas")
+    primary_field = " ".join(str(data.get("primary_field") or "").split())
     errors: list[str] = []
+    if primary_field and (len(primary_field) > 80 or len(primary_field.split()) > 6):
+        errors.append("primary_field must be at most 80 characters and 6 words")
+        primary_field = ""
+    data["primary_field"] = primary_field
+    areas = data.get("research_areas")
     if not isinstance(areas, list):
         return OllamaReview("INVALID_EVIDENCE", data, ("research_areas must be a list",), review.cached)
     if len(areas) > 8:
@@ -603,13 +610,19 @@ def review_research_interest_summary(
         "speculative": speculative,
     }
     source_text = json.dumps(source, ensure_ascii=False)
+    if speculative:
+        return OllamaReview(
+            "INVALID_EVIDENCE", {},
+            ("unsupported department-only research inference is disabled",),
+        )
     prompt = f"""Summarize the research or professional subject areas of ONE already
 verified faculty member from the supplied biography. Return broad noun phrases,
 not claims about publications. Do not invent a field that is not supported by
 the biography. Teaching, administration, employers, awards, and hobbies are not
 research interests unless the biography explicitly connects them to scholarly
 work. Return JSON only:
-{{"research_interests":["2 to 8 word label"],
+{{"primary_field":"1 to 6 word broad academic field",
+  "research_interests":["2 to 8 word label"],
   "basis_summary":"one short explanation",
   "confidence":0.0}}
 Return at most 8 unique labels. Return an empty list when the biography does not
@@ -619,15 +632,6 @@ SOURCE_JSON:
 """
     if explicit_interests:
         prompt += "\nValidate and normalize the explicit labels against the excerpt."
-    if speculative:
-        prompt = (
-            "Suggest at most 5 broad POSSIBLE academic fields from the department. "
-            "These are unsupported AI suggestions, not known interests of this person. "
-            "Never infer fields from their name, ethnicity, gender or school reputation. "
-            "If department is absent or vague return an empty list. Return JSON only: "
-            '{"research_interests":[],"basis_summary":"","confidence":0.1}. '
-            + source_text
-        )
     review = _run_cached_review(
         source_type="RESEARCH_INTEREST_SUMMARY",
         source_record_key=source_record_key,
@@ -654,6 +658,13 @@ SOURCE_JSON:
     if errors:
         return OllamaReview("INVALID_EVIDENCE", review.data, tuple(errors), review.cached)
     data = dict(review.data)
+    primary_field = " ".join(str(data.get("primary_field") or "").split())
+    if primary_field and (len(primary_field) > 80 or len(primary_field.split()) > 6):
+        return OllamaReview(
+            "INVALID_EVIDENCE", data,
+            ("primary_field must be at most 80 characters and 6 words",), review.cached,
+        )
+    data["primary_field"] = primary_field
     data["research_interests"] = labels
     return OllamaReview("VALID", data, (), review.cached)
 

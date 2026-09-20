@@ -14,7 +14,7 @@ from ingestion.research_classification import (
 )
 
 
-ROSTER_DISCOVERY_VERSION = 8
+ROSTER_DISCOVERY_VERSION = 9
 _STOP_WORDS = {
     "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
     "technique", "techniques", "method", "methods", "study", "studies",
@@ -153,12 +153,17 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                 combined = min(100.0, evidence[0]["score"] + min(15, 3 * (len(evidence) - 1)))
                 ranked.append((combined, professor_id, evidence, "PAPER", "", ""))
 
-            # Verified professors with no papers may still be discoverable from
-            # official-profile interests. These matches stay lower-ranked and
-            # are explicitly labeled as interest-only evidence in the UI.
+            # Professor-level research profiles are the fast discovery layer.
+            # They may backstop any verified professor, including professors who
+            # already have papers, but they never outrank strong direct-paper
+            # evidence. This lets explicit interests and Qwen paper-title
+            # summaries make a professor searchable before every paper has been
+            # individually categorized.
+            paper_ranked_ids = {int(item[1]) for item in ranked}
             cursor.execute(
                 """SELECT p.id AS professor_id,
-                          BOOL_OR(interest.evidence_method='AI_SUGGESTION') AS ai_generated,
+                          p.research_profile_status,
+                          p.research_profile_confidence,
                           ARRAY_AGG(interest.display_interest
                                     ORDER BY interest.confidence DESC,
                                              interest.display_interest) AS interests,
@@ -173,8 +178,9 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                      AND p.faculty_status='VERIFIED'
                      AND p.employment_status IN ('ACTIVE_CONFIRMED','EMERITUS_CONFIRMED')
                      AND institution.country_code='US'
-                     AND NOT EXISTS (
-                         SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id
+                     AND p.research_profile_status IN (
+                         'OFFICIAL_INTERESTS','PAPER_DERIVED',
+                         'BIOGRAPHY_DERIVED','MANUAL_REVIEWED'
                      )
                      AND EXISTS (
                          SELECT 1 FROM faculty_directory_memberships membership
@@ -188,20 +194,28 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                    GROUP BY p.id"""
             )
             for interest_row in cursor.fetchall():
+                professor_id = int(interest_row["professor_id"])
+                if professor_id in paper_ranked_ids:
+                    continue
                 labels = [str(value) for value in (interest_row.get("interests") or [])]
                 summary = " • ".join(dict.fromkeys(labels))
                 classification = classify_text(category, summary, "")
                 if classification["decision"] != "AUTO_ACCEPTED":
                     continue
-                # Interest evidence is useful for discovery but must never
-                # outrank direct paper evidence.
-                interest_score = min(55.0, round(
-                    float(classification["combined_score"]) * 0.58, 2
-                ))
-                if interest_row.get('ai_generated'):
-                    interest_score = min(15.0, interest_score)
+                status = str(interest_row.get("research_profile_status") or "")
+                cap = {
+                    "OFFICIAL_INTERESTS": 62.0,
+                    "MANUAL_REVIEWED": 62.0,
+                    "PAPER_DERIVED": 58.0,
+                    "BIOGRAPHY_DERIVED": 52.0,
+                }.get(status, 45.0)
+                confidence = float(interest_row.get("research_profile_confidence") or 0)
+                interest_score = min(
+                    cap,
+                    round(float(classification["combined_score"]) * (0.55 + 0.15 * confidence), 2),
+                )
                 ranked.append((
-                    interest_score, int(interest_row["professor_id"]), [],
+                    interest_score, professor_id, [],
                     "RESEARCH_INTEREST", summary,
                     str(interest_row.get("source_url") or ""),
                 ))

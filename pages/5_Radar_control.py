@@ -13,7 +13,7 @@ from radar_store import (
     save_publication_review_candidate, reject_publication_candidate,
     approve_scholar_publication_row, reject_scholar_publication_row,
     requeue_unresolved_publication_reviews,
-    save_roster_review_record,
+    save_roster_review_record, save_manual_research_profile,
 )
 from ui import configure_page, navigation
 
@@ -129,9 +129,9 @@ def live_panel() -> None:
             elif not areas and paper_area_step.get('status')=='NO_SUPPORTED_AREAS':
                 area_text = 'Verified papers reviewed — no broad research area accepted'
             elif not areas and interest_step.get('status')=='AWAITING_MODEL_REVIEW':
-                area_text = ('Interests found — awaiting Qwen review' if interest_step.get('extracted_interests')
-                             else 'Biography found — awaiting Qwen review' if interest_step.get('evidence_status')=='BIOGRAPHY_FOUND'
-                             else 'No direct interest evidence — awaiting AI suggestion review')
+                area_text = ('Biography found — awaiting Qwen review'
+                             if interest_step.get('evidence_status')=='BIOGRAPHY_FOUND'
+                             else 'Research-profile review is pending')
             elif not areas and interest_step.get('status')=='MODEL_UNAVAILABLE':
                 area_text = 'Review unavailable in this run — interests not established'
             elif not areas and interest_step.get('status')=='NO_SUPPORTED_INTERESTS':
@@ -160,11 +160,14 @@ def live_panel() -> None:
                     "supporting paper titles are retained in the audit step."
                 )
             elif interest_step.get("interests"):
-                st.caption(
-                    "Very low confidence · No direct interest found; possible research area created by AI."
-                    if interest_step.get("evidence_method") == "AI_SUGGESTION" else
-                    "Low confidence · Research areas based on website statements, not paper-level classification."
-                )
+                if interest_step.get("evidence_method") == "EXPLICIT_PROFILE_SECTION":
+                    st.caption(
+                        "High confidence · Explicit research interests found on a verified faculty, personal, or lab page."
+                    )
+                elif interest_step.get("evidence_method") == "QWEN_BIO_SUMMARY":
+                    st.caption(
+                        "Medium-low confidence · Research areas summarized from a verified subject-local biography."
+                    )
             if interest_step.get('extracted_interests') and not interest_step.get('interests'):
                 st.caption('Extracted website interests (unreviewed): '+', '.join(interest_step['extracted_interests']))
             if interest_step.get('status')=='AWAITING_MODEL_REVIEW':
@@ -341,6 +344,56 @@ if operations["roster_member_issues"]:
             st.rerun()
         except ValueError as error:
             st.error(str(error))
+if operations.get("research_profile_issues"):
+    st.markdown("**Professors needing research-profile review**")
+    st.caption(
+        "These verified professors had no explicit research-interest statement, "
+        "no usable verified publication profile, and no biography that could establish research areas."
+    )
+    profile_cases = operations["research_profile_issues"]
+    st.dataframe([{
+        "Professor": row.get("name"),
+        "University": row.get("institution_name"),
+        "Department": row.get("department") or "—",
+        "Faculty role": row.get("faculty_title") or "—",
+        "Profile": row.get("faculty_source_url") or "—",
+    } for row in profile_cases], width="stretch", hide_index=True)
+    selected_profile = st.selectbox(
+        "Research profile to review",
+        profile_cases,
+        format_func=lambda row: (
+            f"{row.get('name') or 'Unknown'} — {row.get('institution_name') or 'Unknown university'}"
+        ),
+    )
+    with st.form(f"manual_research_profile_{selected_profile['professor_id']}"):
+        primary_field = st.text_input(
+            "Primary field",
+            value=str(selected_profile.get("department") or ""),
+            help="Example: Computer Science, Communication, Mechanical Engineering",
+        )
+        interest_text = st.text_area(
+            "Research areas (one per line or comma-separated)",
+            help="Use concise research-area labels. These become staff-reviewed evidence.",
+        )
+        notes = st.text_area("Review notes", value="Manual research-profile review")
+        save_profile = st.form_submit_button("Save research profile")
+    if save_profile:
+        labels = [
+            value.strip()
+            for line in interest_text.splitlines()
+            for value in line.split(",")
+            if value.strip()
+        ]
+        try:
+            save_manual_research_profile(
+                int(user["id"]), int(selected_profile["professor_id"]),
+                primary_field=primary_field, interests=labels, notes=notes,
+            )
+            st.success("Manual research profile saved.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+
 if operations.get("publication_row_issues"):
     st.markdown("**Scholar rows needing publication review**")
     st.caption(

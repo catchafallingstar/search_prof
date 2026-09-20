@@ -16,7 +16,7 @@ from ingestion.publication_quality import REJECT as QUALITY_REJECT, scholar_publ
 
 FACULTY_VERIFICATION_VERSION = 20
 MIN_PUBLIC_FACULTY_VERIFICATION_VERSION = 20
-RADAR_DISCOVERY_VERSION = 6
+RADAR_DISCOVERY_VERSION = 9
 
 
 def _target_country_code() -> str:
@@ -1566,7 +1566,10 @@ def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
                          SELECT 1
                          FROM professor_research_interests interest
                          WHERE interest.professor_id = p.id
-                           AND interest.evidence_method = 'QWEN_PAPER_SUMMARY'
+                           AND interest.evidence_method IN (
+                               'EXPLICIT_PROFILE_SECTION',
+                               'MANUAL_REVIEW','QWEN_PAPER_SUMMARY'
+                           )
                      )
                      AND NOT EXISTS (
                          SELECT 1
@@ -1574,7 +1577,7 @@ def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
                          WHERE job.professor_id = p.id
                            AND job.job_type = 'QWEN_REVIEW_INTERESTS'
                            AND job.result_json->'interest_input'->>'mode' = 'PAPER_SUMMARY'
-                           AND job.status IN ('queued', 'running', 'completed')
+                           AND job.status IN ('queued', 'running')
                      )
                    ORDER BY p.publication_checked_at NULLS FIRST, p.id
                    LIMIT %s""",
@@ -1595,7 +1598,7 @@ def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
                          AND NULLIF(BTRIM(paper.title), '') IS NOT NULL
                        ORDER BY paper.publication_year DESC NULLS LAST,
                                 paper.id DESC
-                       LIMIT 30""",
+                       LIMIT 100""",
                     (int(professor['id']),),
                 )
                 paper_rows = [dict(row) for row in cursor.fetchall()]
@@ -1625,8 +1628,11 @@ def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
                     'year': row.get('year'),
                     'venue': str(row.get('venue') or ''),
                 }
-                for row in paper_rows
-            ],
+                for row in (
+                    paper_rows if len(paper_rows) <= 30 else
+                    [*paper_rows[:20], *(paper_rows[20:][round(i * (len(paper_rows[20:]) - 1) / 9)] for i in range(10))]
+                )
+            ][:30],
             'source_url': source_url,
             'scholar_interests': [],
         }
@@ -1809,7 +1815,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                      )
                      AND (
                          p.publication_status = 'NOT_CHECKED'
-                         OR (p.publication_discovery_version < 13
+                         OR (p.publication_discovery_version < 14
                              AND NOT EXISTS (SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id))
                      )
                      AND NOT EXISTS (
@@ -2611,6 +2617,8 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                          WHERE status='PENDING')
                       + (SELECT COUNT(*) FROM scholar_publication_review_queue
                          WHERE status='PENDING')
+                      + (SELECT COUNT(*) FROM professors
+                         WHERE research_profile_status='MANUAL_REVIEW_REQUIRED')
                     ) AS needs_staff_review,
                     (
                       (SELECT COUNT(*) FROM faculty_page_candidates
@@ -2987,6 +2995,20 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
             )
             roster_member_issues = list(cursor.fetchall())
             cursor.execute(
+                """SELECT p.id AS professor_id, p.name, p.institution_name,
+                          p.department, p.faculty_title, p.faculty_source_url,
+                          p.research_profile_primary_field,
+                          p.research_profile_source_url,
+                          p.research_profile_checked_at
+                   FROM professors p
+                   WHERE p.faculty_status='VERIFIED'
+                     AND p.research_profile_status='MANUAL_REVIEW_REQUIRED'
+                   ORDER BY p.research_profile_checked_at DESC NULLS LAST, p.id
+                   LIMIT %s""",
+                (max(1, min(250, int(limit))),),
+            )
+            research_profile_issues = list(cursor.fetchall())
+            cursor.execute(
                 """SELECT review.id, review.reason, review.evidence,
                           review.created_at, professor.id AS professor_id,
                           professor.name, professor.institution_name,
@@ -3047,11 +3069,76 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
         "directory_issues": directory_issues,
         "faculty_page_issues": faculty_page_issues,
         "roster_member_issues": roster_member_issues,
+        "research_profile_issues": research_profile_issues,
         "publication_identity_issues": publication_identity_issues,
         "publication_row_issues": publication_row_issues,
     }
 
 
+
+
+def save_manual_research_profile(
+    owner_user_id: int, professor_id: int, *, primary_field: str,
+    interests: list[str], notes: str = "",
+) -> None:
+    """Resolve a missing professor research profile with explicit staff labels."""
+    clean = [" ".join(str(value).split()) for value in interests]
+    clean = list(dict.fromkeys(value for value in clean if value))[:12]
+    field = " ".join(str(primary_field or "").split())[:120]
+    if not clean and not field:
+        raise ValueError("Enter at least one research area or a primary field.")
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """SELECT id,faculty_source_url FROM professors
+                   WHERE id=%s AND faculty_status='VERIFIED' FOR UPDATE""",
+                (professor_id,),
+            )
+            professor = cursor.fetchone()
+            if not professor:
+                raise ValueError("This verified professor no longer exists.")
+            source_url = str(professor.get("faculty_source_url") or "manual://research-profile")
+            cursor.execute(
+                "DELETE FROM professor_research_interests WHERE professor_id=%s",
+                (professor_id,),
+            )
+            for display in clean:
+                normalized = " ".join(re.findall(r"[a-z0-9]+", display.casefold()))
+                if not normalized:
+                    continue
+                cursor.execute(
+                    """INSERT INTO professor_research_interests
+                       (professor_id,display_interest,normalized_interest,
+                        evidence_method,source_url,source_excerpt,confidence)
+                       VALUES (%s,%s,%s,'MANUAL_REVIEW',%s,%s,1.0)""",
+                    (
+                        professor_id, display, normalized, source_url,
+                        (notes.strip() or "Research profile entered by site owner")[:12000],
+                    ),
+                )
+            cursor.execute(
+                """UPDATE professors SET
+                       research_profile_status='MANUAL_REVIEWED',
+                       research_profile_primary_field=%s,
+                       research_profile_source_url=%s,
+                       research_profile_confidence=1.0,
+                       research_profile_version=1,
+                       research_profile_checked_at=NOW(), updated_at=NOW()
+                   WHERE id=%s""",
+                (field or None, source_url, professor_id),
+            )
+            cursor.execute("UPDATE radar_topics SET next_refresh_at=NOW(),updated_at=NOW()")
+            cursor.execute(
+                """INSERT INTO admin_audit_log
+                   (actor_user_id,action,target_type,target_id,notes)
+                   VALUES (%s,'SAVE_MANUAL_RESEARCH_PROFILE','professor',%s,%s)""",
+                (
+                    owner_user_id, professor_id,
+                    json.dumps({"primary_field": field, "interests": clean, "notes": notes[:1000]}),
+                ),
+            )
 
 def approve_scholar_publication_row(owner_user_id: int, review_id: int) -> None:
     """Accept one staff-reviewed Scholar row and attach it as a publication."""

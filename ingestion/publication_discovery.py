@@ -84,7 +84,7 @@ NON_PROFILE_PATH = re.compile(
     r"/(?:news|events?|awards?|honors?|alumni|archive|stories?|press|jobs?)(?:/|$)",
     re.I,
 )
-PUBLICATION_DISCOVERY_VERSION = 13
+PUBLICATION_DISCOVERY_VERSION = 14
 SCHOLAR_SUFFIXES = frozenset({'com','co.uk','com.tr','de','fr','ca','com.au','co.in',
     'co.jp','com.br','es','it','nl','ch','se','no','dk','fi','at','be','pl','pt',
     'co.nz','co.za','com.mx','com.sg','com.hk','com.tw','co.kr','co.id'})
@@ -434,6 +434,128 @@ def _save_research_interests(
             cursor.execute("UPDATE radar_topics SET next_refresh_at=NOW(),updated_at=NOW()")
     return len(clean[:12])
 
+
+
+RESEARCH_PROFILE_VERSION = 1
+AUTHORITATIVE_RESEARCH_METHODS = {
+    "EXPLICIT_PROFILE_SECTION","MANUAL_REVIEW",
+    #"QWEN_VALIDATED_SECTION",  # legacy explicit-section rows
+    
+}
+
+
+def _set_research_profile_state(
+    professor_id: int, status: str, *, primary_field: str = "",
+    source_url: str = "", confidence: float = 0.0,
+) -> None:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE professors SET
+                       research_profile_status=%s,
+                       research_profile_primary_field=%s,
+                       research_profile_source_url=%s,
+                       research_profile_confidence=%s,
+                       research_profile_version=%s,
+                       research_profile_checked_at=NOW(),
+                       updated_at=NOW()
+                   WHERE id=%s""",
+                (
+                    status, primary_field.strip() or None, source_url.strip() or None,
+                    max(0.0, min(1.0, float(confidence))), RESEARCH_PROFILE_VERSION,
+                    professor_id,
+                ),
+            )
+
+
+def _research_profile_has_any_interests(professor_id: int) -> bool:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM professor_research_interests WHERE professor_id=%s LIMIT 1",
+                (professor_id,),
+            )
+            return cursor.fetchone() is not None
+
+
+def _research_profile_is_authoritative(professor_id: int) -> bool:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT 1 FROM professor_research_interests
+                   WHERE professor_id=%s AND evidence_method=ANY(%s)
+                   LIMIT 1""",
+                (professor_id, sorted(AUTHORITATIVE_RESEARCH_METHODS)),
+            )
+            return cursor.fetchone() is not None
+
+
+def _save_explicit_research_interests(
+    professor_id: int, professor: dict[str, Any],
+    explicit: list[tuple[list[str], str, str]], steps: list[dict[str, Any]],
+) -> int:
+    """Save explicit page statements directly; no model review is required."""
+    first_by_label: dict[str, tuple[str, str, str]] = {}
+    for interests, source_url, excerpt in explicit:
+        for display in interests:
+            normalized = _normalize_interest(display)
+            if normalized and normalized not in first_by_label:
+                first_by_label[normalized] = (display.strip(), source_url, excerpt)
+    if not first_by_label:
+        return 0
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM professor_research_interests WHERE professor_id=%s",
+                (professor_id,),
+            )
+            for normalized, (display, source_url, excerpt) in list(first_by_label.items())[:12]:
+                cursor.execute(
+                    """INSERT INTO professor_research_interests
+                       (professor_id,display_interest,normalized_interest,
+                        evidence_method,source_url,source_excerpt,confidence)
+                       VALUES (%s,%s,%s,'EXPLICIT_PROFILE_SECTION',%s,%s,0.95)""",
+                    (professor_id, display, normalized, source_url, excerpt[:12000]),
+                )
+            cursor.execute("UPDATE radar_topics SET next_refresh_at=NOW(),updated_at=NOW()")
+
+    first_source = next(iter(first_by_label.values()))[1]
+    _set_research_profile_state(
+        professor_id, "OFFICIAL_INTERESTS",
+        primary_field=str(professor.get("department") or ""),
+        source_url=first_source, confidence=0.95,
+    )
+    labels = [value[0] for value in first_by_label.values()][:12]
+    steps.append({
+        "step": "RESEARCH_INTERESTS",
+        "status": "EXPLICIT_INTERESTS_SAVED",
+        "evidence_status": "EXPLICIT_INTERESTS_FOUND",
+        "evidence_method": "EXPLICIT_PROFILE_SECTION",
+        "confidence": "High",
+        "interests": labels,
+        "interests_saved": len(labels),
+        "source_url": first_source,
+        "reason": "Explicit research-interest statement saved directly from a verified professor-related page.",
+    })
+    return len(labels)
+
+
+def _mark_research_profile_manual_review(
+    professor_id: int, steps: list[dict[str, Any]], *, reason: str,
+    source_url: str = "",
+) -> None:
+    if _research_profile_has_any_interests(professor_id):
+        return
+    _set_research_profile_state(
+        professor_id, "MANUAL_REVIEW_REQUIRED", source_url=source_url, confidence=0.0,
+    )
+    steps.append({
+        "step": "RESEARCH_PROFILE",
+        "status": "MANUAL_REVIEW_REQUIRED",
+        "source_url": source_url,
+        "reason": reason,
+    })
 
 def _publication_search(query: str, max_results: int) -> list[dict[str, Any]]:
     """Wait through one normal DDGS slot; treat unrelated results as empty."""
@@ -1318,16 +1440,27 @@ def _queue_linked_scholar_review(professor_id: int, urls: list[str],
         })
 
 def _paper_summary_payload(papers: list[Publication]) -> list[dict[str, Any]]:
-    """Keep a bounded, auditable set of representative verified papers."""
+    """Use recent work plus older career evidence without flooding Qwen."""
     ordered = sorted(
-        papers,
+        [paper for paper in papers if paper.title.strip()],
         key=lambda paper: (paper.year or 0, paper.title.casefold()),
         reverse=True,
     )
+    if len(ordered) <= 30:
+        selected = ordered
+    else:
+        recent = ordered[:20]
+        older = ordered[20:]
+        # Ten evenly spread older papers preserve established areas without
+        # letting a long publication history dominate the context window.
+        positions = {
+            round(index * (len(older) - 1) / 9)
+            for index in range(10)
+        }
+        selected = [*recent, *(older[index] for index in sorted(positions))]
     return [
         {"title": paper.title, "year": paper.year, "venue": paper.venue}
-        for paper in ordered[:30]
-        if paper.title.strip()
+        for paper in selected[:30]
     ]
 
 
@@ -1363,8 +1496,13 @@ def _store_paper_research_summary(
             method="QWEN_PAPER_SUMMARY",
             source_url=source_url,
             source_excerpt="\n".join(excerpt_parts),
-            confidence=0.65,
-            replace_all=False,
+            confidence=0.70,
+            replace_all=True,
+        )
+        _set_research_profile_state(
+            professor_id, "PAPER_DERIVED",
+            primary_field=str(review.data.get("primary_field") or ""),
+            source_url=source_url, confidence=0.70,
         )
 
     # Network/model outages can be retried later from saved evidence. Malformed
@@ -1390,6 +1528,19 @@ def _store_paper_research_summary(
             delay_seconds=300,
         )
         job_id = job["id"]
+
+    if pending and not _research_profile_has_any_interests(professor_id):
+        _set_research_profile_state(
+            professor_id, "AWAITING_MODEL", source_url=source_url, confidence=0.0,
+        )
+    elif manual_review and not _research_profile_has_any_interests(professor_id):
+        _set_research_profile_state(
+            professor_id, "MANUAL_REVIEW_REQUIRED", source_url=source_url, confidence=0.0,
+        )
+    elif review.status == "VALID" and not count and not _research_profile_has_any_interests(professor_id):
+        _set_research_profile_state(
+            professor_id, "MANUAL_REVIEW_REQUIRED", source_url=source_url, confidence=0.0,
+        )
 
     steps.append({
         "step": "PAPER_RESEARCH_AREAS",
@@ -1424,62 +1575,96 @@ def _store_interest_fallback(
     steps: list[dict[str, Any]],
     *, queue_on_failure: bool = True,
 ) -> None:
-    """Review explicit evidence or generate clearly labeled AI suggestions."""
-    supplied, source_url, source_text = (
-        explicit[0] if explicit else ([], biography_url, biography_text)
-    )
-    speculative = not source_text.strip()
+    """Use biography only when no explicit interests or verified papers exist."""
+    if explicit:
+        _save_explicit_research_interests(professor_id, professor, explicit, steps)
+        return
+    if not biography_text.strip():
+        _mark_research_profile_manual_review(
+            professor_id, steps,
+            reason="No explicit research interests, verified papers, or usable biography were found.",
+            source_url=biography_url,
+        )
+        return
+
     review = review_research_interest_summary(
-        source_record_key=f"{professor_id}:{source_url}",
+        source_record_key=f"{professor_id}:{biography_url}:biography",
         institution_id=int(professor["institution_id"]),
         professor_name=str(professor["name"]),
         institution=str(professor["institution_name"]),
         department=str(professor.get("department") or ""),
-        biography_text=source_text,
-        explicit_interests=supplied,
-        speculative=speculative,
+        biography_text=biography_text,
+        explicit_interests=[],
+        speculative=False,
     )
     labels = review.data.get("research_interests") if review.status == "VALID" else []
     labels = [str(value).strip() for value in labels or [] if str(value).strip()]
     count = 0
     if labels:
-        # Confidence is a product policy, never the model's self-assessment.
-        confidence = 0.15 if speculative else 0.45
         count = _save_research_interests(
             professor_id, labels,
-            method=("AI_SUGGESTION" if speculative else
-                    "QWEN_VALIDATED_SECTION" if supplied else "QWEN_BIO_SUMMARY"),
-            source_url=source_url,
-            source_excerpt=(source_text if not speculative else
-                            "No direct evidence; supplied department: "
-                            + str(professor.get("department") or "Not stated")),
-            confidence=confidence,
+            method="QWEN_BIO_SUMMARY",
+            source_url=biography_url,
+            source_excerpt=biography_text,
+            confidence=0.55,
+            replace_all=True,
         )
+        _set_research_profile_state(
+            professor_id, "BIOGRAPHY_DERIVED",
+            primary_field=str(review.data.get("primary_field") or ""),
+            source_url=biography_url, confidence=0.55,
+        )
+
     pending = review.status in {'MODEL_UNAVAILABLE','MODEL_COOLDOWN','DISABLED'}
     job_id = None
     if pending and queue_on_failure:
         from radar_store import enqueue_radar_job
-        payload = {'professor': {k:professor.get(k) for k in ('name','institution_id','institution_name','department')},
-                   'explicit':explicit,'biography_text':biography_text,'biography_url':biography_url}
-        job = enqueue_radar_job('QWEN_REVIEW_INTERESTS',professor_id=professor_id,priority=60,max_attempts=3,
-                                initial_result={'interest_input':payload},delay_seconds=300)
+        payload = {
+            'mode': 'BIOGRAPHY_SUMMARY',
+            'professor': {k: professor.get(k) for k in
+                          ('name','institution_id','institution_name','department')},
+            'explicit': [],
+            'biography_text': biography_text,
+            'biography_url': biography_url,
+        }
+        job = enqueue_radar_job(
+            'QWEN_REVIEW_INTERESTS', professor_id=professor_id,
+            priority=60, max_attempts=3,
+            initial_result={'interest_input':payload}, delay_seconds=300,
+        )
         job_id = job['id']
+
+    if pending and not _research_profile_has_any_interests(professor_id):
+        _set_research_profile_state(
+            professor_id, "AWAITING_MODEL", source_url=biography_url, confidence=0.0,
+        )
+    elif review.status in {'INVALID_RESPONSE','INVALID_EVIDENCE'} and not _research_profile_has_any_interests(professor_id):
+        _set_research_profile_state(
+            professor_id, "MANUAL_REVIEW_REQUIRED", source_url=biography_url, confidence=0.0,
+        )
+    elif review.status == 'VALID' and not count and not _research_profile_has_any_interests(professor_id):
+        _set_research_profile_state(
+            professor_id, "MANUAL_REVIEW_REQUIRED", source_url=biography_url, confidence=0.0,
+        )
+
     steps.append({
         "step": "RESEARCH_INTERESTS",
-        "status": (("AI_SUGGESTED" if speculative else "QWEN_REVIEWED") if count
-                   else 'AWAITING_MODEL_REVIEW' if pending else "NO_SUPPORTED_INTERESTS" if review.status == "VALID" else review.status),
-        'model_status':review.status,
-        'evidence_status':'EXPLICIT_INTERESTS_FOUND' if supplied else 'BIOGRAPHY_FOUND' if source_text.strip() else 'NO_DIRECT_INTEREST_EVIDENCE',
-        'extracted_interests':supplied,
-        'review_job_id':job_id,
-        "source_url": source_url,
-        "evidence_method": "AI_SUGGESTION" if speculative else "WEBSITE_INTERESTS",
-        "confidence": "Very low" if speculative else "Low",
+        "status": ("QWEN_REVIEWED" if count else
+                   'AWAITING_MODEL_REVIEW' if pending else
+                   'REVIEW_REQUIRED' if review.status in {'INVALID_RESPONSE','INVALID_EVIDENCE'} else
+                   "NO_SUPPORTED_INTERESTS" if review.status == "VALID" else review.status),
+        'model_status': review.status,
+        'evidence_status': 'BIOGRAPHY_FOUND',
+        'extracted_interests': [],
+        'review_job_id': job_id,
+        "source_url": biography_url,
+        "evidence_method": "QWEN_BIO_SUMMARY",
+        "confidence": "Medium-low",
         "interests": labels[:12] if count else [],
         "interests_saved": count,
         "reason": (str(review.data.get("basis_summary") or "") if count
-                   else 'Awaiting Qwen; saved evidence will be retried without repeating publication searches.' if pending
-                   else "Qwen did not return validated research interests."),
+                   else 'Awaiting Qwen; saved biography will be retried without repeating publication searches.' if pending
+                   else "Biography did not yield a sufficiently grounded research profile."),
     })
 
 
@@ -1703,6 +1888,10 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
                         explicit_interests.append(
                             (interests, str(linked.url), interest_excerpt)
                         )
+                    linked_biography = extract_biography_text(linked.text)
+                    if linked_biography and len(linked_biography) > len(biography_text):
+                        biography_text = linked_biography
+                        biography_url = str(linked.url)
                     steps.append({"step": kind, "status": "CHECKED",
                                   "source_url": str(linked.url),
                                   "papers_found": len(found)})
@@ -1723,12 +1912,14 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
             [u for u in linked_site_scholar_urls if _scholar_profile_key(u) not in {_scholar_profile_key(v) for v in official_scholar_urls}],
             steps, discovered_by='LINKED_RESEARCH_PAGE')
         if explicit_interests:
-            _store_interest_fallback(professor_id, professor, explicit_interests,
-                                     biography_text, biography_url, steps)
-        _store_paper_research_summary(
-            professor_id, dict(professor), papers,
-            papers[0].source_url or profile_url, steps,
-        )
+            _save_explicit_research_interests(
+                professor_id, dict(professor), explicit_interests, steps
+            )
+        elif not _research_profile_is_authoritative(professor_id):
+            _store_paper_research_summary(
+                professor_id, dict(professor), papers,
+                papers[0].source_url or profile_url, steps,
+            )
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                       "papers_found": len(papers), "papers_imported": imported,
                       "papers_already_linked": len(papers)-imported})
@@ -1777,6 +1968,10 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
                 explicit_interests.append(
                     (interests, str(response.url), interest_excerpt)
                 )
+            alternate_biography = extract_biography_text(response.text)
+            if alternate_biography and len(alternate_biography) > len(biography_text):
+                biography_text = alternate_biography
+                biography_url = str(response.url)
             steps.append({"step": "ALTERNATE_OFFICIAL_PROFILE",
                           "status": "VERIFIED", "source_url": str(response.url),
                           "papers_found": len(found)})
@@ -1798,24 +1993,28 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
             [u for u in linked_site_scholar_urls if _scholar_profile_key(u) not in {_scholar_profile_key(v) for v in official_scholar_urls}],
             steps, discovered_by='LINKED_RESEARCH_PAGE')
         if explicit_interests:
-            _store_interest_fallback(
-                professor_id, dict(professor), explicit_interests,
-                biography_text, biography_url, steps,
+            _save_explicit_research_interests(
+                professor_id, dict(professor), explicit_interests, steps
             )
-        _store_paper_research_summary(
-            professor_id, dict(professor), papers,
-            papers[0].source_url or profile_url, steps,
-        )
+        elif not _research_profile_is_authoritative(professor_id):
+            _store_paper_research_summary(
+                professor_id, dict(professor), papers,
+                papers[0].source_url or profile_url, steps,
+            )
         steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
                       "papers_found": len(papers), "papers_imported": imported,
                       "papers_already_linked": len(papers)-imported})
         return {"status": "OFFICIAL_PUBLICATIONS_FOUND",
                 "papers_found": len(papers), "papers_imported": imported,
                 "steps": steps}
-    _store_interest_fallback(
-        professor_id, dict(professor), explicit_interests,
-        biography_text, biography_url, steps,
-    )
+    if explicit_interests:
+        _save_explicit_research_interests(
+            professor_id, dict(professor), explicit_interests, steps
+        )
+    elif biography_text.strip():
+        _store_interest_fallback(
+            professor_id, dict(professor), [], biography_text, biography_url, steps
+        )
     for url in official_scholar_urls:
         _record_source(professor_id, "GOOGLE_SCHOLAR", url, "QWEN_QUEUED", {
             "discovered_by": "OFFICIAL_PROFILE_LINK",
@@ -1843,6 +2042,12 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
     if not urls:
         steps.append({"step": "QWEN_SCHOLAR_REVIEW", "status": "NOT_RUN",
                       "reason": "No Google Scholar profile candidate was returned"})
+        if not _research_profile_has_any_interests(professor_id):
+            _mark_research_profile_manual_review(
+                professor_id, steps,
+                reason="No explicit research interests, verified papers, usable biography, or Scholar publication candidate was found.",
+                source_url=profile_url,
+            )
         _status(professor_id, "NO_PUBLICATIONS_FOUND")
         return {"status": "NO_PUBLICATIONS_FOUND", "papers_found": 0,
                 "papers_imported": 0, "steps": steps}
@@ -1854,6 +2059,10 @@ def discover_faculty_publications(professor_id: int, *, progress_callback: Calla
             "verified": False,
         })
     _status(professor_id, "SCHOLAR_REVIEW_QUEUED")
+    if not _research_profile_has_any_interests(professor_id):
+        _set_research_profile_state(
+            professor_id, "AWAITING_PUBLICATIONS", source_url=profile_url, confidence=0.0,
+        )
     steps.append({"step": "QWEN_SCHOLAR_REVIEW", "status": "QUEUED",
                   "reason": "Candidate identity review is handled by the serialized Qwen queue."})
     return {"status": "SCHOLAR_REVIEW_QUEUED", "papers_found": 0,
@@ -2099,13 +2308,24 @@ def review_queued_scholar_candidates(
                 )
                 _status(professor_id, publication_value)
                 _dismiss_resolved_scholar_reviews(professor_id)
-                if scholar_papers:
+                if scholar_papers and not _research_profile_is_authoritative(professor_id):
                     _store_paper_research_summary(
                         professor_id, dict(professor), scholar_papers, url, steps,
                         scholar_interests=[
                             str(value) for value in scholar.get("research_interests") or []
                         ],
                     )
+                elif not scholar_papers and not _research_profile_has_any_interests(professor_id):
+                    if filter_audit["review_required_rows"]:
+                        _set_research_profile_state(
+                            professor_id, "AWAITING_PUBLICATIONS", source_url=url, confidence=0.0,
+                        )
+                    else:
+                        _mark_research_profile_manual_review(
+                            professor_id, steps,
+                            reason="Scholar identity was verified but no usable publication rows or other research-profile evidence remained.",
+                            source_url=url,
+                        )
                 steps.append({
                     "step": "PAPER_IMPORT",
                     "status": "COMPLETED",

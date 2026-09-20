@@ -547,7 +547,92 @@ CREATE INDEX IF NOT EXISTS professor_research_interests_professor_idx
 ALTER TABLE professor_research_interests DROP CONSTRAINT IF EXISTS professor_research_interests_evidence_method_check;
 ALTER TABLE professor_research_interests ADD CONSTRAINT professor_research_interests_evidence_method_check
     CHECK (evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY',
-                              'QWEN_VALIDATED_SECTION','AI_SUGGESTION','QWEN_PAPER_SUMMARY'));
+                              'QWEN_VALIDATED_SECTION','QWEN_PAPER_SUMMARY','MANUAL_REVIEW'));
+
+-- A professor-level research profile is the fast discovery layer. It is built
+-- from explicit website interests first, then verified paper titles, then a
+-- subject-local biography. Unsupported department-only guesses are forbidden.
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS research_profile_status TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS research_profile_primary_field TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS research_profile_source_url TEXT;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS research_profile_confidence NUMERIC(4,3) NOT NULL DEFAULT 0;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS research_profile_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS research_profile_checked_at TIMESTAMPTZ;
+ALTER TABLE professors DROP CONSTRAINT IF EXISTS professors_research_profile_status_check;
+ALTER TABLE professors ADD CONSTRAINT professors_research_profile_status_check CHECK (
+    research_profile_status IN (
+        'NOT_CHECKED','OFFICIAL_INTERESTS','PAPER_DERIVED','BIOGRAPHY_DERIVED',
+        'AWAITING_MODEL','AWAITING_PUBLICATIONS','MANUAL_REVIEW_REQUIRED','MANUAL_REVIEWED'
+    )
+);
+
+-- Earlier builds could create unsupported department-only AI suggestions.
+-- They are intentionally discarded so every remaining profile is grounded in
+-- an explicit page statement, a biography, verified paper titles, or staff review.
+DELETE FROM professor_research_interests WHERE evidence_method='AI_SUGGESTION';
+
+-- Legacy QWEN_VALIDATED_SECTION rows came from an older pipeline that
+-- asked Qwen to reinterpret page prose. They are retained for auditability,
+-- but they must never be treated as authoritative official-interest evidence.
+-- Mark legacy-only profiles stale so the current pipeline can rebuild them
+-- from an explicit interest section, verified paper titles, biography evidence,
+-- or staff review. Better evidence below will immediately promote the profile.
+UPDATE professors p
+SET research_profile_status='NOT_CHECKED',
+    research_profile_primary_field=NULL,
+    research_profile_source_url=NULL,
+    research_profile_confidence=0,
+    research_profile_version=0,
+    research_profile_checked_at=NULL,
+    updated_at=NOW()
+WHERE EXISTS (
+    SELECT 1 FROM professor_research_interests i
+    WHERE i.professor_id=p.id
+      AND i.evidence_method='QWEN_VALIDATED_SECTION'
+)
+  AND NOT EXISTS (
+    SELECT 1 FROM professor_research_interests i
+    WHERE i.professor_id=p.id
+      AND i.evidence_method IN ('EXPLICIT_PROFILE_SECTION','MANUAL_REVIEW')
+);
+
+UPDATE professors p
+SET research_profile_status='MANUAL_REVIEWED', research_profile_confidence=1.0,
+    research_profile_version=1, research_profile_checked_at=NOW()
+WHERE EXISTS (
+    SELECT 1 FROM professor_research_interests i
+    WHERE i.professor_id=p.id AND i.evidence_method='MANUAL_REVIEW'
+);
+UPDATE professors p
+SET research_profile_status='OFFICIAL_INTERESTS', research_profile_confidence=0.95,
+    research_profile_version=1, research_profile_checked_at=NOW()
+WHERE research_profile_status <> 'MANUAL_REVIEWED'
+  AND EXISTS (
+    SELECT 1 FROM professor_research_interests i
+    WHERE i.professor_id=p.id
+      AND i.evidence_method='EXPLICIT_PROFILE_SECTION'
+);
+UPDATE professors p
+SET research_profile_status='PAPER_DERIVED', research_profile_confidence=0.70,
+    research_profile_version=1, research_profile_checked_at=NOW()
+WHERE research_profile_status NOT IN ('MANUAL_REVIEWED','OFFICIAL_INTERESTS')
+  AND EXISTS (
+    SELECT 1 FROM professor_research_interests i
+    WHERE i.professor_id=p.id AND i.evidence_method='QWEN_PAPER_SUMMARY'
+);
+UPDATE professors p
+SET research_profile_status='BIOGRAPHY_DERIVED', research_profile_confidence=0.55,
+    research_profile_version=1, research_profile_checked_at=NOW()
+WHERE research_profile_status NOT IN (
+        'MANUAL_REVIEWED','OFFICIAL_INTERESTS','PAPER_DERIVED'
+      )
+  AND EXISTS (
+    SELECT 1 FROM professor_research_interests i
+    WHERE i.professor_id=p.id AND i.evidence_method='QWEN_BIO_SUMMARY'
+);
+CREATE INDEX IF NOT EXISTS professors_research_profile_status_idx
+    ON professors (research_profile_status, research_profile_checked_at DESC);
+
 ALTER TABLE roster_member_candidates ADD COLUMN IF NOT EXISTS staff_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS program_admission_requirements (

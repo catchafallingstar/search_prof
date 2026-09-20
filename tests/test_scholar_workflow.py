@@ -101,6 +101,10 @@ def setup_review(monkeypatch, *, official=True, affiliation="Example University"
     monkeypatch.setattr(pub,'_dismiss_resolved_scholar_reviews',lambda _:None)
     monkeypatch.setattr(pub,'_scholar_manual_decisions',lambda *args,**kwargs:{})
     monkeypatch.setattr(pub,'_sync_scholar_publication_review_queue',lambda *args,**kwargs:None)
+    monkeypatch.setattr(pub,'_research_profile_is_authoritative',lambda *args,**kwargs:False)
+    monkeypatch.setattr(pub,'_research_profile_has_any_interests',lambda *args,**kwargs:False)
+    monkeypatch.setattr(pub,'_set_research_profile_state',lambda *args,**kwargs:None)
+    monkeypatch.setattr(pub,'_mark_research_profile_manual_review',lambda *args,**kwargs:None)
     if suppress_paper_summary:
         monkeypatch.setattr(pub,'_store_paper_research_summary',lambda *args,**kwargs:None)
     scholar=dict(name='Jane Smith',affiliation=affiliation,verified_email='',homepage='',

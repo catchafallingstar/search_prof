@@ -114,6 +114,7 @@ def test_paper_research_summary_requires_exact_supporting_titles(monkeypatch) ->
         lambda **kwargs: OllamaReview(
             "VALID",
             {
+                "primary_field": "Biomedical Engineering",
                 "research_areas": [
                     {
                         "label": "Biomedical signal processing",
@@ -138,6 +139,7 @@ def test_paper_research_summary_requires_exact_supporting_titles(monkeypatch) ->
         ],
     )
     assert review.status == "VALID"
+    assert review.data["primary_field"] == "Biomedical Engineering"
     assert review.data["research_interests"] == ["Biomedical signal processing"]
 
 
@@ -213,6 +215,8 @@ def test_paper_research_invalid_json_routes_to_staff_review(monkeypatch) -> None
             "INVALID_RESPONSE", {}, ("JSON_RETRY_EXHAUSTED",)
         ),
     )
+    monkeypatch.setattr(publications, "_research_profile_has_any_interests", lambda _pid: False)
+    monkeypatch.setattr(publications, "_set_research_profile_state", lambda *args, **kwargs: None)
     steps = []
     publications._store_paper_research_summary(
         1,
@@ -321,3 +325,18 @@ def test_scholar_publication_filter_requires_one_decision_per_row(monkeypatch) -
     )
     assert review.status == "INVALID_EVIDENCE"
     assert any("exactly one decision" in error for error in review.errors)
+
+
+def test_department_only_research_guessing_is_disabled() -> None:
+    review = ollama_evidence.review_research_interest_summary(
+        source_record_key="bio:none",
+        institution_id=1,
+        professor_name="Jane Smith",
+        institution="Example University",
+        department="Computer Science",
+        biography_text="",
+        explicit_interests=[],
+        speculative=True,
+    )
+    assert review.status == "INVALID_EVIDENCE"
+    assert any("department-only" in error for error in review.errors)
