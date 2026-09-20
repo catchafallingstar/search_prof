@@ -333,19 +333,67 @@ def _section_after_heading(heading: Any, *, max_chars: int = 8000) -> str:
 
 
 def _interest_labels(section_text: str) -> list[str]:
-    """Normalize explicit labels while refusing long prose as a field name."""
+    """Extract only compact explicit research-interest labels.
+
+    Long narrative prose, contact information, addresses, advising text, and
+    demographic phrases must not be converted into research-area labels.
+    Narrative Research Interests sections can fall through to the grounded
+    biography/paper-summary pipeline instead.
+    """
     values: list[str] = []
-    for line in section_text.splitlines():
+
+    contact_or_address = re.compile(
+        r"(?:"
+        r"\b(?:contact|phone|fax|office|advising|email)\b|"
+        r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b|"
+        r"\b\d{5}(?:-\d{4})?\b|"
+        r"\b(?:street|st\.?|road|rd\.?|avenue|ave\.?|boulevard|blvd\.?|"
+        r"drive|dr\.?|lane|ln\.?|highway|hwy\.?|room|building)\b"
+        r")",
+        re.I,
+    )
+
+    for raw_line in section_text.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+
+        # Never interpret obvious contact/address material as a research area.
+        if contact_or_address.search(line):
+            continue
+
+        # Bullets, semicolons, and pipes are strong list delimiters.
         chunks = re.split(r"\s*[;•|]\s*", line)
-        if len(chunks) == 1 and 1 <= line.count(",") <= 7:
+
+        # A comma-separated line is accepted as a list only when it looks like
+        # a compact label list rather than ordinary narrative prose.
+        if (
+            len(chunks) == 1
+            and 1 <= line.count(",") <= 7
+            and len(line) <= 180
+            and len(line.split()) <= 24
+            and not re.search(r"[.!?]", line)
+        ):
             chunks = [part.strip() for part in line.split(",")]
+
         for chunk in chunks:
             value = " ".join(chunk.strip(" .:;-–—").split())
             words = value.split()
+
+            if not value:
+                continue
             if NON_RESEARCH_INTEREST_LABEL.fullmatch(value):
                 continue
+            if contact_or_address.search(value):
+                continue
+
+            # Fragments created from prose are not standalone fields.
+            if re.match(r"^(?:and|or|including|such as|among|with|for)\b", value, re.I):
+                continue
+
             if 2 <= len(value) <= 80 and 1 <= len(words) <= 8:
                 values.append(value)
+
     return list(dict.fromkeys(values))[:12]
 
 
@@ -436,11 +484,10 @@ def _save_research_interests(
 
 
 
-RESEARCH_PROFILE_VERSION = 1
+RESEARCH_PROFILE_VERSION = 2
 AUTHORITATIVE_RESEARCH_METHODS = {
-    "EXPLICIT_PROFILE_SECTION","MANUAL_REVIEW",
-    #"QWEN_VALIDATED_SECTION",  # legacy explicit-section rows
-    
+    "EXPLICIT_PROFILE_SECTION",
+    "MANUAL_REVIEW",
 }
 
 
@@ -469,23 +516,42 @@ def _set_research_profile_state(
 
 
 def _research_profile_has_any_interests(professor_id: int) -> bool:
+    """Return whether the professor has interests from the current profile build.
+
+    Old interest rows are intentionally retained until a replacement succeeds,
+    but they must not make a stale professor look complete or block review state.
+    """
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT 1 FROM professor_research_interests WHERE professor_id=%s LIMIT 1",
-                (professor_id,),
+                """SELECT 1
+                   FROM professor_research_interests interest
+                   JOIN professors p ON p.id=interest.professor_id
+                   WHERE interest.professor_id=%s
+                     AND p.research_profile_version >= %s
+                   LIMIT 1""",
+                (professor_id, RESEARCH_PROFILE_VERSION),
             )
             return cursor.fetchone() is not None
 
 
 def _research_profile_is_authoritative(professor_id: int) -> bool:
+    """Trust explicit/manual evidence only when built by the current profile version."""
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """SELECT 1 FROM professor_research_interests
-                   WHERE professor_id=%s AND evidence_method=ANY(%s)
+                """SELECT 1
+                   FROM professor_research_interests interest
+                   JOIN professors p ON p.id=interest.professor_id
+                   WHERE interest.professor_id=%s
+                     AND interest.evidence_method=ANY(%s)
+                     AND p.research_profile_version >= %s
                    LIMIT 1""",
-                (professor_id, sorted(AUTHORITATIVE_RESEARCH_METHODS)),
+                (
+                    professor_id,
+                    sorted(AUTHORITATIVE_RESEARCH_METHODS),
+                    RESEARCH_PROFILE_VERSION,
+                ),
             )
             return cursor.fetchone() is not None
 

@@ -1,69 +1,107 @@
-ScholarRadar fast professor research-profile fallback
-Built from catchafallingstar/search_prof current main on 2026-09-20.
+ScholarRadar research-profile v2 fix — 2026-09-20
+=================================================
 
-CHANGED PRODUCTION FILES
-- db.sql
-- radar_store.py
-- pages/5_Radar_control.py
-- ingestion/publication_discovery.py
-- ingestion/ollama_evidence.py
-- ingestion/roster_topic_index.py
+What this fixes
+---------------
+1. Old v1 professor research profiles can no longer block a new v2 rebuild.
+2. Old/stale profile rows are excluded from professor-profile search until a
+   successful v2 replacement is written.
+3. `make schema` no longer promotes old automatic EXPLICIT_PROFILE_SECTION,
+   QWEN_PAPER_SUMMARY, or QWEN_BIO_SUMMARY rows to the current version.
+4. Manual staff-reviewed profiles are trusted and promoted to v2.
+5. Maintenance automatically queues MATCH_FACULTY_PUBLICATIONS for verified
+   professors whose research_profile_version is older than v2.
+6. The explicit-interest parser rejects narrative prose, demographic fragments,
+   contact information, addresses, phone numbers, and advising text.
+7. Existing paper-research-v4 partial acceptance remains included: valid research
+   areas survive even if another proposed area has invalid exact-title support.
 
-CHANGED/NEW TESTS
-- tests/test_ollama_evidence.py
-- tests/test_scholar_workflow.py
-- tests/test_research_profile_fallback.py (new)
+Files to replace
+----------------
+db.sql
+radar_store.py
+ingestion/publication_discovery.py
+ingestion/ollama_evidence.py
+ingestion/roster_topic_index.py
+tests/test_faculty_publications.py
+tests/test_research_profile_fallback.py
+tests/test_ollama_evidence.py
 
-NEW RESEARCH-PROFILE ORDER
-1. Explicit research interests on verified faculty/personal/lab pages -> save directly.
-2. Otherwise verified paper titles -> Qwen professor research profile.
-3. Otherwise usable biography -> Qwen biography profile.
-4. Otherwise -> MANUAL_REVIEW_REQUIRED.
-
-Notes:
-- Unsupported department-only AI suggestions are removed/disabled.
-- If a Scholar candidate is still pending and there is no other evidence, the
-  profile waits in AWAITING_PUBLICATIONS rather than creating a premature manual case.
-- Paper-title summaries use up to 30 representative papers: 20 newest plus up
-  to 10 spread across older work.
-- Direct paper evidence still outranks professor-profile evidence in topic search.
-- Professor profiles may now backstop topic search even when a professor already
-  has papers, so weak per-paper categorization no longer blocks discovery.
-
-EXISTING DATA MIGRATION
-- Existing EXPLICIT_PROFILE_SECTION / legacy QWEN_VALIDATED_SECTION rows become
-  OFFICIAL_INTERESTS profiles.
-- Existing QWEN_PAPER_SUMMARY rows become PAPER_DERIVED profiles.
-- Existing QWEN_BIO_SUMMARY rows become BIOGRAPHY_DERIVED profiles.
-- Existing AI_SUGGESTION rows are deleted because they were unsupported
-  department-only guesses.
-- Publication discovery version is bumped to 14. Verified professors with no
-  papers are eligible for a new bounded page/profile pass so the new fallback
-  logic can run.
-- Topic discovery version is bumped to 9 so research-profile-backed matching is
-  reflected in rebuilt topic indexes.
-
-APPLY
-1. Replace the files above with these complete files.
-2. Apply the idempotent schema:
+Apply
+-----
+1. Stop `make start` with Ctrl+C if it is running.
+2. Replace the files above, preserving their project paths.
+3. From the project root run:
 
    make schema
 
-3. Run focused tests:
+4. Verify syntax:
+
+   .venv/bin/python -m py_compile \
+     ingestion/publication_discovery.py \
+     ingestion/ollama_evidence.py \
+     ingestion/roster_topic_index.py \
+     radar_store.py
+
+5. Run focused tests:
 
    .venv/bin/python -m pytest -q \
+     tests/test_faculty_publications.py \
      tests/test_research_profile_fallback.py \
      tests/test_ollama_evidence.py \
      tests/test_scholar_workflow.py \
      tests/test_search_scheduling.py \
      tests/test_research_classification.py
 
-4. Queue topic rebuilds for the new professor-profile fallback:
+Expected on the packaged source: 93 focused tests pass.
 
-   make rebuild-topics
+Fast canary check
+-----------------
+After `make schema`, old automatic v1 profiles are intentionally stale. Search
+will not use them until rebuilt. You do not need to wait for thousands of jobs.
+Queue Erica, Anis, and Haluk at high priority and process only three jobs:
 
-5. Start normally:
+.venv/bin/python - <<'PY'
+from db import get_db_connection
+from radar_store import enqueue_radar_job
+
+names = ["Erica Austin", "Haluk Beyenal", "Anis Allagui"]
+with get_db_connection() as connection:
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT id, name
+            FROM professors
+            WHERE name = ANY(%s)
+            ORDER BY name
+        """, (names,))
+        professors = cursor.fetchall()
+
+for professor in professors:
+    job = enqueue_radar_job(
+        "MATCH_FACULTY_PUBLICATIONS",
+        professor_id=int(professor["id"]),
+        priority=300,
+        max_attempts=5,
+    )
+    print(professor["id"], professor["name"], job["id"])
+PY
+
+.venv/bin/python -m scripts.run_worker --max-jobs 3 --poll-seconds 0.25
+
+Expected canary behavior
+------------------------
+- Erica: old `adolescents` / `adults and families` v1 explicit rows do not block
+  rebuilding. If the corrected parser finds no compact explicit list, her stored
+  papers can drive QWEN_PAPER_SUMMARY.
+- Anis: address/phone/advising text must not appear as research interests.
+- Haluk: paper-research-v4 keeps independently valid areas and records warnings
+  for bad supporting-title proposals rather than rejecting the whole profile.
+
+Normal operation
+----------------
+After the canaries look good:
 
    make start
 
-Do not run `make worker` at the same time as `make start` in the normal local setup.
+Maintenance will automatically prioritize stale research-profile rebuilds via
+MATCH_FACULTY_PUBLICATIONS. Existing ENRICH_CLASSIFY_PAPER jobs can stay queued.

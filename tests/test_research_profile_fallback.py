@@ -4,6 +4,10 @@ from ingestion import publication_discovery as pub
 from ingestion.ollama_evidence import OllamaReview
 
 
+def test_research_profile_version_is_current():
+    assert pub.RESEARCH_PROFILE_VERSION == 2
+
+
 def professor():
     return {
         "name": "Jane Smith",

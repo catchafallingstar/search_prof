@@ -15,6 +15,7 @@ from ingestion.research_classification import (
 
 
 ROSTER_DISCOVERY_VERSION = 9
+RESEARCH_PROFILE_VERSION = 2
 _STOP_WORDS = {
     "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
     "technique", "techniques", "method", "methods", "study", "studies",
@@ -182,6 +183,7 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                          'OFFICIAL_INTERESTS','PAPER_DERIVED',
                          'BIOGRAPHY_DERIVED','MANUAL_REVIEWED'
                      )
+                     AND p.research_profile_version >= %s
                      AND EXISTS (
                          SELECT 1 FROM faculty_directory_memberships membership
                          JOIN faculty_directories directory
@@ -191,7 +193,8 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                            AND directory.active=TRUE
                            AND directory.validation_status='APPROVED'
                      )
-                   GROUP BY p.id"""
+                   GROUP BY p.id""",
+                (RESEARCH_PROFILE_VERSION,),
             )
             for interest_row in cursor.fetchall():
                 professor_id = int(interest_row["professor_id"])

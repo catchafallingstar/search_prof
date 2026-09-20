@@ -17,6 +17,7 @@ from ingestion.publication_quality import REJECT as QUALITY_REJECT, scholar_publ
 FACULTY_VERIFICATION_VERSION = 20
 MIN_PUBLIC_FACULTY_VERIFICATION_VERSION = 20
 RADAR_DISCOVERY_VERSION = 9
+RESEARCH_PROFILE_VERSION = 2
 
 
 def _target_country_code() -> str:
@@ -1562,26 +1563,31 @@ def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
                            AND directory.active = TRUE
                            AND directory.validation_status = 'APPROVED'
                      )
-                     AND NOT EXISTS (
-                         SELECT 1
-                         FROM professor_research_interests interest
-                         WHERE interest.professor_id = p.id
-                           AND interest.evidence_method IN (
-                               'EXPLICIT_PROFILE_SECTION',
-                               'MANUAL_REVIEW','QWEN_PAPER_SUMMARY'
-                           )
+                     AND (
+                         p.research_profile_version < %s
+                         OR NOT EXISTS (
+                             SELECT 1
+                             FROM professor_research_interests interest
+                             WHERE interest.professor_id = p.id
+                               AND interest.evidence_method IN (
+                                   'EXPLICIT_PROFILE_SECTION',
+                                   'MANUAL_REVIEW','QWEN_PAPER_SUMMARY'
+                               )
+                         )
                      )
                      AND NOT EXISTS (
                          SELECT 1
                          FROM radar_jobs job
                          WHERE job.professor_id = p.id
-                           AND job.job_type = 'QWEN_REVIEW_INTERESTS'
-                           AND job.result_json->'interest_input'->>'mode' = 'PAPER_SUMMARY'
+                           AND job.job_type IN (
+                               'MATCH_FACULTY_PUBLICATIONS',
+                               'QWEN_REVIEW_INTERESTS'
+                           )
                            AND job.status IN ('queued', 'running')
                      )
                    ORDER BY p.publication_checked_at NULLS FIRST, p.id
                    LIMIT %s""",
-                (bounded_limit,),
+                (RESEARCH_PROFILE_VERSION, bounded_limit),
             )
             professors = [dict(row) for row in cursor.fetchall()]
 
@@ -1615,7 +1621,7 @@ def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
 
         payload = {
             'mode': 'PAPER_SUMMARY',
-            'summary_version': 1,
+            'summary_version': RESEARCH_PROFILE_VERSION,
             'professor': {
                 'name': professor.get('name'),
                 'institution_id': professor.get('institution_id'),
@@ -1817,6 +1823,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                          p.publication_status = 'NOT_CHECKED'
                          OR (p.publication_discovery_version < 14
                              AND NOT EXISTS (SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id))
+                         OR p.research_profile_version < %s
                      )
                      AND NOT EXISTS (
                          SELECT 1 FROM radar_jobs job
@@ -1826,7 +1833,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                      )
                    ORDER BY p.roster_verified_at NULLS FIRST, p.id
                    LIMIT %s""",
-                (max(1, min(100, int(limit))),),
+                (RESEARCH_PROFILE_VERSION, max(1, min(100, int(limit)))),
             )
             publication_ids = [int(row["id"]) for row in cursor.fetchall()]
     for professor_id in publication_ids:
@@ -3124,10 +3131,10 @@ def save_manual_research_profile(
                        research_profile_primary_field=%s,
                        research_profile_source_url=%s,
                        research_profile_confidence=1.0,
-                       research_profile_version=1,
+                       research_profile_version=%s,
                        research_profile_checked_at=NOW(), updated_at=NOW()
                    WHERE id=%s""",
-                (field or None, source_url, professor_id),
+                (field or None, source_url, RESEARCH_PROFILE_VERSION, professor_id),
             )
             cursor.execute("UPDATE radar_topics SET next_refresh_at=NOW(),updated_at=NOW()")
             cursor.execute(

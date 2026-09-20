@@ -15,7 +15,7 @@ from settings import setting, setting_bool, setting_int
 PROMPT_VERSION = "faculty-evidence-v1"
 PUBLICATION_PROMPT_VERSION = "publication-identity-v3"
 RESEARCH_INTEREST_PROMPT_VERSION = "research-interest-v3"
-PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v3"
+PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v4"
 SCHOLAR_PUBLICATION_FILTER_PROMPT_VERSION = "scholar-publication-filter-v1"
 ALLOWED_RECORD_TYPES = {
     "FACULTY", "EMERITUS", "ADJUNCT", "VISITING", "RESEARCH_FACULTY",
@@ -582,13 +582,35 @@ SOURCE_JSON:
 
     if not normalized_areas and areas:
         errors.append("no research areas had valid paper support")
+
     data["research_areas"] = normalized_areas
-    data["research_interests"] = [item["label"] for item in normalized_areas]
+    data["research_interests"] = [
+        item["label"] for item in normalized_areas
+    ]
     data["supporting_evidence"] = {
-        item["label"]: item["supporting_titles"] for item in normalized_areas
+        item["label"]: item["supporting_titles"]
+        for item in normalized_areas
     }
-    if errors:
-        return OllamaReview("INVALID_EVIDENCE", data, tuple(dict.fromkeys(errors)), review.cached)
+
+    unique_errors = tuple(dict.fromkeys(errors))
+
+    # Validate each proposed research area independently. A malformed or
+    # unsupported area must never invalidate other areas whose exact paper-title
+    # evidence has already passed validation. Keep warnings for auditing.
+    if normalized_areas:
+        if unique_errors:
+            data["validation_warnings"] = list(unique_errors)
+        return OllamaReview("VALID", data, (), review.cached)
+
+    # If Qwen proposed areas but none survived evidence validation, do not
+    # invent a profile: route the saved paper evidence to staff review.
+    if unique_errors:
+        return OllamaReview(
+            "INVALID_EVIDENCE", data, unique_errors, review.cached
+        )
+
+    # An intentionally empty area list is valid and becomes NO_SUPPORTED_AREAS
+    # at the caller rather than fabricated research evidence.
     return OllamaReview("VALID", data, (), review.cached)
 
 def review_research_interest_summary(

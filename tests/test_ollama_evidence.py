@@ -143,6 +143,67 @@ def test_paper_research_summary_requires_exact_supporting_titles(monkeypatch) ->
     assert review.data["research_interests"] == ["Biomedical signal processing"]
 
 
+def test_paper_research_summary_keeps_valid_areas_when_one_area_is_bad(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ollama_evidence,
+        "_run_cached_review",
+        lambda **kwargs: OllamaReview(
+            "VALID",
+            {
+                "primary_field": "Bioengineering",
+                "research_areas": [
+                    {
+                        "label": "Biofilm Engineering",
+                        "supporting_titles": [
+                            "Electrochemical control of biofilms",
+                            "Electron transfer in microbial biofilms",
+                        ],
+                    },
+                    {
+                        "label": "Unsupported Area",
+                        "supporting_titles": [
+                            "Invented paper title",
+                            "Electron transfer in microbial biofilms",
+                        ],
+                    },
+                ],
+                "basis_summary": "One supported area and one bad citation.",
+            },
+        ),
+    )
+
+    review = ollama_evidence.review_paper_research_summary(
+        source_record_key="paper-set:partial",
+        institution_id=1,
+        professor_name="Jane Smith",
+        institution="Example University",
+        papers=[
+            {
+                "title": "Electrochemical control of biofilms",
+                "year": 2025,
+                "venue": "Journal A",
+            },
+            {
+                "title": "Electron transfer in microbial biofilms",
+                "year": 2024,
+                "venue": "Journal B",
+            },
+        ],
+    )
+
+    assert review.status == "VALID"
+    assert review.data["research_interests"] == ["Biofilm Engineering"]
+    assert review.data["supporting_evidence"]["Biofilm Engineering"] == [
+        "Electrochemical control of biofilms",
+        "Electron transfer in microbial biofilms",
+    ]
+    assert "validation_warnings" in review.data
+    assert any(
+        "supporting title is not an exact supplied paper title" in warning
+        for warning in review.data["validation_warnings"]
+    )
+
+
 def test_json_request_retries_once_after_truncated_response(monkeypatch) -> None:
     calls = []
     responses = [

@@ -323,6 +323,33 @@ def test_explicit_research_interest_section_is_extracted() -> None:
     assert "Introductory communication" not in excerpt
 
 
+def test_research_interest_narrative_prose_is_not_split_into_demographics() -> None:
+    html = """<main><h1>Erica Austin</h1><h2>Research Interests</h2>
+    <p>She focuses on how media literacy can facilitate healthier decision making
+    about health and civic affairs among children, adolescents, and adults. Her
+    work also studies media literacy as an empowering skill for youth, adults and
+    families.</p></main>"""
+    interests, _ = extract_research_interests(html)
+    assert interests == []
+
+
+def test_research_interest_section_rejects_contact_noise_but_keeps_labels() -> None:
+    html = """<main><h1>Anis Allagui</h1><h2>Research Interests</h2>
+    <ul>
+      <li>10555 West Flagler Street EC 2400 Miami, FL 33174</li>
+      <li>305-348-2522 ENG Advising: 305-348-0273</li>
+      <li>Fractional-order calculus and anomalous transport equations</li>
+      <li>Physics-based models</li>
+      <li>Signal processing methods</li>
+    </ul></main>"""
+    interests, _ = extract_research_interests(html)
+    assert interests == [
+        "Fractional-order calculus and anomalous transport equations",
+        "Physics-based models",
+        "Signal processing methods",
+    ]
+
+
 def test_biography_extraction_stays_inside_bio_section() -> None:
     html = """<main><h2>Biography</h2><p>Jane studies online communities,
     digital communication, and public relations in emerging media.</p>
