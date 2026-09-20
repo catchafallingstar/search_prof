@@ -23,6 +23,13 @@ from ingestion.ollama_evidence import (
     review_paper_research_summary,
     review_publication_identity,
     review_research_interest_summary,
+    review_scholar_publication_candidates,
+)
+from ingestion.publication_quality import (
+    ACCEPT as QUALITY_ACCEPT,
+    AMBIGUOUS as QUALITY_AMBIGUOUS,
+    REJECT as QUALITY_REJECT,
+    scholar_publication_quality,
 )
 from ingestion.websearch import SearchUnavailable, search_web
 
@@ -812,6 +819,295 @@ def _dedupe_scholar_profiles(urls: list[str]) -> list[str]:
         found.setdefault(key, url)
     return list(found.values())
 
+
+
+def _scholar_quality(paper: Publication):
+    return scholar_publication_quality(
+        title=paper.title,
+        authors=paper.authors,
+        venue=paper.venue,
+        year=paper.year,
+        evidence=paper.evidence,
+    )
+
+
+def _identity_safe_scholar_profile(scholar: dict[str, Any]) -> dict[str, Any]:
+    """Drop only deterministic service/event junk before identity correlation."""
+    papers = [
+        paper for paper in scholar.get("papers") or []
+        if _scholar_quality(paper).decision != QUALITY_REJECT
+    ]
+    return {**scholar, "papers": papers}
+
+
+def _scholar_manual_decisions(
+    professor_id: int, source_url: str, papers: list[Publication]
+) -> dict[str, dict[str, Any]]:
+    keys = [paper_key(paper) for paper in papers]
+    if not keys:
+        return {}
+    scholar_key = _scholar_profile_key(source_url)
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT source_key::TEXT AS source_key, status, model_decision,
+                          model_confidence, model_reason
+                   FROM scholar_publication_review_queue
+                   WHERE professor_id=%s AND scholar_key=%s
+                     AND source_key::TEXT = ANY(%s::TEXT[])""",
+                (professor_id, scholar_key, keys),
+            )
+            return {
+                str(row["source_key"]): dict(row)
+                for row in cursor.fetchall()
+            }
+
+
+def _sync_scholar_publication_review_queue(
+    professor_id: int,
+    source_url: str,
+    papers: list[Publication],
+    row_details: dict[int, dict[str, Any]],
+    accepted_indices: set[int],
+    rejected_indices: set[int],
+    review_indices: set[int],
+) -> None:
+    """Persist unresolved rows and close obsolete pending rows safely."""
+    scholar_key = _scholar_profile_key(source_url)
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for index in sorted(review_indices):
+                paper = papers[index]
+                detail = row_details[index]
+                cursor.execute(
+                    """INSERT INTO scholar_publication_review_queue
+                       (professor_id,scholar_url,scholar_key,source_key,title,
+                        publication_year,authors,venue,evidence,model_decision,
+                        model_confidence,model_reason,status,updated_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PENDING',NOW())
+                       ON CONFLICT (professor_id,scholar_key,source_key)
+                       DO UPDATE SET scholar_url=EXCLUDED.scholar_url,
+                         title=EXCLUDED.title,
+                         publication_year=EXCLUDED.publication_year,
+                         authors=EXCLUDED.authors,venue=EXCLUDED.venue,
+                         evidence=EXCLUDED.evidence,
+                         model_decision=EXCLUDED.model_decision,
+                         model_confidence=EXCLUDED.model_confidence,
+                         model_reason=EXCLUDED.model_reason,
+                         status=CASE
+                           WHEN scholar_publication_review_queue.status IN ('ACCEPTED','REJECTED')
+                             THEN scholar_publication_review_queue.status
+                           ELSE 'PENDING'
+                         END,
+                         updated_at=NOW()""",
+                    (
+                        professor_id, source_url, scholar_key, paper_key(paper),
+                        paper.title, paper.year, paper.authors, paper.venue,
+                        paper.evidence,
+                        detail.get("qwen_decision"),
+                        detail.get("qwen_confidence"),
+                        detail.get("qwen_reason") or "; ".join(detail.get("model_errors") or []),
+                    ),
+                )
+            resolved_keys = [
+                paper_key(papers[index])
+                for index in sorted(accepted_indices | rejected_indices)
+            ]
+            if resolved_keys:
+                cursor.execute(
+                    """UPDATE scholar_publication_review_queue
+                       SET status='DISMISSED', updated_at=NOW(), reviewed_at=NOW()
+                       WHERE professor_id=%s AND scholar_key=%s
+                         AND status='PENDING'
+                         AND source_key::TEXT = ANY(%s::TEXT[])""",
+                    (professor_id, scholar_key, resolved_keys),
+                )
+
+
+def _filter_verified_scholar_papers(
+    professor_id: int,
+    professor: dict[str, Any],
+    scholar: dict[str, Any],
+    source_url: str,
+) -> tuple[list[Publication], list[Publication], dict[str, Any]]:
+    """Three-phase publication-quality gate for an identity-verified Scholar profile.
+
+    Phase 1 handles only high-confidence deterministic accept/reject cases.
+    Phase 2 batches ambiguous rows through Qwen. Phase 3 leaves low-confidence,
+    unavailable, or invalid model decisions for staff review instead of indexing
+    them as papers.
+    """
+    papers = list(scholar.get("papers") or [])
+    manual_decisions = _scholar_manual_decisions(professor_id, source_url, papers)
+    accepted_indices: set[int] = set()
+    rejected_indices: set[int] = set()
+    review_indices: set[int] = set()
+    row_details: dict[int, dict[str, Any]] = {}
+    ambiguous: list[tuple[int, Publication]] = []
+
+    for index, paper in enumerate(papers):
+        saved = manual_decisions.get(paper_key(paper)) or {}
+        saved_status = str(saved.get("status") or "")
+        if saved_status == "ACCEPTED":
+            accepted_indices.add(index)
+            row_details[index] = {
+                "title": paper.title,
+                "final_decision": "PUBLICATION",
+                "decision_source": "STAFF",
+                "reasons": ["staff_accepted"],
+            }
+            continue
+        if saved_status == "REJECTED":
+            rejected_indices.add(index)
+            row_details[index] = {
+                "title": paper.title,
+                "final_decision": "NOT_PUBLICATION",
+                "decision_source": "STAFF",
+                "reasons": ["staff_rejected"],
+            }
+            continue
+        if saved_status == "PENDING":
+            review_indices.add(index)
+            row_details[index] = {
+                "title": paper.title,
+                "final_decision": "REVIEW_REQUIRED",
+                "decision_source": "STAFF_QUEUE",
+                "qwen_decision": saved.get("model_decision"),
+                "qwen_confidence": float(saved.get("model_confidence") or 0),
+                "qwen_reason": str(saved.get("model_reason") or ""),
+                "reasons": ["existing_staff_review_case"],
+            }
+            continue
+
+        quality = _scholar_quality(paper)
+        row_details[index] = {
+            "title": paper.title,
+            "deterministic_decision": quality.decision,
+            "reasons": list(quality.reasons),
+        }
+        if quality.decision == QUALITY_ACCEPT:
+            accepted_indices.add(index)
+            row_details[index]["final_decision"] = "PUBLICATION"
+            row_details[index]["decision_source"] = "DETERMINISTIC"
+        elif quality.decision == QUALITY_REJECT:
+            rejected_indices.add(index)
+            row_details[index]["final_decision"] = "NOT_PUBLICATION"
+            row_details[index]["decision_source"] = "DETERMINISTIC"
+        else:
+            ambiguous.append((index, paper))
+
+    qwen_batches = 0
+    for chunk_start in range(0, len(ambiguous), 20):
+        chunk = ambiguous[chunk_start:chunk_start + 20]
+        qwen_batches += 1
+        candidates = [
+            {
+                "candidate_id": str(index + 1),
+                "title": paper.title,
+                "authors": paper.authors,
+                "venue": paper.venue,
+                "year": paper.year,
+            }
+            for index, paper in chunk
+        ]
+        model = review_scholar_publication_candidates(
+            source_record_key=(
+                f"{professor_id}:{_scholar_profile_key(source_url)}:"
+                f"publication-filter:{qwen_batches}"
+            ),
+            institution_id=int(professor["institution_id"]),
+            candidates=candidates,
+        )
+        model_items = {
+            str(item.get("candidate_id") or ""): item
+            for item in (model.data.get("items") or [])
+        } if model.status == "VALID" else {}
+        for index, paper in chunk:
+            item = model_items.get(str(index + 1))
+            if not item:
+                review_indices.add(index)
+                row_details[index].update({
+                    "final_decision": "REVIEW_REQUIRED",
+                    "decision_source": "QWEN",
+                    "model_status": model.status,
+                    "model_errors": list(model.errors),
+                })
+                continue
+            decision = str(item.get("decision") or "UNCERTAIN").upper()
+            confidence = float(item.get("confidence") or 0)
+            row_details[index].update({
+                "qwen_decision": decision,
+                "qwen_confidence": confidence,
+                "qwen_reason": str(item.get("reason") or ""),
+                "model_status": model.status,
+            })
+            if decision == "PUBLICATION" and confidence >= 0.80:
+                accepted_indices.add(index)
+                row_details[index]["final_decision"] = "PUBLICATION"
+                row_details[index]["decision_source"] = "QWEN"
+            elif decision == "NOT_PUBLICATION" and confidence >= 0.80:
+                rejected_indices.add(index)
+                row_details[index]["final_decision"] = "NOT_PUBLICATION"
+                row_details[index]["decision_source"] = "QWEN"
+            else:
+                review_indices.add(index)
+                row_details[index]["final_decision"] = "REVIEW_REQUIRED"
+                row_details[index]["decision_source"] = "QWEN"
+
+    # Every row must land in exactly one bucket. Treat anything unexpected as
+    # review-required rather than accidentally importing it.
+    classified = accepted_indices | rejected_indices | review_indices
+    for index in range(len(papers)):
+        if index not in classified:
+            review_indices.add(index)
+            row_details[index]["final_decision"] = "REVIEW_REQUIRED"
+            row_details[index]["decision_source"] = "SAFETY_FALLBACK"
+
+    _sync_scholar_publication_review_queue(
+        professor_id, source_url, papers, row_details,
+        accepted_indices, rejected_indices, review_indices,
+    )
+
+    accepted = [paper for index, paper in enumerate(papers) if index in accepted_indices]
+    rejected = [paper for index, paper in enumerate(papers) if index in rejected_indices]
+    review_rows = [row_details[index] for index in sorted(review_indices)]
+    rejected_rows = [row_details[index] for index in sorted(rejected_indices)]
+    audit = {
+        "rows_seen": len(papers),
+        "accepted_rows": len(accepted_indices),
+        "rejected_rows": len(rejected_indices),
+        "review_required_rows": len(review_indices),
+        "qwen_reviewed_rows": len(ambiguous),
+        "qwen_batches": qwen_batches,
+        "rejected": rejected_rows[:50],
+        "review_required": review_rows[:50],
+    }
+    return accepted, rejected, audit
+
+
+def _detach_rejected_scholar_links(
+    professor_id: int, rejected: list[Publication]
+) -> int:
+    """Detach only Scholar-only rows confidently rejected by the quality gate."""
+    keys = [paper_key(paper) for paper in rejected]
+    if not keys:
+        return 0
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """DELETE FROM professor_papers link
+                   USING papers paper
+                   WHERE link.professor_id=%s
+                     AND link.paper_id=paper.id
+                     AND paper.source_type='GOOGLE_SCHOLAR'
+                     AND paper.source_key::TEXT = ANY(%s::TEXT[])""",
+                (professor_id, keys),
+            )
+            deleted = int(cursor.rowcount or 0)
+    if deleted:
+        from ingestion.research_classification import rebuild_professor_profiles
+        rebuild_professor_profiles([professor_id])
+    return deleted
 
 def parse_scholar_profile(html: str, url: str) -> dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
@@ -1698,7 +1994,7 @@ def review_queued_scholar_candidates(
                         professor.get("official_institution_domain") or ""
                     ),
                     known_pages=known_urls,
-                    scholar_profile=scholar,
+                    scholar_profile=_identity_safe_scholar_profile(scholar),
                     official_biography=official_biography,
                     official_interests=official_interests,
                 )
@@ -1772,10 +2068,36 @@ def review_queued_scholar_candidates(
                           "qwen_matching_signals": qwen_data.get("matching_signals") or [],
                           "qwen_conflicts": qwen_data.get("conflicts") or []})
             if decision == "VERIFIED":
-                scholar_papers = list(scholar["papers"])[:max_works]
+                scholar_papers, rejected_papers, filter_audit = _filter_verified_scholar_papers(
+                    professor_id, dict(professor), scholar, url
+                )
+                detached = _detach_rejected_scholar_links(
+                    professor_id, rejected_papers
+                )
+                filter_audit["detached_existing_links"] = detached
+                filter_step = {
+                    "step": "SCHOLAR_PUBLICATION_FILTER",
+                    "status": (
+                        "REVIEW_REQUIRED"
+                        if filter_audit["review_required_rows"]
+                        else "COMPLETED"
+                    ),
+                    "source_url": url,
+                    **filter_audit,
+                }
+                steps.append(filter_step)
+                _record_source(
+                    professor_id, "GOOGLE_SCHOLAR", url, "VERIFIED",
+                    {"publication_filter": filter_audit},
+                )
+
                 imported = _save(professor_id, scholar_papers, progress_callback)
-                value = "SCHOLAR_VERIFIED" if scholar_papers else "NO_PUBLICATIONS_FOUND"
-                _status(professor_id, value)
+                publication_value = (
+                    "SCHOLAR_VERIFIED" if scholar_papers
+                    else "REVIEW_REQUIRED" if filter_audit["review_required_rows"]
+                    else "NO_PUBLICATIONS_FOUND"
+                )
+                _status(professor_id, publication_value)
                 _dismiss_resolved_scholar_reviews(professor_id)
                 if scholar_papers:
                     _store_paper_research_summary(
@@ -1784,12 +2106,27 @@ def review_queued_scholar_candidates(
                             str(value) for value in scholar.get("research_interests") or []
                         ],
                     )
-                steps.append({"step": "PAPER_IMPORT", "status": "COMPLETED",
-                              "papers_found": len(scholar_papers),
-                              "papers_imported": imported,
-                              "papers_already_linked": len(scholar_papers)-imported})
-                return {"status": value, "papers_found": len(scholar_papers),
-                        "papers_imported": imported, "steps": steps}
+                steps.append({
+                    "step": "PAPER_IMPORT",
+                    "status": "COMPLETED",
+                    "papers_found": len(scholar_papers),
+                    "papers_imported": imported,
+                    "papers_already_linked": len(scholar_papers)-imported,
+                })
+                job_status = (
+                    "REVIEW_REQUIRED"
+                    if filter_audit["review_required_rows"]
+                    else publication_value
+                )
+                return {
+                    "status": job_status,
+                    "papers_found": len(scholar_papers),
+                    "papers_imported": imported,
+                    "scholar_rows_seen": filter_audit["rows_seen"],
+                    "publication_rows_rejected": filter_audit["rejected_rows"],
+                    "publication_rows_review_required": filter_audit["review_required_rows"],
+                    "steps": steps,
+                }
         except requests.RequestException as error:
             http_status = error.response.status_code if error.response is not None else None
             retry_after = error.response.headers.get('Retry-After','') if error.response is not None else ''

@@ -495,6 +495,35 @@ ALTER TABLE professor_publication_sources
         source_type IN ('OFFICIAL_PROFILE','OFFICIAL_ALTERNATE_PROFILE',
         'PERSONAL_SITE','LAB_SITE','LINKED_SITE','GOOGLE_SCHOLAR'));
 
+-- Ambiguous Google Scholar rows are never attached as papers automatically.
+-- They are persisted here so staff can explicitly accept or reject them.
+CREATE TABLE IF NOT EXISTS scholar_publication_review_queue (
+    id BIGSERIAL PRIMARY KEY,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    scholar_url TEXT NOT NULL,
+    scholar_key TEXT NOT NULL,
+    source_key CHAR(64) NOT NULL,
+    title TEXT NOT NULL,
+    publication_year INTEGER,
+    authors TEXT,
+    venue TEXT,
+    evidence TEXT,
+    model_decision TEXT,
+    model_confidence NUMERIC(4, 3) CHECK (model_confidence BETWEEN 0 AND 1),
+    model_reason TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (
+        status IN ('PENDING','ACCEPTED','REJECTED','DISMISSED')
+    ),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ,
+    reviewed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE (professor_id, scholar_key, source_key)
+);
+CREATE INDEX IF NOT EXISTS scholar_publication_review_pending_idx
+    ON scholar_publication_review_queue (status, created_at DESC)
+    WHERE status='PENDING';
+
 -- Research interests are fallback evidence only. They never create a faculty
 -- identity and never claim that a publication exists. Each label retains the
 -- official page and the exact profile passage from which it was extracted.
@@ -504,7 +533,7 @@ CREATE TABLE IF NOT EXISTS professor_research_interests (
     display_interest TEXT NOT NULL,
     normalized_interest TEXT NOT NULL,
     evidence_method TEXT NOT NULL CHECK (
-        evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY')
+        evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY','QWEN_PAPER_SUMMARY')
     ),
     source_url TEXT NOT NULL,
     source_excerpt TEXT NOT NULL,
@@ -518,7 +547,7 @@ CREATE INDEX IF NOT EXISTS professor_research_interests_professor_idx
 ALTER TABLE professor_research_interests DROP CONSTRAINT IF EXISTS professor_research_interests_evidence_method_check;
 ALTER TABLE professor_research_interests ADD CONSTRAINT professor_research_interests_evidence_method_check
     CHECK (evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY',
-                              'QWEN_VALIDATED_SECTION','AI_SUGGESTION'));
+                              'QWEN_VALIDATED_SECTION','AI_SUGGESTION','QWEN_PAPER_SUMMARY'));
 ALTER TABLE roster_member_candidates ADD COLUMN IF NOT EXISTS staff_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS program_admission_requirements (

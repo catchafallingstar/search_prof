@@ -281,25 +281,49 @@ def extract_page_metadata(html: str) -> dict[str, str]:
     return {"title": title[:1000], "abstract": abstract[:20000], "doi": doi[:300]}
 
 
+# These source types identify the page where a publication list was discovered,
+# not an individual paper landing page. They remain useful provenance, but they
+# should never be fetched as though they were paper metadata sources.
+PROVENANCE_ONLY_PUBLICATION_SOURCES = {
+    "GOOGLE_SCHOLAR",
+    "OFFICIAL_PROFILE",
+    "OFFICIAL_ALTERNATE_PROFILE",
+    "PERSONAL_SITE",
+    "LAB_SITE",
+    "INSTITUTIONAL_RESEARCH_PORTAL",
+}
+
+
 def _metadata_url(paper: dict[str, Any]) -> str:
+    """Return a direct metadata URL only when the stored source is paper-specific."""
     doi = str(paper.get("doi") or "").strip()
     if doi:
         return "https://doi.org/" + re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.I)
-    source = str(paper.get("source_url") or "")
+
+    source_type = str(paper.get("source_type") or "").strip().upper()
+    if source_type in PROVENANCE_ONLY_PUBLICATION_SOURCES:
+        return ""
+
+    source = str(paper.get("source_url") or "").strip()
     host = (urlparse(source).hostname or "").casefold()
-    return "" if "scholar.google." in host else source
+    if not source or "scholar.google." in host:
+        return ""
+    return source
 
 
 def enrich_paper_metadata(paper_id: int) -> dict[str, Any]:
-    """Use DOI/known URLs only. Search recovery remains a separate staff action."""
+    """Use DOI/direct paper URLs only; provenance/list pages are not metadata pages."""
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT * FROM papers WHERE id=%s", (paper_id,))
             paper = cursor.fetchone()
     if not paper:
         raise RuntimeError("Paper no longer exists.")
-    url = _metadata_url(dict(paper))
-    status, abstract, metadata = "NOT_FOUND", "", {}
+
+    paper_data = dict(paper)
+    url = _metadata_url(paper_data)
+    status = "NOT_FOUND" if url else "NO_DIRECT_METADATA_SOURCE"
+    abstract, metadata = "", {}
     title_score = 0.0
     if url:
         try:
@@ -315,6 +339,7 @@ def enrich_paper_metadata(paper_id: int) -> dict[str, Any]:
                 status = "TITLE_CONFLICT"
         except requests.RequestException:
             status = "SOURCE_UNAVAILABLE"
+
     content_hash = hashlib.sha256(abstract.encode("utf-8", "replace")).hexdigest() if abstract else None
     with get_db_connection() as connection:
         with connection.cursor() as cursor:

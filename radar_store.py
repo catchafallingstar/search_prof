@@ -11,6 +11,7 @@ from typing import Any
 from db import _require_active_admin, get_db_connection
 from settings import setting, setting_int
 from ingestion.institution_domains import OFFSHORE_SOURCE_PATTERN
+from ingestion.publication_quality import REJECT as QUALITY_REJECT, scholar_publication_quality
 
 
 FACULTY_VERIFICATION_VERSION = 20
@@ -1640,8 +1641,70 @@ def _enqueue_paper_summary_backfill(limit: int = 20) -> int:
     return queued
 
 
+
+def _prune_obvious_scholar_nonpublications(limit: int = 250) -> int:
+    """Detach only deterministic Scholar service/event junk from professors.
+
+    Ambiguous workshop/proceedings rows are never removed here; they wait for
+    the verified-profile Qwen/manual-review path. This maintenance cleanup lets
+    older imports benefit from the new deterministic rules without refetching
+    Scholar or deleting the global paper record.
+    """
+    bounded = max(1, min(1000, int(limit)))
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                r"""SELECT link.professor_id, paper.id AS paper_id, paper.title,
+                           paper.publication_year, COALESCE(paper.venue, '') AS venue,
+                           COALESCE(paper.source_evidence, '') AS source_evidence
+                    FROM professor_papers link
+                    JOIN papers paper ON paper.id=link.paper_id
+                    WHERE paper.source_type='GOOGLE_SCHOLAR'
+                      AND (
+                        paper.title ~* '(committee|committees|organization|\\(chair\\)|doctoral symposium|message from .+ chairs?)'
+                        OR paper.title ~ '^[A-Z][A-Za-z0-9@+.-]*( [A-Z][A-Za-z0-9@+.-]*){0,2} (19|20)[0-9]{2}$'
+                      )
+                    ORDER BY paper.id
+                    LIMIT %s""",
+                (bounded,),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+    rejected: list[tuple[int, int]] = []
+    affected: set[int] = set()
+    for row in rows:
+        evidence = str(row.get('source_evidence') or '')
+        parts = [part.strip() for part in evidence.split(' | ')]
+        authors = parts[1] if len(parts) > 1 else ''
+        venue = str(row.get('venue') or '') or (parts[2] if len(parts) > 2 else '')
+        quality = scholar_publication_quality(
+            title=str(row.get('title') or ''),
+            authors=authors,
+            venue=venue,
+            year=row.get('publication_year'),
+            evidence=evidence,
+        )
+        if quality.decision == QUALITY_REJECT:
+            rejected.append((int(row['professor_id']), int(row['paper_id'])))
+            affected.add(int(row['professor_id']))
+
+    if not rejected:
+        return 0
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for professor_id, paper_id in rejected:
+                cursor.execute(
+                    "DELETE FROM professor_papers WHERE professor_id=%s AND paper_id=%s",
+                    (professor_id, paper_id),
+                )
+    if affected:
+        from ingestion.research_classification import rebuild_professor_profiles
+        rebuild_professor_profiles(sorted(affected))
+    return len(rejected)
+
 def enqueue_due_maintenance(limit: int = 20) -> int:
     queued = 0
+    _prune_obvious_scholar_nonpublications(max(100, int(limit) * 10))
     # Stage 1: discover approved official faculty directories from the US
     # institution registry. This is the only path that creates new people.
     with get_db_connection() as connection:
@@ -1785,6 +1848,17 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                        paper.abstract_status='NOT_CHECKED'
                        OR (paper.abstract_status='SOURCE_UNAVAILABLE'
                            AND paper.abstract_checked_at <= NOW() - INTERVAL '7 days')
+                       OR (
+                           paper.abstract_status IN ('TITLE_CONFLICT','NOT_FOUND')
+                           AND paper.source_type IN (
+                               'GOOGLE_SCHOLAR',
+                               'OFFICIAL_PROFILE',
+                               'OFFICIAL_ALTERNATE_PROFILE',
+                               'PERSONAL_SITE',
+                               'LAB_SITE',
+                               'INSTITUTIONAL_RESEARCH_PORTAL'
+                           )
+                       )
                        OR paper.classification_version < 1
                    )
                      AND NOT EXISTS (
@@ -2249,10 +2323,28 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
 
             cursor.execute(
                 """
-                SELECT job.job_type AS stage, professor.id AS professor_id,
-                       COALESCE(professor.name, paper.title,
-                                job.result_json->>'member_name') AS name,
-                       institution.name AS institution_name,
+                SELECT job.job_type AS stage,
+                       CASE
+                         WHEN professor.id IS NOT NULL THEN professor.id
+                         WHEN CARDINALITY(paper_link.professor_ids) = 1
+                           THEN paper_link.professor_ids[1]
+                         ELSE NULL
+                       END AS professor_id,
+                       CASE
+                         WHEN job.job_type = 'ENRICH_CLASSIFY_PAPER' THEN paper.title
+                         ELSE COALESCE(professor.name, paper.title,
+                                       job.result_json->>'member_name')
+                       END AS name,
+                       COALESCE(
+                           institution.name,
+                           CASE
+                             WHEN CARDINALITY(paper_link.institution_names) = 1
+                               THEN paper_link.institution_names[1]
+                             WHEN CARDINALITY(paper_link.institution_names) > 1
+                               THEN array_to_string(paper_link.institution_names, ', ')
+                             ELSE NULL
+                           END
+                       ) AS institution_name,
                        COALESCE(job.completed_at, job.updated_at) AS activity_at,
                        CASE
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
@@ -2262,24 +2354,51 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                               AND job.job_type='MATCH_FACULTY_PUBLICATIONS'
                            THEN 'Official or linked publication sources processed'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
+                              AND job.job_type='ENRICH_CLASSIFY_PAPER'
+                           THEN 'Research category evidence accepted'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='APPROVED'
                            THEN 'Approved'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='REVIEW_REQUIRED' THEN 'Needs staff review'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='REJECTED' THEN 'Rejected safely'
+                         WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='NO_CHANGE'
+                              AND job.job_type='ENRICH_CLASSIFY_PAPER'
+                           THEN 'Checked — no research category accepted'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='NO_CHANGE' THEN 'Checked — no new evidence'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='NO_PUBLICATIONS_FOUND' THEN 'Faculty approved — no verified publication source'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='SOURCE_UNAVAILABLE' THEN 'Source temporarily unavailable'
                          WHEN COALESCE(to_jsonb(job)->>'outcome_status', 'PENDING')='SUCCEEDED' THEN 'Finished successfully'
                          ELSE UPPER(job.status)
                        END AS result_status,
-                       COALESCE(job.result_json->>'live_detail', job.last_error,
-                                job.result_json::TEXT) AS result_detail,
+                       CASE
+                         WHEN job.status='failed' THEN job.last_error
+                         WHEN job.job_type='QWEN_REVIEW_PUBLICATION' THEN CONCAT(
+                              'Scholar rows checked: ',
+                              COALESCE(job.result_json->>'scholar_rows_seen',
+                                       job.result_json->>'papers_found', '0'),
+                              '; publications accepted: ',
+                              COALESCE(job.result_json->>'papers_found', '0'),
+                              '; rejected as non-publications: ',
+                              COALESCE(job.result_json->>'publication_rows_rejected', '0'),
+                              '; staff review: ',
+                              COALESCE(job.result_json->>'publication_rows_review_required', '0'),
+                              '.'
+                         )
+                         ELSE COALESCE(job.result_json->>'live_detail', job.last_error,
+                                       job.result_json::TEXT)
+                       END AS result_detail,
                        job.last_error AS failure_code,
-                       COALESCE(job.result_json->>'source_url', directory.directory_url)
-                           AS source_url,
+                       COALESCE(job.result_json->>'source_url', paper.source_url,
+                                directory.directory_url) AS source_url,
                        NULL::TEXT AS observed_title,
                        NULL::TEXT AS observed_institution,
-                       job.result_json->>'paper_title' AS evidence_text,
+                       CASE
+                         WHEN job.job_type='ENRICH_CLASSIFY_PAPER' THEN paper.title
+                         WHEN job.job_type='QWEN_REVIEW_PUBLICATION' THEN NULL
+                         ELSE job.result_json->>'paper_title'
+                       END AS evidence_text,
                        job.result_json->'steps' AS audit_steps,
+                       paper_link.professor_names AS linked_professors,
+                       job.result_json->>'abstract_status' AS abstract_status,
                        COALESCE(
                            durable_area.research_areas,
                            ARRAY_REMOVE(ARRAY[topic.requested_query], NULL),
@@ -2297,6 +2416,30 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                   )
                 LEFT JOIN radar_topics topic ON topic.id = job.radar_topic_id
                 LEFT JOIN LATERAL (
+                    SELECT
+                        ARRAY_AGG(DISTINCT linked_professor.id ORDER BY linked_professor.id)
+                            AS professor_ids,
+                        ARRAY_AGG(DISTINCT linked_professor.name ORDER BY linked_professor.name)
+                            AS professor_names,
+                        ARRAY_AGG(
+                            DISTINCT linked_professor.institution_name
+                            ORDER BY linked_professor.institution_name
+                        ) FILTER (
+                            WHERE NULLIF(BTRIM(linked_professor.institution_name), '')
+                                  IS NOT NULL
+                        ) AS institution_names
+                    FROM professor_papers paper_professor
+                    JOIN professors linked_professor
+                      ON linked_professor.id = paper_professor.professor_id
+                    WHERE paper_professor.paper_id = job.paper_id
+                ) paper_link ON job.paper_id IS NOT NULL
+                LEFT JOIN LATERAL (
+                    SELECT CASE
+                        WHEN professor.id IS NOT NULL THEN ARRAY[professor.id]::BIGINT[]
+                        ELSE COALESCE(paper_link.professor_ids, ARRAY[]::BIGINT[])
+                    END AS professor_ids
+                ) resolved_professor ON TRUE
+                LEFT JOIN LATERAL (
                     SELECT ARRAY_AGG(ranked.label ORDER BY ranked.score DESC, ranked.label)
                                AS research_areas
                     FROM (
@@ -2305,7 +2448,7 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                             SELECT interest.display_interest AS label,
                                    COALESCE(interest.confidence, 0) * 100.0 AS score
                             FROM professor_research_interests interest
-                            WHERE interest.professor_id = professor.id
+                            WHERE interest.professor_id = ANY(resolved_professor.professor_ids)
 
                             UNION ALL
 
@@ -2317,7 +2460,7 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                             FROM professor_research_categories profile
                             JOIN research_categories category
                               ON category.id = profile.category_id
-                            WHERE profile.professor_id = professor.id
+                            WHERE profile.professor_id = ANY(resolved_professor.professor_ids)
                               AND profile.status IN (
                                   'CURRENTLY_ACTIVE',
                                   'EMERGING_AREA',
@@ -2329,7 +2472,7 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                         ORDER BY MAX(candidate.score) DESC, candidate.label
                         LIMIT 8
                     ) ranked
-                ) durable_area ON professor.id IS NOT NULL
+                ) durable_area ON CARDINALITY(resolved_professor.professor_ids) > 0
                 WHERE job.status IN ('completed', 'failed')
                   AND job.job_type IN (
                       'DISCOVER_FACULTY_DIRECTORIES',
@@ -2465,6 +2608,8 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                             'REJECTED','NOT_A_PERSON','HISTORICAL_PROFILE',
                             'NOT_GROUP_LEADING_FACULTY'))
                       + (SELECT COUNT(*) FROM professor_identity_review_queue
+                         WHERE status='PENDING')
+                      + (SELECT COUNT(*) FROM scholar_publication_review_queue
                          WHERE status='PENDING')
                     ) AS needs_staff_review,
                     (
@@ -2870,6 +3015,23 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                 (max(1, min(250, int(limit))),),
             )
             publication_identity_issues = list(cursor.fetchall())
+            cursor.execute(
+                """SELECT review.id AS review_id, review.created_at,
+                          review.scholar_url AS source_url,
+                          review.title, review.publication_year,
+                          review.authors, review.venue,
+                          review.model_decision, review.model_confidence,
+                          review.model_reason,
+                          professor.id AS professor_id, professor.name,
+                          professor.institution_name
+                   FROM scholar_publication_review_queue review
+                   JOIN professors professor ON professor.id=review.professor_id
+                   WHERE review.status='PENDING'
+                   ORDER BY review.created_at DESC, review.id DESC
+                   LIMIT %s""",
+                (max(1, min(250, int(limit))),),
+            )
+            publication_row_issues = list(cursor.fetchall())
     return {
         "job_counts": job_counts,
         "quality_counts": quality_counts,
@@ -2886,8 +3048,105 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
         "faculty_page_issues": faculty_page_issues,
         "roster_member_issues": roster_member_issues,
         "publication_identity_issues": publication_identity_issues,
+        "publication_row_issues": publication_row_issues,
     }
 
+
+
+def approve_scholar_publication_row(owner_user_id: int, review_id: int) -> None:
+    """Accept one staff-reviewed Scholar row and attach it as a publication."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """SELECT * FROM scholar_publication_review_queue
+                   WHERE id=%s FOR UPDATE""",
+                (review_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("This Scholar review row no longer exists.")
+            if str(row.get("status") or "") != "PENDING":
+                raise ValueError("This Scholar row has already been reviewed.")
+
+    from ingestion.publication_discovery import Publication, _save, _status
+    publication = Publication(
+        str(row["title"]),
+        int(row["publication_year"]) if row.get("publication_year") else None,
+        "",
+        str(row["scholar_url"]),
+        "GOOGLE_SCHOLAR",
+        str(row.get("evidence") or row["title"]),
+        authors=str(row.get("authors") or ""),
+        venue=str(row.get("venue") or ""),
+    )
+    _save(int(row["professor_id"]), [publication], None)
+    _status(int(row["professor_id"]), "SCHOLAR_VERIFIED")
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """UPDATE scholar_publication_review_queue
+                   SET status='ACCEPTED', reviewed_at=NOW(), reviewed_by=%s,
+                       updated_at=NOW()
+                   WHERE id=%s AND status='PENDING'""",
+                (owner_user_id, review_id),
+            )
+            cursor.execute(
+                """INSERT INTO admin_audit_log
+                   (actor_user_id,action,target_type,target_id,notes)
+                   VALUES (%s,'ACCEPT_SCHOLAR_PUBLICATION_ROW',
+                           'scholar_publication_review_queue',%s,%s)""",
+                (owner_user_id, review_id, str(row["title"])[:1000]),
+            )
+
+
+def reject_scholar_publication_row(owner_user_id: int, review_id: int) -> None:
+    """Reject one ambiguous Scholar row and detach any Scholar-only legacy link."""
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            _require_active_admin(cursor, owner_user_id, owner_only=True)
+            cursor.execute(
+                """SELECT * FROM scholar_publication_review_queue
+                   WHERE id=%s FOR UPDATE""",
+                (review_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("This Scholar review row no longer exists.")
+            if str(row.get("status") or "") != "PENDING":
+                raise ValueError("This Scholar row has already been reviewed.")
+            cursor.execute(
+                """DELETE FROM professor_papers link
+                   USING papers paper
+                   WHERE link.professor_id=%s
+                     AND link.paper_id=paper.id
+                     AND paper.source_type='GOOGLE_SCHOLAR'
+                     AND paper.source_key::TEXT=%s""",
+                (int(row["professor_id"]), str(row["source_key"])),
+            )
+            detached = int(cursor.rowcount or 0)
+            cursor.execute(
+                """UPDATE scholar_publication_review_queue
+                   SET status='REJECTED', reviewed_at=NOW(), reviewed_by=%s,
+                       updated_at=NOW()
+                   WHERE id=%s AND status='PENDING'""",
+                (owner_user_id, review_id),
+            )
+            cursor.execute(
+                """INSERT INTO admin_audit_log
+                   (actor_user_id,action,target_type,target_id,notes)
+                   VALUES (%s,'REJECT_SCHOLAR_PUBLICATION_ROW',
+                           'scholar_publication_review_queue',%s,%s)""",
+                (
+                    owner_user_id, review_id,
+                    json.dumps({"title": row["title"], "detached_links": detached}),
+                ),
+            )
+    if detached:
+        from ingestion.research_classification import rebuild_professor_profiles
+        rebuild_professor_profiles([int(row["professor_id"])])
 
 def retry_radar_job(owner_user_id: int, job_id: int) -> None:
     with get_db_connection() as connection:

@@ -16,6 +16,7 @@ PROMPT_VERSION = "faculty-evidence-v1"
 PUBLICATION_PROMPT_VERSION = "publication-identity-v3"
 RESEARCH_INTEREST_PROMPT_VERSION = "research-interest-v2"
 PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v2"
+SCHOLAR_PUBLICATION_FILTER_PROMPT_VERSION = "scholar-publication-filter-v1"
 ALLOWED_RECORD_TYPES = {
     "FACULTY", "EMERITUS", "ADJUNCT", "VISITING", "RESEARCH_FACULTY",
     "LECTURER", "INSTRUCTOR", "STUDENT", "POSTDOC", "STAFF",
@@ -376,6 +377,107 @@ SOURCE_JSON:
         return OllamaReview("INVALID_EVIDENCE", data, tuple(dict.fromkeys(errors)), review.cached)
     return OllamaReview("VALID", data, (), review.cached)
 
+
+
+def review_scholar_publication_candidates(
+    *, source_record_key: str, institution_id: int,
+    candidates: list[dict[str, Any]],
+) -> OllamaReview:
+    """Classify only ambiguous Scholar rows as publication/service/uncertain.
+
+    Deterministic rules handle obvious rows before this function is called.
+    The model receives only row metadata and cannot establish authorship or
+    professor identity. Low-confidence answers remain manual-review items.
+    """
+    clean: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates[:25], 1):
+        candidate_id = str(candidate.get("candidate_id") or index)
+        title = " ".join(str(candidate.get("title") or "").split())
+        if not title:
+            continue
+        clean.append({
+            "candidate_id": candidate_id,
+            "title": title,
+            "authors": " ".join(str(candidate.get("authors") or "").split()),
+            "venue": " ".join(str(candidate.get("venue") or "").split()),
+            "year": candidate.get("year"),
+        })
+    if not clean:
+        return OllamaReview("INVALID_EVIDENCE", {}, ("no Scholar candidates supplied",))
+
+    source_text = json.dumps({"rows": clean}, ensure_ascii=False)
+    prompt = f"""Classify each Google Scholar row using ONLY the supplied metadata.
+A PUBLICATION is a scholarly work such as a journal/conference paper, book
+chapter, preprint, report, proceedings/editorial item, or other authored
+scholarly output. NOT_PUBLICATION means service/event metadata such as program
+committee membership, workshop organization, chair listings, a bare event name,
+people/affiliation lists, or corrupted non-publication metadata. If the metadata
+is genuinely insufficient or could reasonably be either, use UNCERTAIN.
+
+Do not infer from a person's reputation, institution, or field. Keep each
+candidate_id exactly unchanged. Return JSON only:
+{{"items":[{{"candidate_id":"1","decision":"PUBLICATION|NOT_PUBLICATION|UNCERTAIN","confidence":0.0,"reason":"short reason"}}]}}
+Return exactly one item for every supplied row, no extra rows, confidence 0 to 1,
+and no text outside the JSON object.
+SOURCE_JSON:
+{source_text}
+"""
+    review = _run_cached_review(
+        source_type="SCHOLAR_PUBLICATION_FILTER",
+        source_record_key=source_record_key,
+        institution_id=institution_id,
+        prompt_version=SCHOLAR_PUBLICATION_FILTER_PROMPT_VERSION,
+        source_text=source_text,
+        prompt=prompt,
+    )
+    if review.status != "VALID":
+        return review
+
+    items = review.data.get("items")
+    if not isinstance(items, list):
+        return OllamaReview(
+            "INVALID_EVIDENCE", review.data, ("items must be a list",), review.cached
+        )
+
+    expected = {item["candidate_id"] for item in clean}
+    seen: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            errors.append("each item must be an object")
+            continue
+        candidate_id = str(item.get("candidate_id") or "")
+        decision = str(item.get("decision") or "").upper()
+        try:
+            confidence = float(item.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = -1
+        if candidate_id not in expected or candidate_id in seen:
+            errors.append("candidate_id must match one supplied row exactly once")
+            continue
+        seen.add(candidate_id)
+        if decision not in {"PUBLICATION", "NOT_PUBLICATION", "UNCERTAIN"}:
+            errors.append("decision must be PUBLICATION, NOT_PUBLICATION, or UNCERTAIN")
+            continue
+        if not 0 <= confidence <= 1:
+            errors.append("confidence must be between 0 and 1")
+            continue
+        normalized.append({
+            "candidate_id": candidate_id,
+            "decision": decision,
+            "confidence": confidence,
+            "reason": " ".join(str(item.get("reason") or "").split())[:300],
+        })
+    if seen != expected:
+        errors.append("model must return exactly one decision for every supplied row")
+    data = dict(review.data)
+    data["items"] = normalized
+    if errors:
+        return OllamaReview(
+            "INVALID_EVIDENCE", data, tuple(dict.fromkeys(errors)), review.cached
+        )
+    return OllamaReview("VALID", data, (), review.cached)
 
 def review_paper_research_summary(
     *, source_record_key: str, institution_id: int, professor_name: str,

@@ -99,10 +99,12 @@ def setup_review(monkeypatch, *, official=True, affiliation="Example University"
     monkeypatch.setattr(pub,'_status',lambda pid,value:statuses.append(value))
     monkeypatch.setattr(pub,'_save',lambda pid,papers,callback:saved.extend(papers) or len(papers))
     monkeypatch.setattr(pub,'_dismiss_resolved_scholar_reviews',lambda _:None)
+    monkeypatch.setattr(pub,'_scholar_manual_decisions',lambda *args,**kwargs:{})
+    monkeypatch.setattr(pub,'_sync_scholar_publication_review_queue',lambda *args,**kwargs:None)
     if suppress_paper_summary:
         monkeypatch.setattr(pub,'_store_paper_research_summary',lambda *args,**kwargs:None)
     scholar=dict(name='Jane Smith',affiliation=affiliation,verified_email='',homepage='',
-                 papers=[pub.Publication('A real research paper',2024,'',URL,'GOOGLE_SCHOLAR','evidence')],
+                 papers=[pub.Publication('A real research paper',2024,'',URL,'GOOGLE_SCHOLAR','evidence', authors='Jane Smith, John Doe', venue='Journal A')],
                  pagination_status='END_OF_LIST',pages_fetched=1,works_limit=300)
     monkeypatch.setattr(pub,'fetch_scholar_profile',lambda *args,**kwargs:scholar)
     return sources,statuses,saved,queries
@@ -113,7 +115,7 @@ def test_direct_official_link_does_not_require_qwen(monkeypatch):
     monkeypatch.setattr(pub,'review_publication_identity',lambda **kwargs:pytest.fail('Qwen not needed'))
     result=pub.review_queued_scholar_candidates(1)
     assert result['status']=='SCHOLAR_VERIFIED' and len(saved)==1
-    assert sources[-1][-1]['qwen_status']=='NOT_NEEDED'
+    assert any(call[-1].get('qwen_status')=='NOT_NEEDED' for call in sources)
 
 
 def test_affiliation_alone_cannot_bypass_unavailable_qwen(monkeypatch):
@@ -206,3 +208,61 @@ def test_verified_scholar_runs_paper_research_summary(monkeypatch):
     assert calls == [(1, ['A real research paper'], URL)]
     assert any(step.get('step')=='PAPER_RESEARCH_AREAS' for step in result['steps'])
 
+
+
+def test_verified_scholar_rejects_obvious_service_rows_before_save(monkeypatch):
+    sources,statuses,saved,queries=setup_review(monkeypatch)
+    scholar={
+        'name':'Jane Smith','affiliation':'Example University','verified_email':'','homepage':'',
+        'research_interests':[],
+        'papers':[
+            pub.Publication('A real research paper',2024,'',URL,'GOOGLE_SCHOLAR','A real research paper | Jane Smith, John Doe | Journal A', authors='Jane Smith, John Doe', venue='Journal A'),
+            pub.Publication('Artifact Program Committee',2024,'',URL,'GOOGLE_SCHOLAR','Artifact Program Committee'),
+        ],
+        'pagination_status':'END_OF_LIST','pages_fetched':1,'works_limit':300,
+    }
+    monkeypatch.setattr(pub,'fetch_scholar_profile',lambda *args,**kwargs:scholar)
+    monkeypatch.setattr(pub,'review_publication_identity',lambda **kwargs:pytest.fail('Qwen identity not needed'))
+    detached=[]
+    monkeypatch.setattr(pub,'_detach_rejected_scholar_links',lambda pid,papers: detached.extend(p.title for p in papers) or len(papers))
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='SCHOLAR_VERIFIED'
+    assert [paper.title for paper in saved] == ['A real research paper']
+    assert detached == ['Artifact Program Committee']
+    filter_step=next(step for step in result['steps'] if step['step']=='SCHOLAR_PUBLICATION_FILTER')
+    assert filter_step['accepted_rows']==1
+    assert filter_step['rejected_rows']==1
+    assert filter_step['review_required_rows']==0
+
+
+def test_ambiguous_scholar_row_goes_to_staff_review_when_qwen_uncertain(monkeypatch):
+    sources,statuses,saved,queries=setup_review(monkeypatch)
+    scholar={
+        'name':'Jane Smith','affiliation':'Example University','verified_email':'','homepage':'',
+        'research_interests':[],
+        'papers':[
+            pub.Publication(
+                'The 13th International Workshop on Genetic Improvement (GI @ ICSE 2024)',
+                2024,'',URL,'GOOGLE_SCHOLAR',
+                'The 13th International Workshop on Genetic Improvement (GI @ ICSE 2024) | Jane Smith, John Doe | ICSE Companion Proceedings',
+                authors='Jane Smith, John Doe', venue='ICSE Companion Proceedings'
+            )
+        ],
+        'pagination_status':'END_OF_LIST','pages_fetched':1,'works_limit':300,
+    }
+    monkeypatch.setattr(pub,'fetch_scholar_profile',lambda *args,**kwargs:scholar)
+    monkeypatch.setattr(pub,'review_publication_identity',lambda **kwargs:pytest.fail('Qwen identity not needed'))
+    monkeypatch.setattr(
+        pub,'review_scholar_publication_candidates',
+        lambda **kwargs: SimpleNamespace(
+            status='VALID', errors=[],
+            data={'items':[{'candidate_id':'1','decision':'UNCERTAIN','confidence':0.62,'reason':'Could be proceedings or service.'}]},
+        ),
+    )
+    result=pub.review_queued_scholar_candidates(1)
+    assert result['status']=='REVIEW_REQUIRED'
+    assert not saved
+    assert result['publication_rows_review_required']==1
+    filter_step=next(step for step in result['steps'] if step['step']=='SCHOLAR_PUBLICATION_FILTER')
+    assert filter_step['status']=='REVIEW_REQUIRED'
+    assert filter_step['review_required'][0]['title'].startswith('The 13th International Workshop')

@@ -241,3 +241,83 @@ def test_paper_research_invalid_json_routes_to_staff_review(monkeypatch) -> None
     assert steps[-1]["status"] == "REVIEW_REQUIRED"
     assert steps[-1]["model_status"] == "INVALID_RESPONSE"
     assert "staff review" in steps[-1]["reason"]
+
+
+def test_scholar_publication_filter_accepts_grounded_batch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ollama_evidence,
+        "_run_cached_review",
+        lambda **kwargs: OllamaReview(
+            "VALID",
+            {
+                "items": [
+                    {
+                        "candidate_id": "1",
+                        "decision": "PUBLICATION",
+                        "confidence": 0.96,
+                        "reason": "Authored conference paper metadata.",
+                    },
+                    {
+                        "candidate_id": "2",
+                        "decision": "NOT_PUBLICATION",
+                        "confidence": 0.98,
+                        "reason": "Committee service listing.",
+                    },
+                ]
+            },
+        ),
+    )
+    review = ollama_evidence.review_scholar_publication_candidates(
+        source_record_key="scholar:test:filter",
+        institution_id=1,
+        candidates=[
+            {
+                "candidate_id": "1",
+                "title": "A real software testing paper",
+                "authors": "Jane Smith, John Doe",
+                "venue": "ICSE",
+                "year": 2025,
+            },
+            {
+                "candidate_id": "2",
+                "title": "Program Committee SEAMS 2025",
+                "authors": "",
+                "venue": "",
+                "year": 2025,
+            },
+        ],
+    )
+    assert review.status == "VALID"
+    assert [item["decision"] for item in review.data["items"]] == [
+        "PUBLICATION", "NOT_PUBLICATION"
+    ]
+
+
+def test_scholar_publication_filter_requires_one_decision_per_row(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ollama_evidence,
+        "_run_cached_review",
+        lambda **kwargs: OllamaReview(
+            "VALID",
+            {
+                "items": [
+                    {
+                        "candidate_id": "1",
+                        "decision": "PUBLICATION",
+                        "confidence": 0.9,
+                        "reason": "Looks like a paper.",
+                    }
+                ]
+            },
+        ),
+    )
+    review = ollama_evidence.review_scholar_publication_candidates(
+        source_record_key="scholar:test:missing",
+        institution_id=1,
+        candidates=[
+            {"candidate_id": "1", "title": "Paper one"},
+            {"candidate_id": "2", "title": "Paper two"},
+        ],
+    )
+    assert review.status == "INVALID_EVIDENCE"
+    assert any("exactly one decision" in error for error in review.errors)

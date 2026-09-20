@@ -11,6 +11,7 @@ from radar_store import (
     cancel_radar_job, fetch_live_indexing_status, list_radar_operations,
     recover_stalled_radar_jobs, request_topic_index, retry_radar_job,
     save_publication_review_candidate, reject_publication_candidate,
+    approve_scholar_publication_row, reject_scholar_publication_row,
     requeue_unresolved_publication_reviews,
     save_roster_review_record,
 )
@@ -114,10 +115,14 @@ def live_panel() -> None:
             )
             if display_area_step.get("interests"):
                 areas = display_area_step["interests"]
+            entry_stage = str(entry.get("stage") or "")
             area_text = ", ".join(areas) if areas else (
-                "Not established yet" if str(entry.get("stage") or "") in {
+                "Not established yet" if entry_stage in {
                     "MATCH_FACULTY_PUBLICATIONS", "QWEN_REVIEW_PUBLICATION"
-                } else "Not linked"
+                }
+                else "No accepted research category yet"
+                if entry_stage == "ENRICH_CLASSIFY_PAPER"
+                else "Not linked"
             )
             if not areas and paper_area_step.get('status')=='AWAITING_MODEL_REVIEW':
                 area_text = 'Verified papers found — awaiting Qwen research-area review'
@@ -134,6 +139,21 @@ def live_panel() -> None:
                              else 'Evidence checked — no research areas accepted')
             st.caption(f"Research area: {area_text} · "
                        f"University: {entry.get('institution_name') or 'Not available'}")
+            linked_professors = entry.get("linked_professors") or []
+            if str(entry.get("stage") or "") == "ENRICH_CLASSIFY_PAPER" and linked_professors:
+                label = "Linked professor" if len(linked_professors) == 1 else "Linked professors"
+                st.caption(f"{label}: {', '.join(str(value) for value in linked_professors)}")
+            abstract_status = str(entry.get("abstract_status") or "")
+            if abstract_status == "NO_DIRECT_METADATA_SOURCE":
+                st.caption(
+                    "Abstract metadata: no direct paper landing page is stored; "
+                    "the profile/publications URL is retained as provenance only."
+                )
+            elif abstract_status == "TITLE_CONFLICT":
+                st.caption(
+                    "Abstract metadata: fetched page title did not match this paper closely enough; "
+                    "the page was not used as paper-level evidence."
+                )
             if paper_area_step.get("interests"):
                 st.caption(
                     "Medium confidence · Research areas summarized from identity-verified papers; "
@@ -175,6 +195,16 @@ def live_panel() -> None:
                     details.append(f"saved candidates: {step['saved_candidates']}")
                 if step.get("papers_imported") is not None:
                     details.append(f"newly linked: {step['papers_imported']}")
+                if step.get("rows_seen") is not None:
+                    details.append(f"Scholar rows: {step['rows_seen']}")
+                if step.get("accepted_rows") is not None:
+                    details.append(f"accepted publications: {step['accepted_rows']}")
+                if step.get("rejected_rows") is not None:
+                    details.append(f"rejected non-publications: {step['rejected_rows']}")
+                if step.get("review_required_rows") is not None:
+                    details.append(f"staff review: {step['review_required_rows']}")
+                if step.get("qwen_reviewed_rows") is not None:
+                    details.append(f"ambiguous rows sent to Qwen: {step['qwen_reviewed_rows']}")
                 if step.get('papers_already_linked') is not None:
                     details.append(f"already linked: {step['papers_already_linked']}")
                 if step.get("deterministic_decision"):
@@ -209,6 +239,14 @@ def live_panel() -> None:
                     details.append(str(step["reason"]))
                 suffix = f" · {' · '.join(details)}" if details else ""
                 st.caption(f"• {label}: {status}{suffix}")
+                if step.get("step") == "SCHOLAR_PUBLICATION_FILTER":
+                    review_rows = step.get("review_required") or []
+                    if review_rows:
+                        titles = [str(row.get("title") or "") for row in review_rows[:8]]
+                        st.warning(
+                            "Scholar rows need staff review and were not indexed as papers: "
+                            + "; ".join(title for title in titles if title)
+                        )
 
 
 live_panel()
@@ -303,6 +341,52 @@ if operations["roster_member_issues"]:
             st.rerun()
         except ValueError as error:
             st.error(str(error))
+if operations.get("publication_row_issues"):
+    st.markdown("**Scholar rows needing publication review**")
+    st.caption(
+        "These rows were not indexed as papers because deterministic rules and Qwen "
+        "could not establish publication status with high confidence."
+    )
+    review_rows = operations["publication_row_issues"]
+    st.dataframe([{
+        "Professor": row.get("name"),
+        "University": row.get("institution_name"),
+        "Title": row.get("title"),
+        "Year": row.get("publication_year"),
+        "Authors": row.get("authors"),
+        "Venue": row.get("venue"),
+        "Qwen": row.get("model_decision") or "UNCERTAIN",
+        "Confidence": row.get("model_confidence"),
+        "Reason": row.get("model_reason"),
+    } for row in review_rows], width="stretch", hide_index=True)
+    selected_row = st.selectbox(
+        "Scholar row to review",
+        review_rows,
+        format_func=lambda row: (
+            f"{row.get('name') or 'Unknown'} — {row.get('title') or 'Untitled'}"
+        ),
+    )
+    st.caption(f"Source: {selected_row.get('source_url') or 'Not available'}")
+    left, right = st.columns(2)
+    if left.button("Accept as publication", key=f"accept_scholar_row_{selected_row['review_id']}"):
+        try:
+            approve_scholar_publication_row(
+                int(user["id"]), int(selected_row["review_id"])
+            )
+            st.success("Scholar row accepted and linked as a publication.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+    if right.button("Reject as non-publication", key=f"reject_scholar_row_{selected_row['review_id']}"):
+        try:
+            reject_scholar_publication_row(
+                int(user["id"]), int(selected_row["review_id"])
+            )
+            st.success("Scholar row rejected and kept out of the publication index.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+
 if operations["publication_identity_issues"]:
     st.markdown("**Publication sources needing review**")
     st.caption("Faculty approval is independent. Scholar papers are attached only after name plus an independent identity signal agree.")
