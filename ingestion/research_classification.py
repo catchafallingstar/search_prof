@@ -16,7 +16,7 @@ from db import get_db_connection
 from ingestion.research_seeds import RESEARCH_SEED_GROUPS
 
 
-CLASSIFICATION_VERSION = 1
+CLASSIFICATION_VERSION = 2
 USER_AGENT = "ScholarRadar/2.0 publication-metadata-enricher"
 STOP_WORDS = {
     "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
@@ -67,6 +67,19 @@ SPECIALIZED_CATEGORIES = (
             ("ai", "artificial intelligence", "machine learning", "language model", "llm", "agent"),
             ("safety", "safe", "alignment", "risk", "controllability", "reward hacking"),
         ),
+    ),
+    CategoryDefinition(
+        "evolutionary-computation", "Evolutionary Computation",
+        "Algorithms and digital systems that use evolutionary processes for search, optimization, synthesis, adaptation, or scientific study.",
+        aliases=("evolutionary computation", "evolutionary computing",
+                 "evolutionary algorithm", "evolutionary algorithms",
+                 "genetic programming", "genetic algorithm", "genetic algorithms",
+                 "lexicase selection", "coevolution", "co-evolution",
+                 "co-evolutionary", "artificial life"),
+        positive_terms=("phylogeny-informed", "phylogeny informed",
+                        "selection scheme", "selection schemes",
+                        "down-sampling", "downsampling"),
+        parent_key="artificial-intelligence",
     ),
     CategoryDefinition(
         "large-language-models", "Large Language Models",
@@ -384,6 +397,7 @@ def classify_paper(paper_id: int) -> dict[str, Any]:
             cursor.execute("SELECT * FROM research_categories WHERE active=TRUE ORDER BY id")
             categories = list(cursor.fetchall())
             accepted = 0
+            accepted_categories: list[str] = []
             for category in categories:
                 result = classify_text(dict(category), str(paper["title"]), str(paper["abstract_text"]))
                 cursor.execute(
@@ -403,14 +417,21 @@ def classify_paper(paper_id: int) -> dict[str, Any]:
                      result["combined_score"], result["decision"], result["evidence_text"] or None,
                      result["matched_terms"], CLASSIFICATION_VERSION),
                 )
-                accepted += int(result["decision"] in {"AUTO_ACCEPTED", "QWEN_ACCEPTED"})
+                if result["decision"] in {"AUTO_ACCEPTED", "QWEN_ACCEPTED"}:
+                    accepted += 1
+                    accepted_categories.append(str(category["canonical_name"]))
             cursor.execute(
                 """UPDATE papers SET classification_version=%s,
                    classified_at=NOW() WHERE id=%s""",
                 (CLASSIFICATION_VERSION, paper_id),
             )
-    return {"paper_id": paper_id, "categories_accepted": accepted,
-            "categories_checked": len(categories)}
+    return {
+        "paper_id": paper_id,
+        "categories_accepted": accepted,
+        "accepted_categories": list(dict.fromkeys(accepted_categories)),
+        "categories_checked": len(categories),
+        "classification_version": CLASSIFICATION_VERSION,
+    }
 
 
 def rebuild_professor_profiles(professor_ids: list[int] | None = None) -> int:
