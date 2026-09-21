@@ -641,9 +641,58 @@ def _publication_search(query: str, max_results: int) -> list[dict[str, Any]]:
             raise
 
 
+_PATH_LIKE_PUBLICATION_TITLE = re.compile(
+    r"^(?:https?://\S+|(?:\.\.?/)?(?:[^/\s]+/)+[^/\s]+\.(?:pdf|docx?|pptx?)|"
+    r"[^/\s]+\.(?:pdf|docx?|pptx?))$",
+    re.I,
+)
+_AUTHOR_PREFIXED_CITATION = re.compile(
+    r"^(?P<authors>(?:[A-Z]\.(?:\s*[A-Z]\.)?\s*[A-Z][A-Za-z'’.-]+"
+    r"(?:,\s*|\s+(?:and|&)\s+|,\s+(?:and|&)\s+)){1,12}"
+    r"[A-Z]\.(?:\s*[A-Z]\.)?\s*[A-Z][A-Za-z'’.-]+)\.\s+(?P<body>.+)$"
+)
+
+
 def _clean_publication_title(title: str) -> str:
     # Strip only explicitly bracketed award badges, never the raw citation.
     return re.sub(r'^\s*\[[^\]]*\baward\b[^\]]*\]\s*', '', title, flags=re.I).strip()
+
+
+def _profile_publication_title(entry: str, candidate: str) -> str:
+    """Return a plausible title from one profile/publications-page record.
+
+    Profile pages often use a PDF filename as link text or paste a complete
+    author/title/venue citation into one list item.  File paths are provenance,
+    not titles; common author-prefixed citations are reduced to their title.
+    """
+    value = _clean_publication_title(candidate)
+    if not value:
+        return ""
+
+    if _PATH_LIKE_PUBLICATION_TITLE.fullmatch(value):
+        return ""
+
+    # When the fallback candidate is the complete citation, remove a common
+    # initials+surnames author prefix and a following venue clause.
+    author_match = _AUTHOR_PREFIXED_CITATION.match(entry)
+    if author_match and value == _clean_publication_title(entry):
+        body = author_match.group("body").strip()
+        pieces = re.split(
+            r"\s+\.\s+|\.\s+(?=(?:Proceedings|Journal|Conference|Workshop|"
+            r"IEEE|ACM|Transactions|Symposium)\b)",
+            body,
+            maxsplit=1,
+            flags=re.I,
+        )
+        value = _clean_publication_title(pieces[0])
+
+    if _PATH_LIKE_PUBLICATION_TITLE.fullmatch(value):
+        return ""
+    if re.match(r"^(?:papers?|files?|docs?|downloads?)/", value, re.I):
+        return ""
+    if len(_title_key(value).split()) < 3:
+        return ""
+    return value
 
 
 def _author_year_publication(text: str, url: str, source_type: str,
@@ -767,8 +816,8 @@ def extract_publications(html: str, url: str, source_type: str, subject_name: st
         citation = re.search(r'\((?:19|20)\d{2}[a-z]?\)\.\s*(.+)', entry)
         title = title_only or (re.split(r'\.\s+', citation.group(1), maxsplit=1)[0]
                  if citation else quoted.group(1) if quoted else entry).strip()
-        title = _clean_publication_title(title)
-        if len(_title_key(title).split()) < 3:
+        title = _profile_publication_title(entry, title)
+        if not title:
             continue
         year = YEAR.search(entry)
         doi = DOI.search(entry)
@@ -1372,6 +1421,8 @@ def _save(professor_id: int, papers: list[Publication], progress: Callable[[str,
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             for index, paper in enumerate(papers, 1):
+                if not _profile_publication_title(paper.evidence or paper.title, paper.title):
+                    continue
                 if progress:
                     progress(paper.title, index, len(papers))
                 cursor.execute("""INSERT INTO papers
