@@ -12,6 +12,7 @@ from db import _require_active_admin, get_db_connection
 from settings import setting, setting_int
 from ingestion.institution_domains import OFFSHORE_SOURCE_PATTERN
 from ingestion.publication_quality import REJECT as QUALITY_REJECT, scholar_publication_quality
+from ingestion.research_classification import CLASSIFICATION_VERSION
 
 
 FACULTY_VERIFICATION_VERSION = 20
@@ -1872,7 +1873,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                                'INSTITUTIONAL_RESEARCH_PORTAL'
                            )
                        )
-                       OR paper.classification_version < 1
+                       OR paper.classification_version < %s
                    )
                      AND NOT EXISTS (
                        SELECT 1 FROM radar_jobs job
@@ -1882,7 +1883,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                      )
                    ORDER BY paper.abstract_checked_at NULLS FIRST, paper.id
                    LIMIT %s""",
-                (max(1, min(100, int(limit))),),
+                (CLASSIFICATION_VERSION, max(1, min(100, int(limit)))),
             )
             paper_ids = [int(row["id"]) for row in cursor.fetchall()]
     for paper_id in paper_ids:
@@ -2412,6 +2413,15 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                        job.result_json->'steps' AS audit_steps,
                        paper_link.professor_names AS linked_professors,
                        job.result_json->>'abstract_status' AS abstract_status,
+                       CASE
+                         WHEN jsonb_typeof(job.result_json->'accepted_categories')='array'
+                           THEN ARRAY(
+                             SELECT jsonb_array_elements_text(
+                               job.result_json->'accepted_categories'
+                             )
+                           )
+                         ELSE ARRAY[]::TEXT[]
+                       END AS paper_categories,
                        COALESCE(
                            durable_area.research_areas,
                            ARRAY_REMOVE(ARRAY[topic.requested_query], NULL),
@@ -2453,32 +2463,44 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                     END AS professor_ids
                 ) resolved_professor ON TRUE
                 LEFT JOIN LATERAL (
+                    WITH profile_labels AS (
+                        SELECT interest.display_interest AS label,
+                               COALESCE(interest.confidence, 0) * 100.0 AS score
+                        FROM professor_research_interests interest
+                        JOIN professors profile_professor
+                          ON profile_professor.id=interest.professor_id
+                        WHERE interest.professor_id = ANY(resolved_professor.professor_ids)
+                          AND profile_professor.research_profile_version >= %s
+                          AND profile_professor.research_profile_status IN (
+                              'OFFICIAL_INTERESTS','PAPER_DERIVED',
+                              'BIOGRAPHY_DERIVED','MANUAL_REVIEWED'
+                          )
+                    ),
+                    category_labels AS (
+                        SELECT category.canonical_name AS label,
+                               GREATEST(
+                                   COALESCE(profile.current_activity_score, 0),
+                                   COALESCE(profile.expertise_score, 0)
+                               ) AS score
+                        FROM professor_research_categories profile
+                        JOIN research_categories category
+                          ON category.id = profile.category_id
+                        WHERE profile.professor_id = ANY(resolved_professor.professor_ids)
+                          AND profile.status IN (
+                              'CURRENTLY_ACTIVE',
+                              'EMERGING_AREA',
+                              'ESTABLISHED_EXPERTISE'
+                          )
+                    )
                     SELECT ARRAY_AGG(ranked.label ORDER BY ranked.score DESC, ranked.label)
                                AS research_areas
                     FROM (
                         SELECT candidate.label, MAX(candidate.score) AS score
                         FROM (
-                            SELECT interest.display_interest AS label,
-                                   COALESCE(interest.confidence, 0) * 100.0 AS score
-                            FROM professor_research_interests interest
-                            WHERE interest.professor_id = ANY(resolved_professor.professor_ids)
-
+                            SELECT * FROM profile_labels
                             UNION ALL
-
-                            SELECT category.canonical_name AS label,
-                                   GREATEST(
-                                       COALESCE(profile.current_activity_score, 0),
-                                       COALESCE(profile.expertise_score, 0)
-                                   ) AS score
-                            FROM professor_research_categories profile
-                            JOIN research_categories category
-                              ON category.id = profile.category_id
-                            WHERE profile.professor_id = ANY(resolved_professor.professor_ids)
-                              AND profile.status IN (
-                                  'CURRENTLY_ACTIVE',
-                                  'EMERGING_AREA',
-                                  'ESTABLISHED_EXPERTISE'
-                              )
+                            SELECT * FROM category_labels
+                            WHERE NOT EXISTS (SELECT 1 FROM profile_labels)
                         ) candidate
                         WHERE NULLIF(BTRIM(candidate.label), '') IS NOT NULL
                         GROUP BY candidate.label
@@ -2497,7 +2519,10 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                 ORDER BY COALESCE(job.completed_at, job.updated_at) DESC
                 LIMIT %s
                 """,
-                (max(1, min(50, int(recent_limit))),),
+                (
+                    RESEARCH_PROFILE_VERSION,
+                    max(1, min(50, int(recent_limit))),
+                ),
             )
             activity_logs.extend(cursor.fetchall())
 

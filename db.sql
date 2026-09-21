@@ -1373,6 +1373,263 @@ ALTER TABLE radar_jobs ADD CONSTRAINT radar_jobs_job_type_check CHECK (job_type 
     'ENRICH_CLASSIFY_PAPER', 'CHECK_HIRING', 'CHECK_GRANTS', 'CHECK_PROGRAM_GPA'
 ));
 
+-- Remove legacy rows that were never publication titles at all. Earlier
+-- profile-page extraction could save a PDF/link path such as
+-- "papers/mascots03.pdf" as the title. These rows have no DOI and a
+-- provenance-only source, so deleting them is safer than indexing them as
+-- scholarship. Foreign-key dependents (jobs/topic evidence/links) cascade.
+DELETE FROM papers
+WHERE doi IS NULL
+  AND source_type IN (
+      'OFFICIAL_PROFILE','OFFICIAL_ALTERNATE_PROFILE',
+      'PERSONAL_SITE','LAB_SITE','INSTITUTIONAL_RESEARCH_PORTAL'
+  )
+  AND (
+      BTRIM(title) ~* '^(https?://|(/|\\./|\\.\\./)?([^/[:space:]]+/)+)[^/[:space:]]+\\.(pdf|docx?|pptx?)$'
+      OR BTRIM(title) ~* '^[^/[:space:]]+\\.(pdf|docx?|pptx?)$'
+  );
+
+CREATE TABLE IF NOT EXISTS radar_worker_heartbeats (
+    worker_id TEXT PRIMARY KEY,
+    process_id INTEGER,
+    hostname TEXT,
+    current_job_id BIGINT REFERENCES radar_jobs(id) ON DELETE SET NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    stopped_at TIMESTAMPTZ
+);
+
+-- Successful web searches are shared by worker jobs and survive restarts.
+-- Empty/error responses are deliberately not cached.
+CREATE TABLE IF NOT EXISTS web_search_cache (
+    query_key CHAR(64) PRIMARY KEY,
+    normalized_query TEXT NOT NULL,
+    results_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    provider_names TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    searched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- Provider health is shared across isolated worker job processes. Without a
+-- durable circuit breaker, each new job would immediately retry an engine that
+-- the previous job had just discovered was blocked or unavailable.
+CREATE TABLE IF NOT EXISTS web_search_provider_health (
+    provider_name TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'healthy'
+        CHECK (status IN ('healthy', 'blocked')),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    blocked_until TIMESTAMPTZ,
+    next_request_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_failure_at TIMESTAMPTZ,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Columns retained from earlier deployments because provider accounting is
+-- still useful to the university-directory recovery search.
+ALTER TABLE radar_jobs ADD COLUMN IF NOT EXISTS faculty_directory_id BIGINT
+    REFERENCES faculty_directories(id) ON DELETE CASCADE;
+ALTER TABLE web_search_provider_health
+    ADD COLUMN IF NOT EXISTS next_request_at TIMESTAMPTZ;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS usage_day DATE;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS remote_remaining INTEGER;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS remote_checked_at TIMESTAMPTZ;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS remote_reset_at TIMESTAMPTZ;
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_search_pending BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS usage_month DATE;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_this_month INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE web_search_provider_health ADD COLUMN IF NOT EXISTS requests_today INTEGER NOT NULL DEFAULT 0;
+
+
+-- A run is targeted to one user query. ScholarRadar never attempts to preload
+-- every professor or every field.
+CREATE TABLE IF NOT EXISTS radar_runs (
+    id BIGSERIAL PRIMARY KEY,
+    query_key CHAR(64) NOT NULL,
+    requested_query TEXT NOT NULL,
+    normalized_topic TEXT,
+    requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'completed', 'exhausted', 'waiting', 'failed', 'cancelled')),
+    stage TEXT NOT NULL DEFAULT 'Starting radar',
+    progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+    professors_found INTEGER NOT NULL DEFAULT 0,
+    papers_found INTEGER NOT NULL DEFAULT 0,
+    candidates_ranked INTEGER NOT NULL DEFAULT 0,
+    faculty_identities_checked INTEGER NOT NULL DEFAULT 0,
+    professors_checked INTEGER NOT NULL DEFAULT 0,
+    grants_added INTEGER NOT NULL DEFAULT 0,
+    signals_added INTEGER NOT NULL DEFAULT 0,
+    max_papers INTEGER NOT NULL DEFAULT 10 CHECK (max_papers BETWEEN 1 AND 100),
+    target_professors INTEGER NOT NULL DEFAULT 25
+        CHECK (target_professors IN (10, 25, 50, 100)),
+    web_check_limit INTEGER NOT NULL DEFAULT 12
+        CHECK (web_check_limit BETWEEN 1 AND 25),
+    error_message TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS target_professors INTEGER NOT NULL DEFAULT 25;
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS web_check_limit INTEGER NOT NULL DEFAULT 12;
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS candidates_ranked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE radar_runs ADD COLUMN IF NOT EXISTS faculty_identities_checked INTEGER NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+    ALTER TABLE radar_runs DROP CONSTRAINT IF EXISTS radar_runs_status_check;
+    ALTER TABLE radar_runs ADD CONSTRAINT radar_runs_status_check
+        CHECK (status IN ('running', 'completed', 'exhausted', 'waiting', 'failed', 'cancelled'));
+END $$;
+
+-- Every professor discovered for a run is retained, even if no explicit hiring
+-- statement is found. Hiring evidence and probable-opportunity signals are
+-- displayed as separate confidence categories in the UI.
+CREATE TABLE IF NOT EXISTS radar_run_professors (
+    radar_run_id BIGINT NOT NULL REFERENCES radar_runs(id) ON DELETE CASCADE,
+    professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+    result_rank INTEGER NOT NULL,
+    research_score NUMERIC(5, 2) NOT NULL DEFAULT 0,
+    matching_papers INTEGER NOT NULL DEFAULT 0,
+    latest_paper_title TEXT,
+    latest_paper_year INTEGER,
+    latest_paper_url TEXT,
+    grant_sources_checked BOOLEAN NOT NULL DEFAULT FALSE,
+    public_sources_checked BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_run_id, professor_id)
+);
+ALTER TABLE radar_run_professors
+    ADD COLUMN IF NOT EXISTS grant_sources_checked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE radar_run_professors
+    ADD COLUMN IF NOT EXISTS public_sources_checked BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS radar_run_results (
+    radar_run_id BIGINT NOT NULL REFERENCES radar_runs(id) ON DELETE CASCADE,
+    opportunity_id BIGINT NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_run_id, opportunity_id)
+);
+
+CREATE INDEX IF NOT EXISTS opportunities_active_search_idx
+    ON opportunities (status, position_type, research_area, application_deadline);
+CREATE INDEX IF NOT EXISTS opportunities_institution_idx ON opportunities (institution_name);
+CREATE INDEX IF NOT EXISTS professor_profiles_status_idx ON professor_profiles (verification_status);
+CREATE INDEX IF NOT EXISTS institution_memberships_status_idx ON institution_memberships (verification_status);
+CREATE INDEX IF NOT EXISTS role_verifications_status_idx ON role_verifications (status);
+CREATE INDEX IF NOT EXISTS site_admins_active_idx ON site_admins (admin_role) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS admin_audit_log_created_idx ON admin_audit_log (created_at DESC);
+CREATE INDEX IF NOT EXISTS professors_domain_idx ON professors (research_domain);
+CREATE INDEX IF NOT EXISTS professors_score_idx ON professors (radar_score DESC);
+CREATE INDEX IF NOT EXISTS hiring_signals_professor_idx ON hiring_signals (professor_id);
+CREATE INDEX IF NOT EXISTS opportunities_organic_score_idx
+    ON opportunities (status, organic_score DESC, published_at DESC);
+CREATE INDEX IF NOT EXISTS radar_runs_query_cache_idx
+    ON radar_runs (query_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS radar_runs_status_idx ON radar_runs (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS radar_run_professors_rank_idx
+    ON radar_run_professors (radar_run_id, result_rank);
+CREATE INDEX IF NOT EXISTS radar_topics_requested_idx
+    ON radar_topics (last_requested_at DESC);
+CREATE INDEX IF NOT EXISTS radar_topics_refresh_idx
+    ON radar_topics (next_refresh_at, status);
+CREATE INDEX IF NOT EXISTS radar_topic_professors_rank_idx
+    ON radar_topic_professors (radar_topic_id, is_current_match, result_rank);
+CREATE INDEX IF NOT EXISTS radar_topic_professors_current_rank_idx
+    ON radar_topic_professors (radar_topic_id, result_rank)
+    WHERE is_current_match = TRUE;
+CREATE INDEX IF NOT EXISTS radar_topic_professor_papers_current_idx
+    ON radar_topic_professor_papers (
+        radar_topic_id, professor_id, relevance_score DESC
+    )
+    WHERE is_current_match = TRUE;
+CREATE INDEX IF NOT EXISTS radar_jobs_claim_idx
+    ON radar_jobs (status, available_at, priority DESC, created_at)
+    WHERE status = 'queued';
+CREATE UNIQUE INDEX IF NOT EXISTS radar_jobs_active_dedupe_idx
+    ON radar_jobs (dedupe_key)
+    WHERE status IN ('queued', 'running');
+
+-- Topics containing decisions reset by the identity/relevance migration are
+-- eligible for immediate background refresh instead of waiting 30 days.
+UPDATE radar_topics topic
+SET next_refresh_at = NOW(), updated_at = NOW()
+WHERE EXISTS (
+    SELECT 1
+    FROM radar_topic_professors rtp
+    JOIN professors p ON p.id = rtp.professor_id
+    WHERE rtp.radar_topic_id = topic.id
+      AND p.faculty_status = 'UNVERIFIED'
+      AND p.next_identity_check_at <= NOW()
+);
+CREATE INDEX IF NOT EXISTS radar_worker_last_seen_idx
+    ON radar_worker_heartbeats (last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS web_search_cache_expiry_idx
+    ON web_search_cache (expires_at);
+CREATE INDEX IF NOT EXISTS web_search_provider_block_idx
+    ON web_search_provider_health (blocked_until)
+    WHERE status = 'blocked';
+
+-- Reconcile canonical provenance from actual current evidence. A legacy label
+-- is never enough to call a professor current faculty.
+UPDATE professors p
+SET data_origin = 'OFFICIAL_DIRECTORY'
+WHERE EXISTS (
+    SELECT 1
+    FROM faculty_directory_memberships membership
+    JOIN faculty_directories directory ON directory.id = membership.directory_id
+    WHERE membership.professor_id = p.id
+      AND membership.currently_listed = TRUE
+      AND directory.active = TRUE
+);
+
+UPDATE professors p
+SET data_origin = 'OFFICIAL_PROFILE'
+WHERE data_origin = 'OFFICIAL_DIRECTORY'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM faculty_directory_memberships membership
+      JOIN faculty_directories directory ON directory.id = membership.directory_id
+      WHERE membership.professor_id = p.id
+        AND membership.currently_listed = TRUE
+        AND directory.active = TRUE
+  )
+  AND EXISTS (
+      SELECT 1 FROM faculty_verification_evidence evidence
+      WHERE evidence.professor_id = p.id
+        AND evidence.supports_decision = TRUE
+        AND evidence.currentness = 'CURRENT'
+        AND evidence.verification_status = 'VERIFIED'
+  );
+
+UPDATE professors p
+SET faculty_status = 'UNVERIFIED', employment_status = 'UNKNOWN',
+    data_origin = 'UNVERIFIED_IMPORT', faculty_confidence = 0,
+    next_identity_check_at = NOW(), updated_at = NOW()
+WHERE faculty_status = 'VERIFIED'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM faculty_directory_memberships membership
+      JOIN faculty_directories directory ON directory.id = membership.directory_id
+      WHERE membership.professor_id = p.id
+        AND membership.currently_listed = TRUE
+        AND directory.active = TRUE
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM faculty_verification_evidence evidence
+      WHERE evidence.professor_id = p.id
+        AND evidence.supports_decision = TRUE
+        AND evidence.currentness = 'CURRENT'
+        AND evidence.verification_status = 'VERIFIED'
+  );
+
+-- Latest bounded identity pass: staff-only snippets, page reasons and affiliation trail.
+ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_search_audit JSONB NOT NULL DEFAULT '{}'::jsonb;
+;
+
 CREATE TABLE IF NOT EXISTS radar_worker_heartbeats (
     worker_id TEXT PRIMARY KEY,
     process_id INTEGER,

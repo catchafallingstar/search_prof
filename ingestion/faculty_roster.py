@@ -65,6 +65,33 @@ _NON_ROSTER_PURPOSE = re.compile(
 )
 _PERSON_TOKEN = re.compile(r"^(?:[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*|\([A-Za-zÀ-ÖØ-öø-ÿ'’.-]+\))$")
 _TRACKING_PARAMETERS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+RESEARCH_PROFILE_VERSION = 2
+_RESEARCH_COLUMN = re.compile(
+    r"^(?:research\s+(?:interests?|areas?|focus)|areas?\s+of\s+(?:research|expertise)|"
+    r"research\s+expertise|expertise|specialt(?:y|ies))$",
+    re.I,
+)
+
+
+def _compact_research_labels(value: str) -> tuple[str, ...]:
+    """Parse a dedicated official-directory expertise cell, never free prose."""
+    text = " ".join(str(value or "").split()).strip(" ;|•")
+    if not text or len(text) > 500:
+        return ()
+    chunks = re.split(r"\s*[;|•]\s*", text)
+    if len(chunks) == 1 and 1 <= text.count(",") <= 8:
+        chunks = [part.strip() for part in text.split(",")]
+    labels: list[str] = []
+    for chunk in chunks:
+        label = " ".join(chunk.strip(" .:;-–—").split())
+        words = label.split()
+        if (
+            2 <= len(label) <= 100
+            and 1 <= len(words) <= 10
+            and not re.search(r"\b(?:phone|email|office|advising)\b|\d{3}[-.\s]\d{3}[-.\s]\d{4}", label, re.I)
+        ):
+            labels.append(label)
+    return tuple(dict.fromkeys(labels))[:12]
 
 
 def _canonical_profile_url(value: str) -> str:
@@ -94,6 +121,7 @@ class RosterMember:
     office_address: str = ""
     section_heading: str = ""
     raw_card_html: str = ""
+    research_interests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -302,13 +330,23 @@ def _table_roster_members(root: object, directory_url: str) -> list[RosterMember
                           if str(a.get("href") or "").casefold().startswith("mailto:")), "")
             office_index = next((i for i, value in enumerate(headers) if "office" in value and "phone" not in value), None)
             department_index = next((i for i, value in enumerate(headers) if "department" in value), None)
+            research_index = next(
+                (i for i, value in enumerate(headers) if _RESEARCH_COLUMN.fullmatch(value.strip())),
+                None,
+            )
             section = cells[department_index].get_text(" ", strip=True) if department_index is not None and department_index < len(cells) else ""
+            research_interests = (
+                _compact_research_labels(cells[research_index].get_text(" ", strip=True))
+                if research_index is not None and research_index < len(cells)
+                else ()
+            )
             members.append(RosterMember(
                 name=name, title=role.group(0).strip() if role else "", profile_url=profile_url,
                 appointment_type=_appointment_type(context), excerpt=context[:500], email=email,
                 office_address=cells[office_index].get_text(" ", strip=True) if office_index is not None and office_index < len(cells) else "",
                 section_heading=section,
                 raw_card_html=str(row)[:24000],
+                research_interests=research_interests,
             ))
     return members
 
@@ -1163,6 +1201,66 @@ def crawl_directory(
                     )
                 professor_id = int(cursor.fetchone()["id"])
                 promoted += 1
+
+                # A dedicated expertise/research column on an approved official
+                # roster is direct professor-level evidence. It outranks
+                # biography and paper-summary fallbacks, but never overwrites a
+                # staff-reviewed profile.
+                if member.research_interests:
+                    cursor.execute(
+                        """SELECT 1 FROM professor_research_interests
+                           WHERE professor_id=%s AND evidence_method='MANUAL_REVIEW'
+                           LIMIT 1""",
+                        (professor_id,),
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            "DELETE FROM professor_research_interests WHERE professor_id=%s",
+                            (professor_id,),
+                        )
+                        excerpt = " | ".join(member.research_interests)
+                        for display in member.research_interests:
+                            normalized = " ".join(
+                                re.findall(r"[a-z0-9]+", display.casefold())
+                            )
+                            if not normalized:
+                                continue
+                            cursor.execute(
+                                """INSERT INTO professor_research_interests
+                                   (professor_id,display_interest,normalized_interest,
+                                    evidence_method,source_url,source_excerpt,confidence)
+                                   VALUES (%s,%s,%s,'EXPLICIT_PROFILE_SECTION',%s,%s,0.980)
+                                   ON CONFLICT (professor_id,normalized_interest,source_url)
+                                   DO UPDATE SET display_interest=EXCLUDED.display_interest,
+                                     evidence_method=EXCLUDED.evidence_method,
+                                     source_excerpt=EXCLUDED.source_excerpt,
+                                     confidence=EXCLUDED.confidence,checked_at=NOW()""",
+                                (
+                                    professor_id,
+                                    display,
+                                    normalized,
+                                    str(directory["directory_url"]),
+                                    excerpt,
+                                ),
+                            )
+                        cursor.execute(
+                            """UPDATE professors SET
+                                   research_profile_status='OFFICIAL_INTERESTS',
+                                   research_profile_primary_field=%s,
+                                   research_profile_source_url=%s,
+                                   research_profile_confidence=0.980,
+                                   research_profile_version=%s,
+                                   research_profile_checked_at=NOW(),
+                                   updated_at=NOW()
+                               WHERE id=%s""",
+                            (
+                                str(directory.get("department") or ""),
+                                str(directory["directory_url"]),
+                                RESEARCH_PROFILE_VERSION,
+                                professor_id,
+                            ),
+                        )
+
                 cursor.execute(
                     "UPDATE roster_member_candidates SET professor_id=%s WHERE id=%s",
                     (professor_id, candidate_id),
