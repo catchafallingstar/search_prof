@@ -69,3 +69,22 @@ def test_description_without_matching_title_cannot_supply_an_abstract() -> None:
     """)
     assert metadata["title"] == "Unrelated university home page"
     assert metadata["abstract"] == "General university description"
+
+
+def test_evolutionary_computation_accepts_genetic_programming_and_lexicase() -> None:
+    result = classify_text(
+        _category("evolutionary-computation"),
+        "Improving Lexicase Selection with Informed Down-Sampling",
+        "We evaluate selection schemes for genetic programming.",
+    )
+    assert result["decision"] == "AUTO_ACCEPTED"
+    assert result["combined_score"] >= 65
+
+
+def test_evolutionary_computation_accepts_coevolutionary_phylogeny_title() -> None:
+    result = classify_text(
+        _category("evolutionary-computation"),
+        "Accelerating Co-Evolutionary Learning Through Phylogeny-Informed Interaction Estimation",
+        "",
+    )
+    assert result["decision"] == "AUTO_ACCEPTED"
