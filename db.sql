@@ -1384,7 +1384,13 @@ WHERE doi IS NULL
       'OFFICIAL_PROFILE','OFFICIAL_ALTERNATE_PROFILE',
       'PERSONAL_SITE','LAB_SITE','INSTITUTIONAL_RESEARCH_PORTAL'
   )
-  AND BTRIM(title) ~* '^(?:https?://\\S+|(?:\\.?\\.?/)?(?:[^/[:space:]]+/)+[^/[:space:]]+\\.(pdf|docx?|pptx?)|[^/[:space:]]+\\.(pdf|docx?|pptx?))
+  AND (
+      BTRIM(title) ~* '^(https?://|(/|\\./|\\.\\./)?([^/[:space:]]+/)+)[^/[:space:]]+\\.(pdf|docx?|pptx?)$'
+      OR BTRIM(title) ~* '^[^/[:space:]]+\\.(pdf|docx?|pptx?)$'
+  );
+
+CREATE TABLE IF NOT EXISTS radar_worker_heartbeats (
+    worker_id TEXT PRIMARY KEY,
     process_id INTEGER,
     hostname TEXT,
     current_job_id BIGINT REFERENCES radar_jobs(id) ON DELETE SET NULL,
