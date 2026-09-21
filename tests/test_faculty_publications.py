@@ -501,3 +501,27 @@ def test_research_interest_extraction_rejects_profile_navigation_labels() -> Non
     assert "Resources" not in interests
     assert "Quick Links" not in interests
     assert "College of Engineering & Computing" not in interests
+
+
+def test_profile_publication_parser_rejects_pdf_path_as_title() -> None:
+    html = """<main><h2>Publications</h2>
+    <ul><li><a href="/papers/mascots03.pdf">papers/mascots03.pdf</a></li></ul>
+    </main>"""
+    papers = extract_publications(
+        html, "https://kurmasgvsu.github.io/publications.html",
+        "PERSONAL_SITE", "Zachary Kurmas",
+    )
+    assert papers == []
+
+
+def test_profile_publication_parser_strips_authors_and_venue_from_citation() -> None:
+    html = """<main><h2>Publications</h2>
+    <ul><li>Z. Kurmas and A. Chervenak. Evaluating backup algorithms . Proceedings
+    of the Eighth Goddard Conference on Mass Storage Systems and Technologies,
+    March 2000</li></ul></main>"""
+    papers = extract_publications(
+        html, "https://kurmasgvsu.github.io/publications.html",
+        "PERSONAL_SITE", "Zachary Kurmas",
+    )
+    assert len(papers) == 1
+    assert papers[0].title == "Evaluating backup algorithms"
