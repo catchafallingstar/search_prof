@@ -40,6 +40,6 @@ jobs:
       - run: python -m scripts.apply_schema
       - name: Bootstrap CI owner
         run: python -m scripts.bootstrap_owner --email "$DEV_USER_EMAIL" --name "$DEV_USER_NAME" --create-local-user
-      - run: python -m pytest -q
+      - run: python -m pytest -q tests
       - run: python -m scripts.smoke_test_db
       - run: python -m scripts.smoke_test_streamlit
