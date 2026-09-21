@@ -427,3 +427,29 @@ def test_teaching_professor_tracks_do_not_enter_research_group_pipeline() -> Non
     assert eligible_research_group_leader(
         "Research Professor", "RESEARCH"
     )
+
+
+def test_table_roster_preserves_dedicated_research_expertise_column() -> None:
+    html = """
+    <title>College of Computing Faculty</title><main><h1>Faculty Directory</h1>
+    <table>
+      <tr><th>Name</th><th>Position</th><th>Expertise</th><th>Profile</th></tr>
+      <tr><td>Alexander Lalejini</td><td>Assistant Professor</td>
+          <td>Evolutionary Computation, Evolutionary Biology, Artificial Life</td>
+          <td><a href="/profile/lalejini">View Profile</a></td></tr>
+      <tr><td>Zachary Kurmas</td><td>Professor</td>
+          <td>Accessibility &amp; CS Pedagogy, Computer Science Theory, Computer Architecture</td>
+          <td><a href="/profile/kurmas">View Profile</a></td></tr>
+      <tr><td>Jane Doe</td><td>Associate Professor</td>
+          <td>Data Science, Visualization</td>
+          <td><a href="/profile/doe">View Profile</a></td></tr>
+    </table></main>
+    """
+    members = parse_faculty_directory(html, "https://example.edu/computing/faculty")
+    by_name = {member.name: member for member in members}
+    assert by_name["Alexander Lalejini"].research_interests == (
+        "Evolutionary Computation", "Evolutionary Biology", "Artificial Life",
+    )
+    assert by_name["Zachary Kurmas"].research_interests == (
+        "Accessibility & CS Pedagogy", "Computer Science Theory", "Computer Architecture",
+    )
