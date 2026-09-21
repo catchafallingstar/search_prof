@@ -7,6 +7,8 @@ from urllib.parse import parse_qs, urlparse
 
 from db import get_db_connection
 from settings import setting
+from ingestion.research_classification import CLASSIFICATION_VERSION
+from ingestion.roster_topic_index import RADAR_DISCOVERY_VERSION, RESEARCH_PROFILE_VERSION
 
 
 @dataclass(frozen=True)
@@ -122,10 +124,95 @@ def check_runtime() -> list[Check]:
                 checks.append(Check("PASS" if workers >= 1 else "FAIL", "Background worker",
                                     f"{workers} healthy worker(s) reported recently." if workers else "No worker heartbeat in the last ten minutes."))
 
-                cursor.execute("SELECT COUNT(*) AS total FROM radar_topics WHERE discovery_version < 3")
+                cursor.execute(
+                    "SELECT COUNT(*) AS total FROM radar_topics WHERE discovery_version < %s",
+                    (RADAR_DISCOVERY_VERSION,),
+                )
                 old_topics = int((cursor.fetchone() or {}).get("total") or 0)
-                checks.append(Check("WARN" if old_topics else "PASS", "Exact-evidence rebuild",
-                                    f"{old_topics} topic(s) still need a version-3 rebuild." if old_topics else "All existing topics use discovery version 3."))
+                checks.append(Check(
+                    "WARN" if old_topics else "PASS",
+                    "Exact-evidence rebuild",
+                    (
+                        f"{old_topics} topic(s) still need a version-{RADAR_DISCOVERY_VERSION} rebuild."
+                        if old_topics
+                        else f"All existing topics use discovery version {RADAR_DISCOVERY_VERSION}."
+                    ),
+                ))
+
+                cursor.execute(
+                    """SELECT COUNT(*) AS total
+                       FROM professors
+                       WHERE faculty_status='VERIFIED'
+                         AND research_profile_version < %s""",
+                    (RESEARCH_PROFILE_VERSION,),
+                )
+                stale_profiles = int((cursor.fetchone() or {}).get("total") or 0)
+                checks.append(Check(
+                    "WARN" if stale_profiles else "PASS",
+                    "Research profiles",
+                    (
+                        f"{stale_profiles} verified professor profile(s) are waiting for "
+                        f"research-profile version {RESEARCH_PROFILE_VERSION}."
+                        if stale_profiles
+                        else f"Verified professor profiles use version {RESEARCH_PROFILE_VERSION}."
+                    ),
+                ))
+
+                cursor.execute(
+                    "SELECT COUNT(*) AS total FROM papers WHERE classification_version < %s",
+                    (CLASSIFICATION_VERSION,),
+                )
+                stale_papers = int((cursor.fetchone() or {}).get("total") or 0)
+                checks.append(Check(
+                    "WARN" if stale_papers else "PASS",
+                    "Paper classification",
+                    (
+                        f"{stale_papers} paper(s) are waiting for classification version "
+                        f"{CLASSIFICATION_VERSION}."
+                        if stale_papers
+                        else f"Stored papers use classification version {CLASSIFICATION_VERSION}."
+                    ),
+                ))
+
+                cursor.execute(
+                    """SELECT COUNT(*) AS total
+                       FROM papers
+                       WHERE BTRIM(title) ~* '^(?:https?://\\S+|(?:\\.?\\.?/)?(?:[^/[:space:]]+/)+[^/[:space:]]+\\.(pdf|docx?|pptx?)|[^/[:space:]]+\\.(pdf|docx?|pptx?))
+                failed_jobs = int((cursor.fetchone() or {}).get("total") or 0)
+                checks.append(Check("WARN" if failed_jobs else "PASS", "Failed background jobs",
+                                    f"{failed_jobs} failed job(s) need staff review." if failed_jobs else "No failed jobs are waiting."))
+    except Exception as error:
+        checks.append(Check("FAIL", "Database connection", f"Could not complete runtime checks: {type(error).__name__}."))
+    return checks
+
+
+def main() -> int:
+    checks = check_configuration()
+    if not any(check.level == "FAIL" for check in checks):
+        checks.extend(check_runtime())
+
+    for check in checks:
+        print(f"{check.level:4}  {check.name}: {check.message}")
+    failures = sum(check.level == "FAIL" for check in checks)
+    warnings = sum(check.level == "WARN" for check in checks)
+    print(f"\nProduction readiness: {failures} failure(s), {warnings} warning(s).")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+                )
+                malformed_titles = int((cursor.fetchone() or {}).get("total") or 0)
+                checks.append(Check(
+                    "WARN" if malformed_titles else "PASS",
+                    "Publication title quality",
+                    (
+                        f"{malformed_titles} path/file-like publication title(s) remain."
+                        if malformed_titles
+                        else "No path/file-like publication titles remain."
+                    ),
+                ))
 
                 cursor.execute("SELECT COUNT(*) AS total FROM radar_jobs WHERE status = 'failed'")
                 failed_jobs = int((cursor.fetchone() or {}).get("total") or 0)
