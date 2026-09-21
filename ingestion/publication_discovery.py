@@ -84,7 +84,7 @@ NON_PROFILE_PATH = re.compile(
     r"/(?:news|events?|awards?|honors?|alumni|archive|stories?|press|jobs?)(?:/|$)",
     re.I,
 )
-PUBLICATION_DISCOVERY_VERSION = 14
+PUBLICATION_DISCOVERY_VERSION = 15
 SCHOLAR_SUFFIXES = frozenset({'com','co.uk','com.tr','de','fr','ca','com.au','co.in',
     'co.jp','com.br','es','it','nl','ch','se','no','dk','fi','at','be','pl','pt',
     'co.nz','co.za','com.mx','com.sg','com.hk','com.tw','co.kr','co.id'})
@@ -646,6 +646,65 @@ def _clean_publication_title(title: str) -> str:
     return re.sub(r'^\s*\[[^\]]*\baward\b[^\]]*\]\s*', '', title, flags=re.I).strip()
 
 
+_GENERIC_PUBLICATION_LINK = re.compile(
+    r"^(?:pdf|paper|poster|abstract|full\s*text|doi|download|view|link)$", re.I
+)
+_FILE_REFERENCE_TITLE = re.compile(
+    r"^(?:https?://\S+|(?:[^/\s]+/)+[^/\s]+\.(?:pdf|docx?|pptx?))$", re.I
+)
+_RAW_CITATION_TITLE = re.compile(
+    r"^[A-Z]\.\s+[^.]{1,220}\.\s+.+\b(?:Proceedings|Conference|Workshop|Journal)\b.*\b(?:19|20)\d{2}\b",
+    re.I,
+)
+
+
+def _looks_like_non_title(value: str) -> bool:
+    """Reject file references and obvious full citations used as titles."""
+    cleaned = " ".join(str(value or "").split()).strip()
+    return bool(
+        not cleaned
+        or _FILE_REFERENCE_TITLE.fullmatch(cleaned)
+        or _RAW_CITATION_TITLE.search(cleaned)
+    )
+
+
+def _linked_publication_title(node: Any) -> str:
+    """Prefer descriptive publication-link text over the surrounding citation."""
+    candidates: list[str] = []
+    for anchor in node.find_all("a", href=True):
+        label = " ".join(anchor.get_text(" ", strip=True).split()).strip(" .")
+        if not label or _GENERIC_PUBLICATION_LINK.fullmatch(label):
+            continue
+        if _FILE_REFERENCE_TITLE.fullmatch(label):
+            continue
+        words = _title_key(label).split()
+        if len(words) >= 3 and len(label) <= 500:
+            candidates.append(label)
+    return max(candidates, key=len) if candidates else ""
+
+
+def _malformed_href_publication_title(entry: str) -> str:
+    """Recover a title from broken HTML printed literally as href=...>Title."""
+    match = re.search(
+        r"\bhref\s*=\s*[\"']?[^\"'>\s]+[\"']?\s*>\s*(.+)",
+        entry,
+        re.I,
+    )
+    if not match:
+        return ""
+    remainder = match.group(1).strip()
+    title = re.split(
+        r"\.\s+(?=(?:Proceedings|Journal|Conference|Workshop|IEEE|ACM|"
+        r"Transactions|International|GVSU_|Presented\b))",
+        remainder,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" .")
+    if len(_title_key(title).split()) < 3 or _looks_like_non_title(title):
+        return ""
+    return title
+
+
 def _author_year_publication(text: str, url: str, source_type: str,
                              subject_name: str) -> Publication | None:
     """Recognize attributable citations even without a Publications heading.
@@ -734,7 +793,7 @@ def extract_publications(html: str, url: str, source_type: str, subject_name: st
                 if id(node) in consumed:
                     continue
                 nested = node.find_all(['ul', 'ol'], recursive=False) if node.name == 'li' else []
-                title_only = ''
+                title_only = _linked_publication_title(node)
                 if nested:
                     # A book's indented editor/publisher lines belong to that
                     # book. Do not flatten them into its title or emit them again.
@@ -746,7 +805,7 @@ def extract_publications(html: str, url: str, source_type: str, subject_name: st
                         lst.decompose()
                     candidate_title = own.get_text(' ', strip=True).strip(' .')
                     if metadata and all(is_metadata(value) for value in metadata) and len(candidate_title.split()) >= 3:
-                        title_only = candidate_title
+                        title_only = title_only or candidate_title
                         consumed.update(id(child) for child in node.find_all())
                     else:
                         # Group labels such as "Books" aren't publications;
@@ -762,13 +821,16 @@ def extract_publications(html: str, url: str, source_type: str, subject_name: st
         if re.match(r'^(?:(?:19|20)\d{2}\s+)?(?:Ph\.?D\.?|M\.?Sc\.?|B\.?A\.?|M\.?A\.?|Education|Office|Email)\b', entry, re.I):
             continue
         quoted = re.search(r"[\"“]([^\"”]{12,350})[\"”]", entry)
+        malformed_href_title = _malformed_href_publication_title(entry)
         # Author-year citations can contain a short quoted phrase *within*
         # their title. Do not discard its unquoted subtitle.
         citation = re.search(r'\((?:19|20)\d{2}[a-z]?\)\.\s*(.+)', entry)
-        title = title_only or (re.split(r'\.\s+', citation.group(1), maxsplit=1)[0]
-                 if citation else quoted.group(1) if quoted else entry).strip()
+        title = title_only or malformed_href_title or (
+            re.split(r'\.\s+', citation.group(1), maxsplit=1)[0]
+            if citation else quoted.group(1) if quoted else entry
+        ).strip()
         title = _clean_publication_title(title)
-        if len(_title_key(title).split()) < 3:
+        if len(_title_key(title).split()) < 3 or _looks_like_non_title(title):
             continue
         year = YEAR.search(entry)
         doi = DOI.search(entry)
@@ -1367,6 +1429,8 @@ def _record_source(professor_id: int, source_type: str, url: str, status: str, e
 
 
 def _save(professor_id: int, papers: list[Publication], progress: Callable[[str, int, int], None] | None) -> int:
+    # Never persist a path/URL or an obvious whole citation as the paper title.
+    papers = [paper for paper in papers if not _looks_like_non_title(paper.title)]
     imported = 0
     paper_ids: list[int] = []
     with get_db_connection() as connection:
@@ -1398,6 +1462,39 @@ def _save(professor_id: int, papers: list[Publication], progress: Callable[[str,
                     VALUES (%s,%s,'NOT_CHECKED',2) ON CONFLICT DO NOTHING""", (professor_id, paper_id))
                 imported += int(cursor.rowcount > 0)
             if papers:
+                # Older parser versions could persist a PDF path or an entire
+                # bibliography citation as the title. Once this professor is
+                # refreshed, detach those malformed provenance-only rows. The
+                # newly parsed clean publication remains linked above.
+                cursor.execute(
+                    r"""DELETE FROM professor_papers link
+                       USING papers stale
+                       WHERE link.professor_id=%s
+                         AND stale.id=link.paper_id
+                         AND stale.source_type IN (
+                             'OFFICIAL_PROFILE','OFFICIAL_ALTERNATE_PROFILE',
+                             'PERSONAL_SITE','LAB_SITE','INSTITUTIONAL_RESEARCH_PORTAL'
+                         )
+                         AND (
+                             stale.title ~* '^(https?://\S+|([^/[:space:]]+/)+[^/[:space:]]+\.(pdf|docx?|pptx?))$'
+                             OR stale.title ~* '^[A-Z]\.\s+[^.]{1,220}\.\s+.+\m(Proceedings|Conference|Workshop|Journal)\M.*\m(19|20)[0-9]{2}\M'
+                         )""",
+                    (professor_id,),
+                )
+                cursor.execute(
+                    r"""DELETE FROM papers stale
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM professor_papers link WHERE link.paper_id=stale.id
+                       )
+                         AND stale.source_type IN (
+                             'OFFICIAL_PROFILE','OFFICIAL_ALTERNATE_PROFILE',
+                             'PERSONAL_SITE','LAB_SITE','INSTITUTIONAL_RESEARCH_PORTAL'
+                         )
+                         AND (
+                             stale.title ~* '^(https?://\S+|([^/[:space:]]+/)+[^/[:space:]]+\.(pdf|docx?|pptx?))$'
+                             OR stale.title ~* '^[A-Z]\.\s+[^.]{1,220}\.\s+.+\m(Proceedings|Conference|Workshop|Journal)\M.*\m(19|20)[0-9]{2}\M'
+                         )"""
+                )
                 cursor.execute("UPDATE radar_topics SET next_refresh_at=NOW(),updated_at=NOW()")
     if paper_ids:
         # Queue metadata/category work after the import transaction commits.

@@ -137,8 +137,20 @@ def live_panel() -> None:
             elif not areas and interest_step.get('status')=='NO_SUPPORTED_INTERESTS':
                 area_text = ('No direct research interests found' if interest_step.get('evidence_status')=='NO_DIRECT_INTEREST_EVIDENCE'
                              else 'Evidence checked — no research areas accepted')
-            st.caption(f"Research area: {area_text} · "
-                       f"University: {entry.get('institution_name') or 'Not available'}")
+            if entry_stage == "ENRICH_CLASSIFY_PAPER":
+                st.caption(
+                    f"Paper category: {area_text} · "
+                    f"University: {entry.get('institution_name') or 'Not available'}"
+                )
+                professor_areas = entry.get("professor_research_areas") or []
+                if professor_areas:
+                    st.caption(
+                        "Professor research profile: "
+                        + ", ".join(str(value) for value in professor_areas)
+                    )
+            else:
+                st.caption(f"Research area: {area_text} · "
+                           f"University: {entry.get('institution_name') or 'Not available'}")
             linked_professors = entry.get("linked_professors") or []
             if str(entry.get("stage") or "") == "ENRICH_CLASSIFY_PAPER" and linked_professors:
                 label = "Linked professor" if len(linked_professors) == 1 else "Linked professors"

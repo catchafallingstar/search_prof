@@ -69,3 +69,22 @@ def test_description_without_matching_title_cannot_supply_an_abstract() -> None:
     """)
     assert metadata["title"] == "Unrelated university home page"
     assert metadata["abstract"] == "General university description"
+
+
+def test_broad_single_word_education_is_not_auto_accepted_from_incidental_word() -> None:
+    category = {
+        "category_key": "education",
+        "canonical_name": "Education",
+        "description": "Research focused on Education.",
+        "aliases": ["Education"],
+        "positive_terms": [],
+        "exclusion_terms": [],
+        "breadth": "BROAD",
+    }
+    result = classify_text(
+        category,
+        "Empirical: A scientific software library for research, education, and public engagement",
+        "A software library supporting reproducible computational research and public engagement.",
+    )
+    assert result["decision"] != "AUTO_ACCEPTED"
+    assert result["combined_score"] <= 54

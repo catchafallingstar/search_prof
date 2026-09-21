@@ -16,7 +16,7 @@ from db import get_db_connection
 from ingestion.research_seeds import RESEARCH_SEED_GROUPS
 
 
-CLASSIFICATION_VERSION = 1
+CLASSIFICATION_VERSION = 2
 USER_AGENT = "ScholarRadar/2.0 publication-metadata-enricher"
 STOP_WORDS = {
     "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
@@ -231,6 +231,21 @@ def classify_text(category: dict[str, Any], title: str, abstract: str = "") -> d
         concepts_satisfied = False
     if definition.concept_groups and not concepts_satisfied:
         combined = min(combined, 54.0)
+
+    # A single generic word such as "Education", "Biology", or "History"
+    # can occur incidentally in an otherwise unrelated title/abstract.  Seeded
+    # broad one-word fields therefore need semantic/manual evidence beyond the
+    # bare field name; deterministic lexical matching alone may request review
+    # but cannot auto-accept the paper into that field.
+    broad_tokens = _tokens(definition.name)
+    if (
+        definition.breadth == "BROAD"
+        and len(broad_tokens) == 1
+        and not definition.concept_groups
+        and not definition.positive_terms
+    ):
+        combined = min(combined, 54.0)
+
     combined = round(combined, 2)
     decision = (
         "AUTO_ACCEPTED" if combined >= 65 and concepts_satisfied

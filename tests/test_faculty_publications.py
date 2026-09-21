@@ -501,3 +501,33 @@ def test_research_interest_extraction_rejects_profile_navigation_labels() -> Non
     assert "Resources" not in interests
     assert "Quick Links" not in interests
     assert "College of Engineering & Computing" not in interests
+
+
+def test_publication_parser_prefers_linked_title_over_full_citation() -> None:
+    html = '''<main><h1>Refereed Publications</h1><ul>
+    <li>Z. Kurmas, R. Becker-Szendy, and K. Keeton.
+      <a href="paper.pdf">Iterative development of an I/O workload characterization</a> .
+      Proceedings of 3rd Workshop on Computer Architecture Evaluation Using Commercial Workloads (CAECW), January 2001.</li>
+    <li>Z. Kurmas and A. Chervenak.
+      <a href="backup.pdf">Evaluating backup algorithms</a> .
+      Proceedings of the Eighth Goddard Conference on Mass Storage Systems and Technologies, March 2000</li>
+    </ul></main>'''
+    papers = extract_publications(
+        html, 'https://example.edu/publications.html', 'PERSONAL_SITE', 'Zachary Kurmas'
+    )
+    assert [paper.title for paper in papers] == [
+        'Iterative development of an I/O workload characterization',
+        'Evaluating backup algorithms',
+    ]
+
+
+def test_publication_parser_recovers_title_from_literal_broken_href() -> None:
+    html = '''<main><h1>Refereed Publications</h1><ul><li>
+    Z. Kurmas, K. Keeton, and K. Mackenzie. href="papers/mascots03.pdf">Synthesizing representative I/O workloads using iterative distillation. Proceedings of the 11th IEEE/ACM International Symposium on Modeling, Analysis and Simulation of Computer and Telecommunications Systems (MASCOTS), October 2003.
+    </li></ul></main>'''
+    papers = extract_publications(
+        html, 'https://example.edu/publications.html', 'PERSONAL_SITE', 'Zachary Kurmas'
+    )
+    assert len(papers) == 1
+    assert papers[0].title == 'Synthesizing representative I/O workloads using iterative distillation'
+    assert papers[0].title != 'papers/mascots03.pdf'

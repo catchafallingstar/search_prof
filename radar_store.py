@@ -1821,8 +1821,9 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                      )
                      AND (
                          p.publication_status = 'NOT_CHECKED'
-                         OR (p.publication_discovery_version < 14
-                             AND NOT EXISTS (SELECT 1 FROM professor_papers pp WHERE pp.professor_id=p.id))
+                         OR p.publication_checked_at IS NULL
+                         OR p.publication_checked_at <= NOW() - INTERVAL '30 days'
+                         OR p.publication_discovery_version < 15
                          OR p.research_profile_version < %s
                      )
                      AND NOT EXISTS (
@@ -2412,11 +2413,17 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                        job.result_json->'steps' AS audit_steps,
                        paper_link.professor_names AS linked_professors,
                        job.result_json->>'abstract_status' AS abstract_status,
-                       COALESCE(
-                           durable_area.research_areas,
-                           ARRAY_REMOVE(ARRAY[topic.requested_query], NULL),
-                           ARRAY[]::TEXT[]
-                       ) AS research_areas
+                       CASE
+                           WHEN job.job_type='ENRICH_CLASSIFY_PAPER'
+                             THEN COALESCE(paper_area.research_areas, ARRAY[]::TEXT[])
+                           ELSE COALESCE(
+                               durable_area.research_areas,
+                               ARRAY_REMOVE(ARRAY[topic.requested_query], NULL),
+                               ARRAY[]::TEXT[]
+                           )
+                       END AS research_areas,
+                       COALESCE(durable_area.research_areas, ARRAY[]::TEXT[])
+                           AS professor_research_areas
                 FROM radar_jobs job
                 LEFT JOIN professors professor ON professor.id = job.professor_id
                 LEFT JOIN papers paper ON paper.id = job.paper_id
@@ -2452,6 +2459,18 @@ def fetch_live_indexing_status(admin_user_id: int, recent_limit: int = 20) -> di
                         ELSE COALESCE(paper_link.professor_ids, ARRAY[]::BIGINT[])
                     END AS professor_ids
                 ) resolved_professor ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT ARRAY_AGG(
+                               category.canonical_name
+                               ORDER BY classification.combined_score DESC,
+                                        category.canonical_name
+                           ) AS research_areas
+                    FROM paper_research_categories classification
+                    JOIN research_categories category
+                      ON category.id=classification.category_id
+                    WHERE classification.paper_id=job.paper_id
+                      AND classification.decision IN ('AUTO_ACCEPTED','QWEN_ACCEPTED')
+                ) paper_area ON job.paper_id IS NOT NULL
                 LEFT JOIN LATERAL (
                     SELECT ARRAY_AGG(ranked.label ORDER BY ranked.score DESC, ranked.label)
                                AS research_areas
