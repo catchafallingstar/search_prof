@@ -5,7 +5,7 @@ from ingestion.ollama_evidence import OllamaReview
 
 
 def test_research_profile_version_is_current():
-    assert pub.RESEARCH_PROFILE_VERSION == 2
+    assert pub.RESEARCH_PROFILE_VERSION == 3
 
 
 def professor():
@@ -34,6 +34,7 @@ def test_representative_paper_payload_keeps_recent_and_older_work():
 
 
 def test_verified_papers_create_profile_and_replace_weaker_fallback(monkeypatch):
+    monkeypatch.setattr(pub, "_research_profile_is_authoritative", lambda _pid: False)
     saved = {}
     state = {}
     monkeypatch.setattr(
@@ -80,6 +81,7 @@ def test_verified_papers_create_profile_and_replace_weaker_fallback(monkeypatch)
 
 
 def test_no_papers_and_no_biography_goes_to_manual_review(monkeypatch):
+    monkeypatch.setattr(pub, "_research_profile_is_authoritative", lambda _pid: False)
     calls = []
     monkeypatch.setattr(
         pub, "review_research_interest_summary",
@@ -95,6 +97,7 @@ def test_no_papers_and_no_biography_goes_to_manual_review(monkeypatch):
 
 
 def test_biography_is_used_only_as_grounded_fallback(monkeypatch):
+    monkeypatch.setattr(pub, "_research_profile_is_authoritative", lambda _pid: False)
     saved = {}
     state = {}
     monkeypatch.setattr(
@@ -129,3 +132,32 @@ def test_biography_is_used_only_as_grounded_fallback(monkeypatch):
     assert saved["replace_all"] is True
     assert state["status"] == "BIOGRAPHY_DERIVED"
     assert state["primary_field"] == "Communication"
+
+
+def test_authoritative_directory_interests_block_paper_summary(monkeypatch):
+    monkeypatch.setattr(pub, "_research_profile_is_authoritative", lambda _pid: True)
+    monkeypatch.setattr(
+        pub, "review_paper_research_summary",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model must not run")),
+    )
+    steps = []
+    pub._store_paper_research_summary(
+        1, professor(),
+        [pub.Publication("Paper A", 2026, "", "https://example.test", "OFFICIAL_PROFILE", "Paper A")],
+        "https://example.test", steps, queue_on_failure=False,
+    )
+    assert steps[-1]["status"] == "AUTHORITATIVE_PROFILE_RETAINED"
+
+
+def test_authoritative_directory_interests_block_biography_guess(monkeypatch):
+    monkeypatch.setattr(pub, "_research_profile_is_authoritative", lambda _pid: True)
+    monkeypatch.setattr(
+        pub, "review_research_interest_summary",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model must not run")),
+    )
+    steps = []
+    pub._store_interest_fallback(
+        1, professor(), [], "Jane has a long biography about many projects.",
+        "https://example.test/jane", steps, queue_on_failure=False,
+    )
+    assert steps[-1]["status"] == "AUTHORITATIVE_PROFILE_RETAINED"

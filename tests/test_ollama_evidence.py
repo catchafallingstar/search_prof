@@ -277,6 +277,7 @@ def test_paper_research_invalid_json_routes_to_staff_review(monkeypatch) -> None
         ),
     )
     monkeypatch.setattr(publications, "_research_profile_has_any_interests", lambda _pid: False)
+    monkeypatch.setattr(publications, "_research_profile_is_authoritative", lambda _pid: False)
     monkeypatch.setattr(publications, "_set_research_profile_state", lambda *args, **kwargs: None)
     steps = []
     publications._store_paper_research_summary(

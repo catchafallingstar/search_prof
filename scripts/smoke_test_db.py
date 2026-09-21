@@ -1,36 +1,20 @@
 """Read-only database checks for the local PostgreSQL instance."""
 
 from db import get_db_connection
-
-
-REQUIRED_TABLES = {
-    "admin_audit_log",
-    "hiring_signals",
-    "institution_memberships",
-    "institutions",
-    "opportunities",
-    "professor_profiles",
-    "professors",
-    "radar_jobs",
-    "radar_topic_professors",
-    "radar_topics",
-    "radar_worker_heartbeats",
-    "role_verifications",
-    "site_admins",
-    "users",
-}
+from schema_contract import schema_gaps
 
 
 def main() -> None:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
-            )
-            tables = {row["tablename"] for row in cursor.fetchall()}
-            missing = REQUIRED_TABLES - tables
-            if missing:
-                raise SystemExit(f"Database schema is incomplete; missing: {sorted(missing)}")
+            missing_tables, missing_columns = schema_gaps(cursor)
+            if missing_tables or missing_columns:
+                details = []
+                if missing_tables:
+                    details.append(f"missing tables: {missing_tables}")
+                if missing_columns:
+                    details.append(f"missing columns: {missing_columns}")
+                raise SystemExit("Database schema is incomplete; " + "; ".join(details))
 
             cursor.execute(
                 """

@@ -205,13 +205,13 @@ def _fetch_with_safe_redirects(url: str, max_redirects: int = 5) -> requests.Res
 def _fetch_hiring_page_snapshot(homepage_url: str) -> dict[str, Any]:
     """Fetch once and retain bounded identity, links, and recruiting text."""
     if not is_public_http_url(homepage_url, resolve_dns=True):
-        return {"sentences": [], "accessible": False, "text": "", "title": "", "links": []}
+        return {"sentences": [], "accessible": False, "text": "", "title": "", "links": [], "blocks": []}
     try:
         time.sleep(random.uniform(0.2, 0.5))
         response = _fetch_with_safe_redirects(homepage_url)
         response.raise_for_status()
         if "text/html" not in response.headers.get("content-type", "").casefold():
-            return {"sentences": [], "accessible": True, "text": "", "title": "", "links": []}
+            return {"sentences": [], "accessible": True, "text": "", "title": "", "links": [], "blocks": []}
         soup = BeautifulSoup(response.text, "html.parser")
         title = " ".join((soup.title.get_text(" ", strip=True) if soup.title else "").split())
         source_date_text = ""
@@ -242,12 +242,17 @@ def _fetch_hiring_page_snapshot(homepage_url: str) -> dict[str, Any]:
         # Preserve block boundaries. Many lab pages use cards or list items
         # without final punctuation; flattening the whole page into one string
         # can hide an otherwise clear recruiting sentence.
-        chunks = [
-            element.get_text(" ", strip=True)
-            for element in soup.select("p, li, h1, h2, h3, h4, h5, h6")
+        block_nodes = list(soup.select("p, li, h1, h2, h3, h4, h5, h6"))
+        blocks = [
+            {"tag": str(element.name or ""),
+             "text": " ".join(element.get_text(" ", strip=True).split())}
+            for element in block_nodes
+            if " ".join(element.get_text(" ", strip=True).split())
         ]
+        chunks = [block["text"] for block in blocks]
         if not chunks:
             chunks = list(soup.stripped_strings)
+            blocks = [{"tag": "text", "text": " ".join(value.split())} for value in chunks]
         matches: list[str] = []
         gpa_sentences: list[str] = []
         seen: set[str] = set()
@@ -270,11 +275,12 @@ def _fetch_hiring_page_snapshot(homepage_url: str) -> dict[str, Any]:
             "text": identity_text,
             "title": title,
             "links": links,
+            "blocks": blocks[:1000],
             "source_date_text": source_date_text,
         }
     except (OSError, requests.RequestException) as error:
         print(f"Homepage fetch failed for {homepage_url}: {error}")
-        return {"sentences": [], "gpa_sentences": [], "accessible": False, "text": "", "title": "", "links": []}
+        return {"sentences": [], "gpa_sentences": [], "accessible": False, "text": "", "title": "", "links": [], "blocks": []}
 
 
 def _fetch_and_parse_homepage_status(homepage_url: str) -> tuple[list[str], bool]:
@@ -402,6 +408,38 @@ def _page_is_person_specific(professor: dict[str, Any], url: str, snapshot: dict
     return bool(len(expected) >= 7 and expected in compact_url)
 
 
+def _scoped_professor_sentences(
+    professor: dict[str, Any], snapshot: dict[str, Any]
+) -> list[str]:
+    """Extract recruiting text from only this professor's block on a shared page."""
+    name = str(professor.get("name") or "")
+    blocks = list(snapshot.get("blocks") or [])
+    for index, block in enumerate(blocks):
+        text = str(block.get("text") or "")
+        if not _ordered_name_present(name, text):
+            continue
+        tag = str(block.get("tag") or "")
+        start_level = int(tag[1]) if re.fullmatch(r"h[1-6]", tag) else None
+        scoped: list[str] = [text]
+        for following in blocks[index + 1:index + 10]:
+            next_tag = str(following.get("tag") or "")
+            next_text = str(following.get("text") or "")
+            if re.fullmatch(r"h[1-6]", next_tag):
+                next_level = int(next_tag[1])
+                if start_level is None or next_level <= start_level:
+                    break
+            scoped.append(next_text)
+        matches: list[str] = []
+        for chunk in scoped:
+            for sentence in re.split(r"(?<=[.!?])\s+|[;\n\r\t]+", chunk):
+                cleaned = " ".join(sentence.split())
+                if 15 < len(cleaned) < 500 and is_valid_signal_text(cleaned):
+                    matches.append(cleaned)
+        if matches:
+            return list(dict.fromkeys(matches))[:5]
+    return []
+
+
 def _quote_names_conflicting_program(professor: dict[str, Any], quote: str) -> bool:
     """Catch explicit program acronyms that contradict the stored employer."""
     institution_words = [
@@ -519,9 +557,11 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
         snapshot = _fetch_hiring_page_snapshot(page)
         accessible = bool(snapshot["accessible"])
         any_accessible = any_accessible or accessible
+        scoped_sentences = _scoped_professor_sentences(professor, snapshot)
+        person_specific = _page_is_person_specific(professor, page, snapshot)
         attributed = not validate_saved or (
             _saved_page_is_attributed(professor, snapshot)
-            and _page_is_person_specific(professor, page, snapshot)
+            and (person_specific or bool(scoped_sentences))
         )
         source_check = {
             "source_type": signal_type,
@@ -535,7 +575,8 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
             if accessible and not attributed:
                 source_check["result"] = "ATTRIBUTION_FAILED"
             return None, snapshot
-        sentences = list(snapshot["sentences"])
+        sentences = (scoped_sentences if scoped_sentences and not person_specific
+                     else list(snapshot["sentences"]))
         if gpa_evidence is None:
             gpa_evidence = extract_gpa_evidence(
                 list(snapshot.get("gpa_sentences") or []), page
@@ -619,7 +660,8 @@ def process_single_professor(professor: dict[str, Any], domain_name: str | None 
     if name and institution:
         query = (
             f'"{name}" "{institution}" '
-            '("PhD students" OR recruiting OR openings OR "join my lab")'
+            '("PhD students" OR "graduate student" OR "graduate students" OR '
+            '"research opportunities" OR "research assistant" OR recruiting OR openings OR "join my lab")'
         )
         try:
             results = search_web(query, max_results=10)

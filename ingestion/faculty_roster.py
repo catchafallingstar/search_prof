@@ -93,6 +93,7 @@ class RosterMember:
     phone: str = ""
     office_address: str = ""
     section_heading: str = ""
+    research_interests: tuple[str, ...] = ()
     raw_card_html: str = ""
 
 
@@ -256,6 +257,25 @@ def _person_name_from_container(container: object) -> str:
     return ""
 
 
+def _split_structured_research_interests(value: str) -> tuple[str, ...]:
+    """Parse an official directory Research/Expertise cell conservatively."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ()
+    parts = re.split(r"\s*(?:[;•·]|\|)\s*|\s*,\s*", text)
+    values: list[str] = []
+    for part in parts:
+        cleaned = " ".join(part.split()).strip(" .:-")
+        words = re.findall(r"[^\W_]+", cleaned, re.UNICODE)
+        if 1 <= len(words) <= 10 and 2 <= len(cleaned) <= 100:
+            values.append(cleaned)
+    return tuple(dict.fromkeys(values[:16]))
+
+
+def _normalized_research_interest(value: str) -> str:
+    return " ".join(re.findall(r"[^\W_]+", value.casefold(), re.UNICODE))
+
+
 def _table_roster_members(root: object, directory_url: str) -> list[RosterMember]:
     """Parse server-rendered directories whose names and links occupy different cells."""
     members: list[RosterMember] = []
@@ -301,13 +321,23 @@ def _table_roster_members(root: object, directory_url: str) -> list[RosterMember
                           for a in row.find_all("a", href=True)
                           if str(a.get("href") or "").casefold().startswith("mailto:")), "")
             office_index = next((i for i, value in enumerate(headers) if "office" in value and "phone" not in value), None)
-            department_index = next((i for i, value in enumerate(headers) if "department" in value), None)
+            department_index = next((i for i, value in enumerate(headers) if "department" in value or value == "program"), None)
+            research_index = next((
+                i for i, value in enumerate(headers)
+                if value in {"research", "research interests", "research areas", "expertise", "areas of expertise"}
+                or value.startswith("research ")
+            ), None)
             section = cells[department_index].get_text(" ", strip=True) if department_index is not None and department_index < len(cells) else ""
+            research_interests = _split_structured_research_interests(
+                cells[research_index].get_text(" ", strip=True)
+                if research_index is not None and research_index < len(cells) else ""
+            )
             members.append(RosterMember(
                 name=name, title=role.group(0).strip() if role else "", profile_url=profile_url,
                 appointment_type=_appointment_type(context), excerpt=context[:500], email=email,
                 office_address=cells[office_index].get_text(" ", strip=True) if office_index is not None and office_index < len(cells) else "",
                 section_heading=section,
+                research_interests=research_interests,
                 raw_card_html=str(row)[:24000],
             ))
     return members
@@ -982,6 +1012,7 @@ def crawl_directory(
             )
             promoted = 0
             for member, profile_status, profile_reason, profile_evidence in validated:
+                member_department = " ".join((member.section_heading or directory["department"] or "").split())
                 name_key = canonical_name_key(member.name)
                 profile_key = _canonical_profile_url(member.profile_url)
                 if profile_evidence.get('staff_candidate_id'):
@@ -1009,7 +1040,7 @@ def crawl_directory(
                            checked_at=NOW(), last_seen_at=NOW()
                        RETURNING id""",
                     (directory_id, member.name, name_key, member.title,
-                     directory["department"], member.profile_url, profile_key,
+                     member_department, member.profile_url, profile_key,
                      member.email or None, member.phone or None,
                      member.office_address or None, member.section_heading or None,
                      member.appointment_type, member.excerpt, profile_status,
@@ -1099,7 +1130,7 @@ def crawl_directory(
                     stored_name, directory["institution_id"], directory["institution_name"],
                     member.profile_url, member.title, evidence_source_url,
                     verification_method, status,
-                    _canonical_rank(member.title), member.title, directory["department"],
+                    _canonical_rank(member.title), member.title, member_department,
                     name_key, profile_key,
                 )
                 if existing:
@@ -1122,7 +1153,7 @@ def crawl_directory(
                             directory["institution_id"], directory["institution_name"],
                             member.profile_url, member.title, evidence_source_url,
                             verification_method, status,
-                            _canonical_rank(member.title), member.title, directory["department"],
+                            _canonical_rank(member.title), member.title, member_department,
                             name_key, profile_key, int(existing["id"]),
                         ),
                     )
@@ -1163,6 +1194,48 @@ def crawl_directory(
                     )
                 professor_id = int(cursor.fetchone()["id"])
                 promoted += 1
+
+                # First-party structured directory fields are authoritative.
+                if member.research_interests:
+                    directory_source = str(directory["directory_url"])
+                    cursor.execute(
+                        """DELETE FROM professor_research_interests
+                           WHERE professor_id=%s AND evidence_method='EXPLICIT_DIRECTORY_FIELD'
+                             AND source_url=%s""",
+                        (professor_id, directory_source),
+                    )
+                    for display in member.research_interests[:16]:
+                        normalized = _normalized_research_interest(display)
+                        if not normalized:
+                            continue
+                        cursor.execute(
+                            """INSERT INTO professor_research_interests
+                               (professor_id,display_interest,normalized_interest,evidence_method,
+                                source_url,source_excerpt,confidence)
+                               VALUES (%s,%s,%s,'EXPLICIT_DIRECTORY_FIELD',%s,%s,0.95)
+                               ON CONFLICT (professor_id,normalized_interest,source_url) DO UPDATE SET
+                                 display_interest=EXCLUDED.display_interest,
+                                 evidence_method=EXCLUDED.evidence_method,
+                                 source_excerpt=EXCLUDED.source_excerpt,
+                                 confidence=EXCLUDED.confidence,checked_at=NOW()""",
+                            (professor_id, display, normalized, directory_source, member.excerpt[:12000]),
+                        )
+                    cursor.execute(
+                        """UPDATE professors SET
+                             research_profile_status=CASE
+                               WHEN research_profile_status='MANUAL_REVIEWED' THEN research_profile_status
+                               ELSE 'OFFICIAL_INTERESTS' END,
+                             research_profile_source_url=CASE
+                               WHEN research_profile_status='MANUAL_REVIEWED' THEN research_profile_source_url
+                               ELSE %s END,
+                             research_profile_confidence=GREATEST(research_profile_confidence,0.95),
+                             research_profile_version=GREATEST(research_profile_version,3),
+                             research_profile_checked_at=NOW(),updated_at=NOW()
+                           WHERE id=%s""",
+                        (directory_source, professor_id),
+                    )
+                    cursor.execute("UPDATE radar_topics SET next_refresh_at=NOW(),updated_at=NOW()")
+
                 cursor.execute(
                     "UPDATE roster_member_candidates SET professor_id=%s WHERE id=%s",
                     (professor_id, candidate_id),
@@ -1205,7 +1278,7 @@ def crawl_directory(
                         currently_listed = TRUE, missing_checks = 0, last_seen_at = NOW()
                     """,
                     (professor_id, directory_id, member.name, member.title,
-                     directory["department"], member.profile_url,
+                     member_department, member.profile_url,
                      member.appointment_type, member.excerpt),
                 )
                 cursor.execute(

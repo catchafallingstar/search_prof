@@ -16,7 +16,7 @@ from db import get_db_connection
 from ingestion.research_seeds import RESEARCH_SEED_GROUPS
 
 
-CLASSIFICATION_VERSION = 2
+CLASSIFICATION_VERSION = 3
 USER_AGENT = "ScholarRadar/2.0 publication-metadata-enricher"
 STOP_WORDS = {
     "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
@@ -45,15 +45,44 @@ SPECIALIZED_CATEGORIES = (
                  "adversarial machine learning", "model security", "secure machine learning"),
         positive_terms=("prompt injection", "model poisoning", "data poisoning", "model extraction",
                         "membership inference", "evasion attack", "adversarial example",
-                        "backdoor attack", "jailbreak attack", "model vulnerability"),
+                        "backdoor attack", "jailbreak attack", "model vulnerability",
+                        "zero-day", "zero day", "intrusion detection", "malware detection",
+                        "network intrusion", "impersonation attack"),
         exclusions=("physical security", "border security", "food security", "energy security"),
         parent_key="artificial-intelligence",
         concept_groups=(
             ("ai", "artificial intelligence", "machine learning", "ml", "language model", "llm",
              "neural network", "foundation model", "agentic"),
-            ("security", "secure", "attack", "adversarial", "vulnerability", "privacy",
-             "poisoning", "inference", "extraction", "jailbreak", "backdoor", "evasion"),
+            ("security", "secure", "cybersecurity", "attack", "attacks", "cyber attack",
+             "cyber attacks", "adversarial", "vulnerability", "vulnerabilities",
+             "privacy", "poisoning", "inference", "extraction", "jailbreak",
+             "backdoor", "evasion", "zero-day", "zero day", "intrusion detection",
+             "malware", "threat", "threats"),
         ),
+    ),
+    CategoryDefinition(
+        "cybersecurity", "Cybersecurity",
+        "Security of computers, networks, software, data, and cyber-physical systems.",
+        aliases=("cybersecurity", "cyber security", "computer security",
+                 "information security", "network security"),
+        positive_terms=("malware", "intrusion detection", "network intrusion",
+                        "zero-day", "zero day", "cyber attack", "cyber attacks",
+                        "security vulnerability", "security vulnerabilities",
+                        "secure systems", "IoT security", "internet of things security"),
+        exclusions=("physical security", "border security", "food security",
+                    "energy security", "national security policy"),
+        breadth="BROAD", parent_key="computing",
+    ),
+    CategoryDefinition(
+        "robotics", "Robotics",
+        "Design, control, perception, learning, and operation of physical robots and robotic systems.",
+        aliases=("robotics", "robot", "robots", "robotic system", "robotic systems",
+                 "autonomous robot", "autonomous robots"),
+        positive_terms=("robotic arm", "mobile robot", "humanoid robot", "robot navigation",
+                        "robot manipulation", "robot learning", "robot motion planning"),
+        exclusions=("robotic process automation", "business process automation",
+                    "process automation", "rpa implementation"),
+        breadth="BROAD", parent_key="computing",
     ),
     CategoryDefinition(
         "ai-safety", "AI Safety",
@@ -88,6 +117,35 @@ def _tokens(value: str) -> set[str]:
         token for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
         if token not in STOP_WORDS and len(token) > 1
     }
+
+
+_ORGANIZATION_LIKE_INTEREST = re.compile(
+    r"\b(?:council|center|centre|institute|journal|society|association|college|"
+    r"university|department|school|office|committee)\b",
+    re.I,
+)
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    haystack = f" {_normalized_text(text)} "
+    needle = _normalized_text(phrase)
+    return bool(needle and f" {needle} " in haystack)
+
+
+def _explicit_interest_supports_broad_field(definition: CategoryDefinition, value: str) -> bool:
+    """Allow genuine subfield labels without letting organization names become fields."""
+    if _ORGANIZATION_LIKE_INTEREST.search(value):
+        return False
+    words = _normalized_text(value).split()
+    if not 1 <= len(words) <= 8:
+        return False
+    return _contains_phrase(value, definition.name) or any(
+        _contains_phrase(value, alias) for alias in definition.aliases
+    )
 
 
 def category_definitions() -> list[CategoryDefinition]:
@@ -186,22 +244,31 @@ def _definition_for(category: dict[str, Any]) -> CategoryDefinition:
     ))
 
 
-def classify_text(category: dict[str, Any], title: str, abstract: str = "") -> dict[str, Any]:
-    """Classify one paper transparently using aliases, concepts, and exclusions."""
+def classify_text(
+    category: dict[str, Any], title: str, abstract: str = "", *,
+    evidence_kind: str = "paper",
+) -> dict[str, Any]:
+    """Classify one evidence unit without combining unrelated research labels.
+
+    ``evidence_kind='explicit_interest'`` is intentionally more permissive for
+    short official labels such as "Condensed Matter Physics". Paper text remains
+    conservative for broad one-word fields so incidental words do not create a
+    research area.
+    """
     definition = _definition_for(category)
     title_text, abstract_text = title.casefold(), abstract.casefold()
     whole = f"{title_text} {abstract_text}".strip()
-    exclusions = [term for term in definition.exclusions if term.casefold() in whole]
+    exclusions = [term for term in definition.exclusions if _contains_phrase(whole, term)]
     phrases = list(dict.fromkeys((definition.name, *definition.aliases, *definition.positive_terms)))
-    title_matches = [phrase for phrase in phrases if phrase.casefold() in title_text]
-    abstract_matches = [phrase for phrase in phrases if phrase.casefold() in abstract_text]
+    title_matches = [phrase for phrase in phrases if _contains_phrase(title_text, phrase)]
+    abstract_matches = [phrase for phrase in phrases if _contains_phrase(abstract_text, phrase)]
+    direct_names = {definition.name.casefold(), *map(str.casefold, definition.aliases)}
+
     lexical = 0.0
     if title_matches:
-        lexical = 96.0 if any(p.casefold() in {definition.name.casefold(), *map(str.casefold, definition.aliases)}
-                             for p in title_matches) else 86.0
+        lexical = 96.0 if any(p.casefold() in direct_names for p in title_matches) else 86.0
     elif abstract_matches:
-        lexical = 88.0 if any(p.casefold() in {definition.name.casefold(), *map(str.casefold, definition.aliases)}
-                             for p in abstract_matches) else 76.0
+        lexical = 88.0 if any(p.casefold() in direct_names for p in abstract_matches) else 76.0
     else:
         category_tokens = _tokens(" ".join((definition.name, *definition.aliases)))
         title_overlap = len(category_tokens & _tokens(title)) / max(1, len(category_tokens))
@@ -216,7 +283,7 @@ def classify_text(category: dict[str, Any], title: str, abstract: str = "") -> d
     concepts_satisfied = True
     if definition.concept_groups:
         for group in definition.concept_groups:
-            hit = next((term for term in group if term.casefold() in whole), "")
+            hit = next((term for term in group if _contains_phrase(whole, term)), "")
             if not hit:
                 concepts_satisfied = False
             else:
@@ -232,17 +299,31 @@ def classify_text(category: dict[str, Any], title: str, abstract: str = "") -> d
     if definition.concept_groups and not concepts_satisfied:
         combined = min(combined, 54.0)
 
-    # A single generic word such as "Education", "Biology", or "History"
-    # can occur incidentally in an otherwise unrelated title/abstract.  Seeded
-    # broad one-word fields therefore need semantic/manual evidence beyond the
-    # bare field name; deterministic lexical matching alone may request review
-    # but cannot auto-accept the paper into that field.
     broad_tokens = _tokens(definition.name)
-    if (
+    broad_single_word = (
         definition.breadth == "BROAD"
         and len(broad_tokens) == 1
         and not definition.concept_groups
         and not definition.positive_terms
+    )
+    if broad_single_word:
+        if evidence_kind == "explicit_interest" and _explicit_interest_supports_broad_field(definition, title):
+            combined = max(combined, 92.0)
+            lexical = max(lexical, 92.0)
+        else:
+            # An incidental generic word in a paper or biography is not enough
+            # to auto-create a broad field. It can still be surfaced for review.
+            combined = min(combined, 54.0)
+
+    # Seeded broad multi-word fields must also be present as an actual phrase.
+    # Token overlap alone can otherwise turn "social computing" + "work" into
+    # Social Work, or "public health" + "mental" into Mental Health.
+    if (
+        definition.breadth == "BROAD"
+        and not definition.concept_groups
+        and not definition.positive_terms
+        and not title_matches
+        and not abstract_matches
     ):
         combined = min(combined, 54.0)
 
@@ -260,6 +341,24 @@ def classify_text(category: dict[str, Any], title: str, abstract: str = "") -> d
         "matched_terms": matched_terms, "evidence_text": evidence,
         "exclusions": exclusions,
     }
+
+
+def classify_interest_units(category: dict[str, Any], interests: list[str]) -> dict[str, Any]:
+    """Classify explicit interests independently so separate labels cannot fuse.
+
+    Example: ["Artificial Intelligence", "Security"] must not become
+    "AI Security" unless one evidence unit independently supports that field.
+    """
+    best: dict[str, Any] | None = None
+    best_interest = ""
+    for interest in interests:
+        result = classify_text(category, interest, "", evidence_kind="explicit_interest")
+        if best is None or float(result["combined_score"]) > float(best["combined_score"]):
+            best = result
+            best_interest = interest
+    if best is None:
+        best = classify_text(category, "", "", evidence_kind="explicit_interest")
+    return {**best, "matched_interest": best_interest}
 
 
 def _title_similarity(expected: str, observed: str) -> float:

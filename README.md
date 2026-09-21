@@ -63,7 +63,7 @@ make db-down    # stop PostgreSQL without deleting data
 make search-test # require SearXNG and an upstream engine to return useful results
 make search-logs # inspect upstream-engine blocks or SearXNG errors
 make backup     # private timestamped local PostgreSQL snapshot in backups/
-make rebuild-topics  # safely queue outdated research areas for version-3 rebuilding
+make rebuild-topics  # safely queue research areas that use an older discovery version
 make topic-status    # show exact supporting-paper rebuild progress
 make seed-catalog    # list the controlled major-field and subfield catalog
 make seed-topics     # queue the next 20 low-priority catalog jobs

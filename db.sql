@@ -533,7 +533,8 @@ CREATE TABLE IF NOT EXISTS professor_research_interests (
     display_interest TEXT NOT NULL,
     normalized_interest TEXT NOT NULL,
     evidence_method TEXT NOT NULL CHECK (
-        evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY','QWEN_PAPER_SUMMARY')
+        evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY','QWEN_VALIDATED_SECTION',
+                            'QWEN_PAPER_SUMMARY','MANUAL_REVIEW','EXPLICIT_DIRECTORY_FIELD')
     ),
     source_url TEXT NOT NULL,
     source_excerpt TEXT NOT NULL,
@@ -547,7 +548,7 @@ CREATE INDEX IF NOT EXISTS professor_research_interests_professor_idx
 ALTER TABLE professor_research_interests DROP CONSTRAINT IF EXISTS professor_research_interests_evidence_method_check;
 ALTER TABLE professor_research_interests ADD CONSTRAINT professor_research_interests_evidence_method_check
     CHECK (evidence_method IN ('EXPLICIT_PROFILE_SECTION','QWEN_BIO_SUMMARY',
-                              'QWEN_VALIDATED_SECTION','QWEN_PAPER_SUMMARY','MANUAL_REVIEW'));
+                              'QWEN_VALIDATED_SECTION','QWEN_PAPER_SUMMARY','MANUAL_REVIEW','EXPLICIT_DIRECTORY_FIELD'));
 
 -- A professor-level research profile is the fast discovery layer. It is built
 -- from explicit website interests first, then verified paper titles, then a
@@ -571,7 +572,7 @@ ALTER TABLE professors ADD CONSTRAINT professors_research_profile_status_check C
 -- an explicit page statement, a biography, verified paper titles, or staff review.
 DELETE FROM professor_research_interests WHERE evidence_method='AI_SUGGESTION';
 
--- Research profile build version 2 tightened explicit-interest extraction.
+-- Research profile build version 3 adds authoritative structured directory research fields.
 -- Old automatic profile rows are retained temporarily for auditability, but
 -- they are stale and must not be searched or treated as authoritative until
 -- the current pipeline successfully replaces them. Manual staff profiles are
@@ -579,7 +580,7 @@ DELETE FROM professor_research_interests WHERE evidence_method='AI_SUGGESTION';
 UPDATE professors p
 SET research_profile_status='MANUAL_REVIEWED',
     research_profile_confidence=1.0,
-    research_profile_version=2,
+    research_profile_version=3,
     research_profile_checked_at=COALESCE(research_profile_checked_at, NOW()),
     updated_at=NOW()
 WHERE EXISTS (
@@ -595,7 +596,7 @@ SET research_profile_status='NOT_CHECKED',
     research_profile_version=0,
     research_profile_checked_at=NULL,
     updated_at=NOW()
-WHERE p.research_profile_version < 2
+WHERE p.research_profile_version < 3
   AND NOT EXISTS (
       SELECT 1 FROM professor_research_interests i
       WHERE i.professor_id=p.id AND i.evidence_method='MANUAL_REVIEW'
@@ -1612,3 +1613,52 @@ WHERE faculty_status = 'VERIFIED'
 
 -- Latest bounded identity pass: staff-only snippets, page reasons and affiliation trail.
 ALTER TABLE professors ADD COLUMN IF NOT EXISTS identity_search_audit JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Apply after the existing schema, with all workers stopped. No data is deleted.
+BEGIN;
+CREATE TABLE IF NOT EXISTS graduate_programs (
+ id BIGSERIAL PRIMARY KEY,
+ institution_id BIGINT NOT NULL REFERENCES institutions(id),
+ program_name TEXT NOT NULL CHECK (btrim(program_name) <> ''),
+ department TEXT,
+ degree_type TEXT NOT NULL CHECK (degree_type IN ('MS','MA','PhD','EdD','MBA','Other')),
+ verified_at TIMESTAMPTZ,
+ UNIQUE(institution_id,program_name,degree_type)
+);
+CREATE TABLE IF NOT EXISTS professor_graduate_programs (
+ professor_id BIGINT NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+ program_id BIGINT NOT NULL REFERENCES graduate_programs(id) ON DELETE CASCADE,
+ evidence_url TEXT NOT NULL,
+ verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ PRIMARY KEY(professor_id,program_id)
+);
+CREATE TABLE IF NOT EXISTS program_admission_sources (
+ id BIGSERIAL PRIMARY KEY,
+ program_id BIGINT NOT NULL REFERENCES graduate_programs(id) ON DELETE CASCADE,
+ source_url TEXT NOT NULL,
+ official_domain TEXT NOT NULL,
+ requirement_level TEXT NOT NULL CHECK (requirement_level IN ('PROGRAM','GRADUATE_SCHOOL')),
+ applicability_verified BOOLEAN NOT NULL DEFAULT FALSE,
+ applicability_note TEXT NOT NULL CHECK (btrim(applicability_note) <> ''),
+ UNIQUE(program_id,source_url)
+);
+CREATE TABLE IF NOT EXISTS program_admission_evidence (
+ id BIGSERIAL PRIMARY KEY,
+ program_id BIGINT NOT NULL REFERENCES graduate_programs(id) ON DELETE CASCADE,
+ checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ results_json JSONB NOT NULL
+);
+ALTER TABLE program_admission_requirements ADD COLUMN IF NOT EXISTS program_id BIGINT REFERENCES graduate_programs(id);
+ALTER TABLE program_admission_requirements ALTER COLUMN minimum_gpa TYPE NUMERIC(5,2);
+ALTER TABLE program_admission_requirements ADD COLUMN IF NOT EXISTS gpa_scale NUMERIC(5,2);
+ALTER TABLE program_admission_requirements ADD COLUMN IF NOT EXISTS gpa_basis TEXT;
+ALTER TABLE program_admission_requirements ADD COLUMN IF NOT EXISTS requirement_level TEXT;
+ALTER TABLE program_admission_requirements ADD COLUMN IF NOT EXISTS manual_override BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE UNIQUE INDEX IF NOT EXISTS program_admission_requirements_program_unique
+ ON program_admission_requirements(program_id) WHERE program_id IS NOT NULL;
+ALTER TABLE radar_jobs ADD COLUMN IF NOT EXISTS program_id BIGINT REFERENCES graduate_programs(id);
+-- Old jobs lack a verified program and degree. Keep them as history, not runnable work.
+UPDATE radar_jobs SET status='cancelled',updated_at=NOW(),
+ last_error='Legacy GPA job retired: requires a verified graduate program and admissions source.'
+ WHERE job_type='CHECK_PROGRAM_GPA' AND program_id IS NULL AND status='queued';
+COMMIT;

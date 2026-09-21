@@ -172,11 +172,27 @@ def _search_candidates(name: str, domain: str) -> list[str]:
 
 
 def _department_name(url: str, title: str) -> str:
+    """Infer an academic unit, never a generic page/navigation title."""
     cleaned = re.sub(r"\s+", " ", title).strip(" |-–—")
-    if cleaned and len(cleaned) <= 160:
-        return cleaned
+    # CMS titles commonly look like
+    # "Directory | Department of Physics | UC Santa Barbara" or
+    # "Faculty Directory - Cornell Law School". Prefer the academic-unit
+    # segment and discard generic navigation labels.
+    segments = [part.strip(" |-–—") for part in re.split(r"\s*[|–—]\s*|\s+-\s+", cleaned) if part.strip()]
+    generic = re.compile(r"^(?:faculty(?:\s*&\s*staff)?\s+)?directory$|^contact us$|^people$", re.I)
+    unit = re.compile(r"\b(?:department|school|college|program|division|faculty)\b", re.I)
+    candidates = [segment for segment in segments if not generic.fullmatch(segment) and unit.search(segment)]
+    if candidates:
+        # University branding is usually the last segment; the most specific
+        # academic unit tends to appear earlier.
+        return min(candidates, key=lambda value: ("university" in value.casefold(), len(value)))[:160]
+
     parts = [part.replace("-", " ").replace("_", " ") for part in urlparse(url).path.split("/") if part]
-    return (parts[-2] if len(parts) > 1 else "University faculty").title()
+    for part in reversed(parts[:-1] if len(parts) > 1 else parts):
+        normalized = " ".join(part.split()).strip()
+        if normalized and not re.fullmatch(r"(?:faculty|staff|people|directory|contact)", normalized, re.I):
+            return normalized.title()[:160]
+    return "University faculty"
 
 
 def _official_directory_alias(html: str, page_url: str, domain: str) -> str:

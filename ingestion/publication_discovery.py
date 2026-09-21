@@ -46,6 +46,11 @@ PUBLICATION_CATEGORY_HEADING = re.compile(
     r"other scholarly work|other scholarly works|creative work|creative works)",
     re.I,
 )
+NON_PUBLICATION_HEADING = re.compile(
+    r"\b(?:presentations?|talks?|lectures?|keynotes?|service|committees?|"
+    r"invited speakers?|professional activities)\b",
+    re.I,
+)
 RESEARCH_LINK = re.compile(r"\b(?:personal|academic|research|lab(?:oratory)?|group|publications?|website|homepage)\b", re.I)
 
 BARE_SITE_EXCLUDED_ROOTS = {
@@ -84,7 +89,7 @@ NON_PROFILE_PATH = re.compile(
     r"/(?:news|events?|awards?|honors?|alumni|archive|stories?|press|jobs?)(?:/|$)",
     re.I,
 )
-PUBLICATION_DISCOVERY_VERSION = 15
+PUBLICATION_DISCOVERY_VERSION = 16
 SCHOLAR_SUFFIXES = frozenset({'com','co.uk','com.tr','de','fr','ca','com.au','co.in',
     'co.jp','com.br','es','it','nl','ch','se','no','dk','fi','at','be','pl','pt',
     'co.nz','co.za','com.mx','com.sg','com.hk','com.tw','co.kr','co.id'})
@@ -484,8 +489,9 @@ def _save_research_interests(
 
 
 
-RESEARCH_PROFILE_VERSION = 2
+RESEARCH_PROFILE_VERSION = 3
 AUTHORITATIVE_RESEARCH_METHODS = {
+    "EXPLICIT_DIRECTORY_FIELD",
     "EXPLICIT_PROFILE_SECTION",
     "MANUAL_REVIEW",
 }
@@ -573,7 +579,8 @@ def _save_explicit_research_interests(
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM professor_research_interests WHERE professor_id=%s",
+                """DELETE FROM professor_research_interests
+                   WHERE professor_id=%s AND evidence_method='EXPLICIT_PROFILE_SECTION'""",
                 (professor_id,),
             )
             for normalized, (display, source_url, excerpt) in list(first_by_label.items())[:12]:
@@ -756,7 +763,10 @@ def extract_publications(html: str, url: str, source_type: str, subject_name: st
         and PUBLICATION_HEADING.search(node.get_text(" ", strip=True))
     )
     for heading in headings:
-        if not PUBLICATION_HEADING.search(heading.get_text(" ", strip=True)):
+        heading_label = " ".join(heading.get_text(" ", strip=True).split())
+        if not PUBLICATION_HEADING.search(heading_label):
+            continue
+        if NON_PUBLICATION_HEADING.search(heading_label):
             continue
         heading_level = (
             int(heading.name[1])
@@ -837,6 +847,12 @@ def extract_publications(html: str, url: str, source_type: str, subject_name: st
         paper = Publication(title[:500], int(year.group(1)) if year else None,
                             doi.group(0).rstrip(".,;)") if doi else "", url,
                             source_type, entry)
+        quality = scholar_publication_quality(
+            title=paper.title, authors=paper.authors, venue=paper.venue,
+            year=paper.year, evidence=entry,
+        )
+        if quality.decision == QUALITY_REJECT:
+            continue
         found.setdefault(paper_key(paper), paper)
     # Humanities profiles often put full book citations under Achievements,
     # not Publications. Require the subject's author name and publisher/year.
@@ -1634,6 +1650,14 @@ def _store_paper_research_summary(
     queue_on_failure: bool = True,
 ) -> None:
     """Create broad areas from identity-verified papers with title-level support."""
+    if _research_profile_is_authoritative(professor_id):
+        steps.append({
+            "step": "PAPER_RESEARCH_AREAS",
+            "status": "AUTHORITATIVE_PROFILE_RETAINED",
+            "reason": "Explicit directory/profile research interests outrank model-derived paper summaries.",
+            "source_url": source_url,
+        })
+        return
     paper_payload = _paper_summary_payload(papers)
     if not paper_payload:
         return
@@ -1741,6 +1765,14 @@ def _store_interest_fallback(
     """Use biography only when no explicit interests or verified papers exist."""
     if explicit:
         _save_explicit_research_interests(professor_id, professor, explicit, steps)
+        return
+    if _research_profile_is_authoritative(professor_id):
+        steps.append({
+            "step": "RESEARCH_INTERESTS",
+            "status": "AUTHORITATIVE_PROFILE_RETAINED",
+            "reason": "Structured directory/profile interests already exist; biography inference was skipped.",
+            "source_url": biography_url,
+        })
         return
     if not biography_text.strip():
         _mark_research_profile_manual_review(

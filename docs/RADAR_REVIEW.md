@@ -194,7 +194,7 @@ Use the generated overlay archive to update code without replacing `.env`:
 ```bash
 cd ~/search_prof
 unzip -o /mnt/c/Users/2023m/Documents/Codex/2026-08-02/so/outputs/scholarradar_radar_fix.zip
-python -m unittest discover -s tests -v
+python -m pytest -q tests
 python -m scripts.smoke_test_streamlit
 ```
 

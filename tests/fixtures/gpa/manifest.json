@@ -1,0 +1,30 @@
+[
+  {
+    "key": "ut_cs",
+    "url": "https://www.cs.utexas.edu/graduate/apply",
+    "degree": "PhD",
+    "status": "PUBLISHED_MINIMUM",
+    "minimum": 3.0
+  },
+  {
+    "key": "uw_psych",
+    "url": "https://psych.uw.edu/graduate/prospective-students/faq",
+    "degree": "PhD",
+    "status": "PUBLISHED_MINIMUM",
+    "minimum": 3.0
+  },
+  {
+    "key": "fiu_cs",
+    "url": "https://www.cis.fiu.edu/degree/master-of-science-in-computer-science/",
+    "degree": "MS",
+    "status": "PUBLISHED_MINIMUM",
+    "minimum": 3.0
+  },
+  {
+    "key": "stanford_chpr",
+    "url": "https://prevention.stanford.edu/education/chpr/faq.html",
+    "degree": "MS",
+    "status": "EXPLICIT_NO_MINIMUM",
+    "minimum": null
+  }
+]

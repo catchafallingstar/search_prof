@@ -17,8 +17,6 @@ docker compose up -d postgres >/dev/null
 umask 077
 docker compose exec -T \
   -e PGPASSWORD="$POSTGRES_PASSWORD" postgres pg_dump \
-  --host host.docker.internal \
-  --port "$POSTGRES_PORT" \
   --username "$POSTGRES_USER" \
   --dbname "$POSTGRES_DB" \
   --format custom \

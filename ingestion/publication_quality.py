@@ -23,6 +23,13 @@ class PublicationQualityDecision:
 
 _EXPLICIT_SERVICE_TITLE = re.compile(
     r"(?:"
+    r"^editorial\b|"
+    r"^guest\s+editors?[’']?\s+introduction\b|"
+    r"^special\s+(?:issue|session)\s+on\b|"
+    r"^invited\s+(?:speaker|talk|lecture)\b|"
+    r"^keynote(?:\s+(?:speaker|talk|lecture))?\b|"
+    r"^public\s+lecture\b|"
+    r"^panel(?:\s+discussion)?\b|"
     r"^program\s+committee(?:\s+.+)?$|"
     r"^artifact\s+program\s+committee$|"
     r"^research\s+track\s+program\s+committee$|"
@@ -63,6 +70,16 @@ _PERSON_LIST_LIKE = re.compile(
 
 _DOI = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 
+_CONTACT_ONLY = re.compile(
+    r"(?:"
+    r"^(?:office|email|phone|fax|contact)\b|"
+    r"^(?:\+?1[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?:\s|$)|"
+    r"^[^@\s]+@[^@\s]+\.[^@\s]+$|"
+    r"\b\d{1,5}\s+(?:[A-Za-z0-9.-]+\s+){0,4}(?:campus\s+)?(?:drive|dr\.?|road|rd\.?|street|st\.?|avenue|ave\.?|boulevard|blvd\.?)\b.*\b(?:michigan|ohio|california|new york|washington|texas|florida|illinois|pennsylvania)\b\s+\d{5}(?:-\d{4})?\b"
+    r")",
+    re.I,
+)
+
 
 def _clean(value: Any) -> str:
     return " ".join(str(value or "").split())
@@ -88,7 +105,19 @@ def scholar_publication_quality(
     folded = title.casefold()
     words = re.findall(r"[a-z0-9]+", folded)
 
-    if _EXPLICIT_SERVICE_TITLE.search(title):
+    contact_probe = " ".join((title, evidence)).strip()
+    if _CONTACT_ONLY.search(title) or (
+        re.search(r"\b(?:email protected|@)\b", title, re.I)
+        and re.search(r"\b(?:\d{3}[). -])?\d{3}[ -]\d{4}\b", title)
+    ):
+        return PublicationQualityDecision(REJECT, ("contact_or_address_record",))
+
+    service_probe = re.sub(r"^(?:19|20)\d{2}\s+", "", title).strip()
+    if _EXPLICIT_SERVICE_TITLE.search(service_probe) or re.search(
+        r"\b(?:special issue on|special session on|guest editors?[’']? introduction|"
+        r"invited speaker|public lecture|program committee)\b",
+        service_probe[:120], re.I,
+    ):
         return PublicationQualityDecision(REJECT, ("explicit_service_or_committee_title",))
 
     if len(words) <= 4 and _SHORT_EVENT_ONLY.fullmatch(title):

@@ -465,28 +465,33 @@ def render_professor_prospect(row: dict[str, Any]) -> None:
             st.write("**Lab GPA policy:** Not checked yet")
         if row.get("lab_gpa_evidence_text"):
             st.caption(f"GPA evidence: {row['lab_gpa_evidence_text']}")
-        program_policy = str(row.get("program_gpa_policy") or "NOT_CHECKED")
-        program_minimum = row.get("official_program_gpa_minimum")
-        if program_policy == "HARD_MINIMUM" and program_minimum is not None:
-            st.write(f"**Graduate-program requirement:** Minimum GPA {float(program_minimum):.2f}")
-        elif program_policy == "RECOMMENDED" and program_minimum is not None:
-            st.write(f"**Graduate-program guidance:** GPA {float(program_minimum):.2f} recommended")
-        elif program_policy == "NO_FORMAL_MINIMUM":
-            st.write("**Graduate-program requirement:** Official page states no formal GPA minimum")
-        elif program_policy == "HOLISTIC_REVIEW":
-            st.write("**Graduate-program requirement:** Official page describes holistic review")
-        elif program_policy == "NOT_STATED":
-            st.write("**Graduate-program requirement:** Not stated on the official admission page checked")
-        elif program_policy == "SOURCE_UNAVAILABLE":
-            st.write("**Graduate-program requirement:** Official admission source unavailable")
-        else:
-            st.write("**Graduate-program requirement:** Not checked yet")
-        if row.get("program_gpa_evidence_text"):
-            st.caption(f"Program GPA evidence: {row['program_gpa_evidence_text']}")
+        programs = row.get("graduate_program_gpa") or []
+        if not programs:
+            st.write("**Program GPA:** No verified graduate-program link yet")
+        for program in programs:
+            label = f"{program['program_name']} ({program['degree_type']})"
+            status = program.get("status")
+            if status == "PUBLISHED_MINIMUM":
+                scale = f"/{program['gpa_scale']}" if program.get("gpa_scale") else " (scale not stated)"
+                st.write(f"**{label}:** Minimum GPA {program['minimum_gpa']}{scale}")
+            else:
+                text = {"EXPLICIT_NO_MINIMUM":"Official source explicitly states no minimum",
+                        "NOT_FOUND":"Minimum not found in the sources checked",
+                        "NEEDS_REVIEW":"Requirement needs review"}.get(status,"Not checked yet")
+                st.write(f"**{label}:** {text}")
+            if program.get("gpa_basis"):
+                st.caption(f"Applies to: {program['gpa_basis']}")
+            if program.get("requirement_level") == "GRADUATE_SCHOOL":
+                st.caption("Graduate-school requirement; applicability to this program was verified.")
+            if program.get("evidence_text"):
+                st.caption(program["evidence_text"])
+            if program.get("source_url"):
+                st.link_button("Official admissions source",program["source_url"])
+            if program.get("checked_at"):
+                st.caption(f"Last checked: {program['checked_at']}")
         links = [
             ("Open source page", row.get("hiring_source_url")),
             ("Check GPA source", row.get("lab_gpa_source_url")),
-            ("Official program GPA source", row.get("official_program_gpa_source_url")),
             ("Official faculty page", row.get("faculty_source_url")),
             ("View active grant", row.get("grant_url")),
             ("Professor/lab page", row.get("homepage_url")),

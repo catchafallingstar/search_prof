@@ -14,7 +14,7 @@ source .env
 set +a
 source .venv/bin/activate
 
-python -m unittest discover -s tests -v
+python -m pytest -q tests
 python -m scripts.smoke_test_db
 python -m scripts.smoke_test_streamlit
 

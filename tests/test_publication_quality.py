@@ -76,3 +76,29 @@ def test_metadata_url_prefers_doi_even_for_profile_discovery() -> None:
         "source_type": "PERSONAL_SITE",
         "source_url": "https://example.edu/person/publications/",
     }) == "https://doi.org/10.1000/example.123"
+
+
+def test_editorial_service_and_event_only_rows_are_rejected() -> None:
+    rejected = [
+        "Editorial TVLSI positioning—Continuing and accelerating an upward trajectory",
+        "Guest Editors' Introduction to the Special Issue",
+        "Special Issue on Benchmarking Machine Learning Systems and Applications",
+        "Special Session on Emerging Manycore Architectures",
+        "Invited Speaker at the International Symposium on Computing",
+        "Public Lecture on Media and Democracy",
+    ]
+    for title in rejected:
+        result = scholar_publication_quality(title=title, authors="Professor Name", year=2026)
+        assert result.decision == REJECT, title
+
+
+def test_contact_and_address_rows_are_rejected() -> None:
+    rejected = [
+        "School of Interdisciplinary Studies 324 Lake Ontario Hall 1 Campus Drive Allendale, Michigan 49401",
+        "(616) 331-8020 [email protected]",
+        "Office: 324 Lake Ontario Hall",
+        "Email professor@example.edu",
+    ]
+    for title in rejected:
+        result = scholar_publication_quality(title=title)
+        assert result.decision == REJECT, title

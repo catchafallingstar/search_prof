@@ -7,6 +7,7 @@ from typing import Any, Iterator
 import psycopg
 from psycopg.rows import dict_row
 from settings import setting, setting_int
+from schema_contract import schema_gaps
 
 
 def database_url() -> str:
@@ -28,22 +29,14 @@ def database_is_configured() -> bool:
 
 
 def database_is_ready() -> bool:
+    """Return True only when the connected database matches current runtime needs."""
     if not database_is_configured():
         return False
     try:
         with get_db_connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        to_regclass('public.opportunities') AS opportunities,
-                        to_regclass('public.users') AS users,
-                        to_regclass('public.site_admins') AS site_admins,
-                        to_regclass('public.admin_audit_log') AS admin_audit_log
-                    """
-                )
-                row = cursor.fetchone()
-                return bool(row and all(row.values()))
+                missing_tables, missing_columns = schema_gaps(cursor)
+                return not missing_tables and not missing_columns
     except Exception:
         return False
 

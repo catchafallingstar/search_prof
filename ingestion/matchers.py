@@ -5,8 +5,11 @@ from datetime import datetime, timezone
 ACTION_VERBS = r"(?:look(?:ing)?\s+for|plan[s]?\s+to\s+recruit|recruit(?:ing)?|seek(?:ing)?|accept(?:ing)?|welcom(?:e|ing)|invit(?:e|ing)|sponsor(?:ing)?|looking\s+to\s+hire|join\s+(?:my|our)\s+(?:lab|group|team))"
 TARGET_ROLES = r"(?:phd[s]?|doctoral|graduate\s+student[s]?|ph\.d\.|postdoc[s]?|post-doc[s]?|research\s+assistant[s]?|intern[s]?)"
 
+SOFT_RECRUITING = r"(?:i(?:'d| would)\s+love\s+to\s+have|it\s+would\s+be\s+(?:great|good)\s+to\s+have|we(?:'d| would)\s+love\s+to\s+have)"
+
 FLEXIBLE_HIRING_PATTERN = re.compile(
-    rf"\b{ACTION_VERBS}\s+(?:\w+\W+){{0,8}}?{TARGET_ROLES}\b",
+    rf"(?:\b{ACTION_VERBS}\s+(?:\w+\W+){{0,8}}?{TARGET_ROLES}\b|"
+    rf"\b{SOFT_RECRUITING}\s+(?:\w+\W+){{0,8}}?{TARGET_ROLES}\b)",
     re.IGNORECASE,
 )
 FUNDING_PATTERNS = re.compile(

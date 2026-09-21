@@ -32,8 +32,6 @@ fi
 
 docker compose exec -T \
   -e PGPASSWORD="$POSTGRES_PASSWORD" postgres psql \
-  --host host.docker.internal \
-  --port "$POSTGRES_PORT" \
   -v ON_ERROR_STOP=1 \
   -U "$POSTGRES_USER" \
   -d "$POSTGRES_DB" < db.sql

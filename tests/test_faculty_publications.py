@@ -531,3 +531,22 @@ def test_publication_parser_recovers_title_from_literal_broken_href() -> None:
     assert len(papers) == 1
     assert papers[0].title == 'Synthesizing representative I/O workloads using iterative distillation'
     assert papers[0].title != 'papers/mascots03.pdf'
+
+
+def test_mixed_academic_papers_presentations_section_is_not_imported_as_publications():
+    html = """
+    <main>
+      <h2>Peer-Reviewed Journal Articles</h2>
+      <p>Lawrence Pintak. (2024). Journalism and public diplomacy. Journal of Media Studies 12(2).</p>
+      <h2>Academic Papers/Presentations</h2>
+      <p>American Muslims in the Age of Trump. Public lecture. Northwestern University Doha.</p>
+      <p>America &amp; Islam: A Tortured Relationship. Campus-wide lecture.</p>
+    </main>
+    """
+    papers = extract_publications(
+        html, "https://example.edu/pintak", "OFFICIAL_PROFILE", "Lawrence Pintak"
+    )
+    titles = [paper.title for paper in papers]
+    assert any("Journalism and public diplomacy" in title for title in titles)
+    assert not any("American Muslims" in title for title in titles)
+    assert not any("Tortured Relationship" in title for title in titles)

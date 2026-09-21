@@ -22,7 +22,7 @@ Use this checklist for the private beta and again before a wider public launch.
 - [ ] Run SearXNG on an always-on service reachable from that worker; Streamlit Community Cloud cannot host it as a second durable process.
 - [ ] Configure automatic worker restart and alert when no heartbeat is recorded for ten minutes.
 - [ ] Confirm user searches receive higher priority than catalog seeding.
-- [ ] Confirm old topics were rebuilt with discovery version 3 and exact supporting papers.
+- [ ] Confirm old topics were rebuilt to the current `RADAR_DISCOVERY_VERSION` and exact supporting papers.
 
 ## Abuse and moderation
 

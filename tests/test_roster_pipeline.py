@@ -427,3 +427,45 @@ def test_teaching_professor_tracks_do_not_enter_research_group_pipeline() -> Non
     assert eligible_research_group_leader(
         "Research Professor", "RESEARCH"
     )
+
+
+def test_directory_title_inference_uses_academic_unit_not_generic_page_title() -> None:
+    from ingestion.university_directory_discovery import _department_name
+    assert _department_name(
+        "https://example.edu/computing/directory",
+        "Directory - GVSU College of Computing - Grand Valley State University",
+    ) == "GVSU College of Computing"
+    assert _department_name(
+        "https://example.edu/physics/directory",
+        "Directory | Department of Physics | UC Santa Barbara",
+    ) == "Department of Physics"
+    assert _department_name(
+        "https://example.edu/law/faculty",
+        "Faculty Directory - Cornell Law School",
+    ) == "Cornell Law School"
+
+
+def test_table_directory_preserves_row_department_and_structured_research_interests() -> None:
+    html = """
+    <title>College Faculty Directory</title>
+    <h1>Faculty Directory</h1>
+    <table>
+      <tr><th>Name</th><th>Title</th><th>Department</th><th>Research</th><th>Profile</th></tr>
+      <tr><td>Sara Sutton</td><td>Assistant Professor</td><td>Information Sciences &amp; Technologies (IST)</td>
+          <td>Cybersecurity, Privacy, Security, Artificial Intelligence, Data Science, IoT, Cyber-Physical Systems</td>
+          <td><a href="/sutton-sara">View Profile</a></td></tr>
+      <tr><td>Samah Mansour</td><td>Associate Professor</td><td>Information Sciences &amp; Technologies (IST)</td>
+          <td>Cybersecurity, IoT Security &amp; Authorization, Machine Learning, Federated Learning</td>
+          <td><a href="/mansour-samah">View Profile</a></td></tr>
+      <tr><td>Erik Fredericks</td><td>Associate Professor</td><td>Computer Science (CS)</td>
+          <td>Software Engineering, Search-Based Software Engineering, Robotics</td>
+          <td><a href="/fredericks-erik">View Profile</a></td></tr>
+    </table>
+    """
+    members = parse_faculty_directory(html, "https://example.edu/directory")
+    sara = next(member for member in members if member.name == "Sara Sutton")
+    assert sara.section_heading == "Information Sciences & Technologies (IST)"
+    assert sara.research_interests == (
+        "Cybersecurity", "Privacy", "Security", "Artificial Intelligence",
+        "Data Science", "IoT", "Cyber-Physical Systems",
+    )

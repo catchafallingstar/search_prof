@@ -25,7 +25,7 @@ from ingestion.publication_discovery import (
     review_queued_interests,
 )
 from ingestion.university_directory_discovery import discover_faculty_directories
-from ingestion.program_gpa import check_program_gpa_for_professor
+from ingestion.program_gpa import check_program_gpa
 from radar_store import (
     claim_next_radar_job,
     complete_radar_job,
@@ -117,6 +117,8 @@ def _job_outcome(job_type: str, result: dict[str, Any]) -> str:
         }.get(status, "REVIEW_REQUIRED")
     if job_type == "ENRICH_CLASSIFY_PAPER":
         return "APPROVED" if int(result.get("categories_accepted") or 0) else "NO_CHANGE"
+    if job_type == "CHECK_PROGRAM_GPA" and result.get("status") == "NEEDS_REVIEW":
+        return "REVIEW_REQUIRED"
     if job_type == "CHECK_HIRING" and bool(result.get("timed_out")):
         return "SOURCE_UNAVAILABLE"
     if job_type in {"CHECK_HIRING", "CHECK_GRANTS", "CHECK_PROGRAM_GPA"}:
@@ -304,10 +306,9 @@ def process_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         )
         return result, False
     if job_type == "CHECK_PROGRAM_GPA":
-        professor_id = job.get("professor_id")
-        if professor_id is None:
-            raise RuntimeError("CHECK_PROGRAM_GPA requires a representative professor.")
-        return check_program_gpa_for_professor(int(professor_id)), False
+        if job.get("program_id") is None:
+            raise RuntimeError("Legacy GPA job has no verified program_id.")
+        return check_program_gpa(int(job["program_id"])), False
     if job_type == "ENRICH_CLASSIFY_PAPER":
         paper_id = job.get("paper_id")
         if paper_id is None:

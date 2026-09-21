@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 from db import get_db_connection
+from radar_store import RADAR_DISCOVERY_VERSION
+from schema_contract import schema_gaps
 from settings import setting
 
 
@@ -85,24 +87,20 @@ def check_runtime() -> list[Check]:
     try:
         with get_db_connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        to_regclass('public.users') AS users,
-                        to_regclass('public.site_admins') AS site_admins,
-                        to_regclass('public.radar_jobs') AS radar_jobs,
-                        to_regclass('public.radar_worker_heartbeats') AS heartbeats,
-                        to_regclass('public.radar_topic_professor_papers') AS exact_evidence,
-                        to_regclass('public.web_search_cache') AS search_cache,
-                        to_regclass('public.web_search_provider_health') AS search_health
-                    """
-                )
-                schema = cursor.fetchone() or {}
-                missing = [name for name, value in schema.items() if not value]
-                checks.append(Check("FAIL" if missing else "PASS", "Database schema",
-                                    f"Missing tables: {', '.join(missing)}." if missing else "Required launch tables exist."))
-                if missing:
+                missing_tables, missing_columns = schema_gaps(cursor)
+                if missing_tables or missing_columns:
+                    detail_parts = []
+                    if missing_tables:
+                        detail_parts.append("missing tables: " + ", ".join(missing_tables))
+                    if missing_columns:
+                        formatted = "; ".join(
+                            f"{table}({', '.join(columns)})"
+                            for table, columns in sorted(missing_columns.items())
+                        )
+                        detail_parts.append("missing columns: " + formatted)
+                    checks.append(Check("FAIL", "Database schema", ". ".join(detail_parts) + "."))
                     return checks
+                checks.append(Check("PASS", "Database schema", "Current runtime tables and migration-marker columns exist."))
 
                 cursor.execute(
                     "SELECT COUNT(*) AS total FROM site_admins WHERE admin_role = 'owner' AND revoked_at IS NULL"
@@ -110,6 +108,14 @@ def check_runtime() -> list[Check]:
                 owners = int((cursor.fetchone() or {}).get("total") or 0)
                 checks.append(Check("PASS" if owners == 1 else "FAIL", "Owner account",
                                     "Exactly one active owner exists." if owners == 1 else f"Expected one active owner; found {owners}."))
+
+                cursor.execute("SELECT COUNT(*) AS total FROM professors")
+                professors = int((cursor.fetchone() or {}).get("total") or 0)
+                checks.append(Check(
+                    "PASS" if professors > 0 else "FAIL",
+                    "Faculty index",
+                    f"{professors} professor record(s) are present." if professors else "The professor index is empty; restore or rebuild data before launch.",
+                ))
 
                 cursor.execute(
                     """
@@ -122,10 +128,18 @@ def check_runtime() -> list[Check]:
                 checks.append(Check("PASS" if workers >= 1 else "FAIL", "Background worker",
                                     f"{workers} healthy worker(s) reported recently." if workers else "No worker heartbeat in the last ten minutes."))
 
-                cursor.execute("SELECT COUNT(*) AS total FROM radar_topics WHERE discovery_version < 3")
+                cursor.execute(
+                    "SELECT COUNT(*) AS total FROM radar_topics WHERE discovery_version < %s",
+                    (RADAR_DISCOVERY_VERSION,),
+                )
                 old_topics = int((cursor.fetchone() or {}).get("total") or 0)
-                checks.append(Check("WARN" if old_topics else "PASS", "Exact-evidence rebuild",
-                                    f"{old_topics} topic(s) still need a version-3 rebuild." if old_topics else "All existing topics use discovery version 3."))
+                checks.append(Check(
+                    "WARN" if old_topics else "PASS",
+                    "Current evidence rebuild",
+                    f"{old_topics} topic(s) still need a discovery-version-{RADAR_DISCOVERY_VERSION} rebuild."
+                    if old_topics
+                    else f"All existing topics use discovery version {RADAR_DISCOVERY_VERSION}.",
+                ))
 
                 cursor.execute("SELECT COUNT(*) AS total FROM radar_jobs WHERE status = 'failed'")
                 failed_jobs = int((cursor.fetchone() or {}).get("total") or 0)

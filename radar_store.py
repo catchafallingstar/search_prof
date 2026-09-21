@@ -5,6 +5,7 @@ import json
 import os
 import re
 import socket
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,7 +18,7 @@ from ingestion.publication_quality import REJECT as QUALITY_REJECT, scholar_publ
 FACULTY_VERIFICATION_VERSION = 20
 MIN_PUBLIC_FACULTY_VERIFICATION_VERSION = 20
 RADAR_DISCOVERY_VERSION = 9
-RESEARCH_PROFILE_VERSION = 2
+RESEARCH_PROFILE_VERSION = 3
 
 
 def _target_country_code() -> str:
@@ -31,7 +32,10 @@ TOPIC_QUERY_ALIASES = {
 
 
 def normalize_topic_query(query: str) -> str:
-    clean = " ".join(re.findall(r"[a-z0-9]+", query.casefold()))
+    # Preserve Unicode letters/digits instead of silently corrupting terms such
+    # as “café”, Greek symbols, or non-Latin research-area names.
+    normalized = unicodedata.normalize("NFKC", query).casefold()
+    clean = " ".join(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE))
     clean = TOPIC_QUERY_ALIASES.get(clean, clean)
     if not 3 <= len(clean) <= 120:
         raise ValueError("Research area must contain between 3 and 120 characters.")
@@ -100,18 +104,23 @@ def enqueue_radar_job(
     professor_id: int | None = None,
     faculty_directory_id: int | None = None,
     paper_id: int | None = None,
+    program_id: int | None = None,
     requested_by: int | None = None,
     priority: int = 50,
     max_attempts: int = 5,
     initial_result: dict[str, Any] | None = None,
     delay_seconds: int = 0,
 ) -> dict[str, Any]:
+    if job_type == "CHECK_PROGRAM_GPA" and program_id is None:
+        raise ValueError("A verified program_id is required for GPA jobs.")
     # A professor's hiring-page refresh is shared across all topics and users.
     dedupe_topic = "-" if job_type == "CHECK_HIRING" and professor_id else (radar_topic_id or "-")
     dedupe = (
         f"{job_type}:{institution_id or '-'}:{dedupe_topic}:"
         f"{professor_id or '-'}:{faculty_directory_id or '-'}:{paper_id or '-'}"
     )
+    if job_type == "CHECK_PROGRAM_GPA":
+        dedupe = f"CHECK_PROGRAM_GPA:program:{program_id}"
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (dedupe,))
@@ -151,8 +160,8 @@ def enqueue_radar_job(
                 INSERT INTO radar_jobs (
                     institution_id, radar_topic_id, professor_id, faculty_directory_id,
                     paper_id, requested_by, job_type, dedupe_key, priority, max_attempts,
-                    result_json,available_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s::jsonb,NOW()+(%s*INTERVAL '1 second'))
+                    result_json,available_at,program_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s::jsonb,NOW()+(%s*INTERVAL '1 second'),%s)
                 RETURNING *
                 """,
                 (
@@ -165,7 +174,7 @@ def enqueue_radar_job(
                     dedupe,
                     max(0, min(100, int(priority))),
                     max(1, min(20, int(max_attempts))),
-                    json.dumps(initial_result or {}),max(0,int(delay_seconds)),
+                    json.dumps(initial_result or {}),max(0,int(delay_seconds)),program_id,
                 ),
             )
             return {**cursor.fetchone(), "reused": False}
@@ -1103,12 +1112,7 @@ def fetch_indexed_professors(
                     p.lab_gpa_source_url, p.lab_gpa_minimum, p.program_gpa_minimum,
                     p.program_gpa_source_url, p.gpa_last_checked_at,
                     p.lab_gpa_check_status,
-                    program_gpa.policy AS program_gpa_policy,
-                    program_gpa.minimum_gpa AS official_program_gpa_minimum,
-                    program_gpa.evidence_text AS program_gpa_evidence_text,
-                    program_gpa.source_url AS official_program_gpa_source_url,
-                    program_gpa.check_status AS program_gpa_check_status,
-                    program_gpa.checked_at AS program_gpa_checked_at,
+                    program_gpa.programs AS graduate_program_gpa,
                     (
                         p.public_hiring_check_status = 'NOT_CHECKED'
                         OR p.public_hiring_checked_at IS NULL
@@ -1233,18 +1237,17 @@ def fetch_indexed_professors(
                     LIMIT 1
                 ) hs ON TRUE
                 LEFT JOIN LATERAL (
-                    SELECT requirement.*
-                    FROM program_admission_requirements requirement
-                    WHERE requirement.institution_id = p.institution_id
-                      AND requirement.degree_type = 'PhD'
-                      AND requirement.department_key IN (
-                          LOWER(BTRIM(regexp_replace(COALESCE(p.department, ''), '\\s+', ' ', 'g'))), ''
-                      )
-                    ORDER BY
-                        (requirement.department_key =
-                            LOWER(BTRIM(regexp_replace(COALESCE(p.department, ''), '\\s+', ' ', 'g')))) DESC,
-                        requirement.checked_at DESC NULLS LAST
-                    LIMIT 1
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'program_name',gp.program_name,'degree_type',gp.degree_type,
+                        'status',r.check_status,'minimum_gpa',r.minimum_gpa,
+                        'gpa_scale',r.gpa_scale,'gpa_basis',r.gpa_basis,
+                        'requirement_level',r.requirement_level,'source_url',r.source_url,
+                        'evidence_text',r.evidence_text,'checked_at',r.checked_at
+                    ) ORDER BY gp.program_name,gp.degree_type) AS programs
+                    FROM professor_graduate_programs link
+                    JOIN graduate_programs gp ON gp.id=link.program_id AND gp.verified_at IS NOT NULL
+                    LEFT JOIN program_admission_requirements r ON r.program_id=gp.id
+                    WHERE link.professor_id=p.id
                 ) program_gpa ON TRUE
                 WHERE {professor_where}
                   AND (
@@ -1321,7 +1324,7 @@ def claim_next_radar_job(
                       -- a web-search slot remain eligible while DDGS cools down.
                       AND (%s OR job_type NOT IN (
                           'DISCOVER_FACULTY_DIRECTORIES',
-                          'CHECK_PROGRAM_GPA', 'CHECK_HIRING'
+                          'CHECK_HIRING'
                       ))
                       -- A single local model serves all workers.  Leave later
                       -- reviews queued while one Qwen job is running.
@@ -1333,7 +1336,13 @@ def claim_next_radar_job(
                                 AND active_qwen.status='running'
                           )
                       )
-                    ORDER BY priority DESC, available_at, created_at
+                    ORDER BY (
+                               priority + LEAST(
+                                   30,
+                                   FLOOR(EXTRACT(EPOCH FROM (NOW() - created_at)) / 21600)::INTEGER
+                               )
+                           ) DESC,
+                           available_at, created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
@@ -1823,7 +1832,7 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                          p.publication_status = 'NOT_CHECKED'
                          OR p.publication_checked_at IS NULL
                          OR p.publication_checked_at <= NOW() - INTERVAL '30 days'
-                         OR p.publication_discovery_version < 15
+                         OR p.publication_discovery_version < 16
                          OR p.research_profile_version < %s
                      )
                      AND NOT EXISTS (
@@ -1931,42 +1940,18 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """SELECT DISTINCT ON (p.institution_id, COALESCE(p.department, '')) p.id
-                   FROM professors p
-                   LEFT JOIN program_admission_requirements requirement
-                     ON requirement.institution_id = p.institution_id
-                    AND requirement.department_key = LOWER(BTRIM(COALESCE(p.department, '')))
-                    AND requirement.degree_type = 'PhD'
-                   WHERE p.data_origin = 'OFFICIAL_DIRECTORY'
-                     AND p.employment_status = 'ACTIVE_CONFIRMED'
-                     AND EXISTS (
-                         SELECT 1 FROM roster_member_candidates candidate
-                         WHERE candidate.professor_id = p.id
-                           AND candidate.validation_status IN ('PROFILE_VERIFIED', 'ROSTER_VERIFIED')
-                     )
-                     AND EXISTS (
-                             SELECT 1 FROM faculty_directory_memberships membership
-                             JOIN faculty_directories directory ON directory.id = membership.directory_id
-                             WHERE membership.professor_id = p.id
-                               AND membership.currently_listed = TRUE
-                               AND directory.active = TRUE
-                               AND directory.validation_status = 'APPROVED'
-                         )
-                     AND (requirement.next_check_at IS NULL OR requirement.next_check_at <= NOW())
-                     AND NOT EXISTS (
-                         SELECT 1 FROM radar_jobs job
-                         WHERE job.professor_id = p.id AND job.job_type = 'CHECK_PROGRAM_GPA'
-                           AND job.status IN ('queued', 'running')
-                     )
-                   ORDER BY p.institution_id, COALESCE(p.department, ''), p.id
-                   LIMIT %s""",
-                (max(1, min(100, int(limit))),),
-            )
+                """SELECT p.id FROM graduate_programs p
+                   LEFT JOIN program_admission_requirements r ON r.program_id=p.id
+                   WHERE p.verified_at IS NOT NULL AND COALESCE(r.manual_override,FALSE)=FALSE
+                   AND (r.next_check_at IS NULL OR r.next_check_at<=NOW())
+                   AND EXISTS (SELECT 1 FROM program_admission_sources src
+                               WHERE src.program_id=p.id AND src.applicability_verified=TRUE)
+                   AND NOT EXISTS (SELECT 1 FROM radar_jobs j WHERE j.program_id=p.id
+                                   AND j.job_type='CHECK_PROGRAM_GPA' AND j.status IN ('queued','running'))
+                   ORDER BY p.id LIMIT %s""", (max(1,min(100,int(limit))),))
             gpa_ids = [int(row["id"]) for row in cursor.fetchall()]
-    for professor_id in gpa_ids:
-        job = enqueue_radar_job(
-            "CHECK_PROGRAM_GPA", professor_id=professor_id, priority=25, max_attempts=5
-        )
+    for program_id in gpa_ids:
+        job = enqueue_radar_job("CHECK_PROGRAM_GPA", program_id=program_id, priority=25, max_attempts=5)
         queued += int(not job.get("reused"))
     return queued
 

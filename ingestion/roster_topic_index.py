@@ -9,13 +9,14 @@ from db import get_db_connection
 from ingestion.research_classification import (
     CLASSIFICATION_VERSION,
     classify_text,
+    classify_interest_units,
     rebuild_professor_profiles,
     resolve_category,
 )
 
 
 ROSTER_DISCOVERY_VERSION = 9
-RESEARCH_PROFILE_VERSION = 2
+RESEARCH_PROFILE_VERSION = 3
 _STOP_WORDS = {
     "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
     "technique", "techniques", "method", "methods", "study", "studies",
@@ -168,9 +169,9 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                           ARRAY_AGG(interest.display_interest
                                     ORDER BY interest.confidence DESC,
                                              interest.display_interest) AS interests,
-                          (ARRAY_AGG(interest.source_url
-                                     ORDER BY interest.confidence DESC,
-                                              interest.checked_at DESC))[1] AS source_url
+                          ARRAY_AGG(interest.source_url
+                                    ORDER BY interest.confidence DESC,
+                                             interest.display_interest) AS source_urls
                    FROM professors p
                    JOIN professor_research_interests interest
                      ON interest.professor_id=p.id
@@ -202,7 +203,9 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                     continue
                 labels = [str(value) for value in (interest_row.get("interests") or [])]
                 summary = " • ".join(dict.fromkeys(labels))
-                classification = classify_text(category, summary, "")
+                # Each official interest is an independent evidence unit. Never
+                # fuse "Artificial Intelligence" + "Security" into "AI Security".
+                classification = classify_interest_units(category, labels)
                 if classification["decision"] != "AUTO_ACCEPTED":
                     continue
                 status = str(interest_row.get("research_profile_status") or "")
@@ -217,10 +220,17 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                     cap,
                     round(float(classification["combined_score"]) * (0.55 + 0.15 * confidence), 2),
                 )
+                matched_interest = str(classification.get("matched_interest") or "")
+                source_urls = [str(value or "") for value in (interest_row.get("source_urls") or [])]
+                try:
+                    matched_index = labels.index(matched_interest)
+                except ValueError:
+                    matched_index = 0
+                source_url = source_urls[matched_index] if matched_index < len(source_urls) else ""
                 ranked.append((
                     interest_score, professor_id, [],
-                    "RESEARCH_INTEREST", summary,
-                    str(interest_row.get("source_url") or ""),
+                    "RESEARCH_INTEREST", matched_interest or summary,
+                    source_url,
                 ))
             ranked.sort(key=lambda item: item[0], reverse=True)
             ranked = ranked[: int(topic.get("desired_results") or 100)]
@@ -286,13 +296,28 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                     paper_count += 1
 
             match_count = len(ranked)
+            # A topic is not exhausted while relevant enrichment work is still
+            # queued/running. This is intentionally conservative: "exhausted"
+            # must never mean "we stopped before classification/hiring finished".
+            cursor.execute(
+                """SELECT EXISTS (
+                       SELECT 1 FROM radar_jobs
+                       WHERE status IN ('queued','running')
+                         AND job_type IN (
+                           'MATCH_FACULTY_PUBLICATIONS','ENRICH_CLASSIFY_PAPER',
+                           'QWEN_REVIEW_PUBLICATION','QWEN_REVIEW_INTERESTS',
+                           'CHECK_GRANTS','CHECK_HIRING'
+                         )
+                   ) AS pending"""
+            )
+            pending_enrichment = bool((cursor.fetchone() or {}).get("pending"))
             cursor.execute(
                 """
                 UPDATE radar_topics
                 SET normalized_topic = %s, research_category_id = %s,
                     discovery_version = %s, candidates_seen = %s,
                     verified_count = %s, papers_found = %s,
-                    sources_exhausted = TRUE,
+                    sources_exhausted = %s,
                     status = CASE WHEN %s > 0 THEN 'ready' ELSE 'partial' END,
                     last_error = NULL, last_indexed_at = NOW(),
                     next_refresh_at = NOW() + INTERVAL '30 days', updated_at = NOW()
@@ -300,7 +325,7 @@ def index_rostered_topic(radar_topic_id: int) -> dict[str, int]:
                 """,
                 (category["canonical_name"], category["id"], ROSTER_DISCOVERY_VERSION,
                  match_count, match_count, paper_count,
-                 match_count, radar_topic_id),
+                 not pending_enrichment, match_count, radar_topic_id),
             )
     rebuild_professor_profiles(list(matches))
     return {"professors_matched": len(ranked), "papers_matched": paper_count}
