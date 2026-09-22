@@ -16,7 +16,7 @@ from db import get_db_connection
 from ingestion.research_seeds import RESEARCH_SEED_GROUPS
 
 
-CLASSIFICATION_VERSION = 3
+CLASSIFICATION_VERSION = 4
 USER_AGENT = "ScholarRadar/2.0 publication-metadata-enricher"
 STOP_WORDS = {
     "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
@@ -76,7 +76,7 @@ SPECIALIZED_CATEGORIES = (
     CategoryDefinition(
         "robotics", "Robotics",
         "Design, control, perception, learning, and operation of physical robots and robotic systems.",
-        aliases=("robotics", "robot", "robots", "robotic system", "robotic systems",
+        aliases=("robotics", "robot", "robots", "robotic", "robotic system", "robotic systems",
                  "autonomous robot", "autonomous robots"),
         positive_terms=("robotic arm", "mobile robot", "humanoid robot", "robot navigation",
                         "robot manipulation", "robot learning", "robot motion planning"),
