@@ -408,6 +408,62 @@ def _page_is_person_specific(professor: dict[str, Any], url: str, snapshot: dict
     return bool(len(expected) >= 7 and expected in compact_url)
 
 
+
+_ATTRIBUTED_PERSON_PREFIX = re.compile(
+    r"""
+    ^\s*
+    (?P<label>
+        [A-Z][A-Za-zÀ-ÖØ-öø-ÿ.'’\-]*
+        (?:
+            \s+
+            (?:
+                [A-Z][A-Za-zÀ-ÖØ-öø-ÿ.'’\-]*
+                |
+                (?:de|del|van|von|ibn|bin|al)
+            )
+        ){1,5}
+    )
+    \s*[-–—]\s+
+    """,
+    re.VERBOSE,
+)
+
+_ATTRIBUTION_NON_NAME_TOKENS = {
+    "artificial",
+    "cloud",
+    "computer",
+    "computing",
+    "cybersecurity",
+    "faculty",
+    "graduate",
+    "intelligence",
+    "learning",
+    "machine",
+    "project",
+    "projects",
+    "research",
+    "robotics",
+    "science",
+    "student",
+    "students",
+}
+
+
+def _starts_attributed_person_block(text: str) -> bool:
+    """Identify a new named-person block on a shared opportunities page."""
+    value = " ".join(str(text or "").split())
+    match = _ATTRIBUTED_PERSON_PREFIX.match(value)
+    if not match:
+        return False
+    label = match.group("label").strip()
+    tokens = name_tokens(label)
+    if not 2 <= len(tokens) <= 6:
+        return False
+    if any(token.casefold() in _ATTRIBUTION_NON_NAME_TOKENS for token in tokens):
+        return False
+    return True
+
+
 def _scoped_professor_sentences(
     professor: dict[str, Any], snapshot: dict[str, Any]
 ) -> list[str]:
@@ -423,12 +479,24 @@ def _scoped_professor_sentences(
         scoped: list[str] = [text]
         for following in blocks[index + 1:index + 10]:
             next_tag = str(following.get("tag") or "")
-            next_text = str(following.get("text") or "")
+            next_text = " ".join(str(following.get("text") or "").split())
+
             if re.fullmatch(r"h[1-6]", next_tag):
                 next_level = int(next_tag[1])
                 if start_level is None or next_level <= start_level:
                     break
+
+            # Some official shared-opportunity pages put each professor in a
+            # normal paragraph/list item. Stop before the next named professor
+            # so one person's recruiting language cannot leak to another.
+            if (
+                _starts_attributed_person_block(next_text)
+                and not _ordered_name_present(name, next_text)
+            ):
+                break
+
             scoped.append(next_text)
+
         matches: list[str] = []
         for chunk in scoped:
             for sentence in re.split(r"(?<=[.!?])\s+|[;\n\r\t]+", chunk):
@@ -438,7 +506,6 @@ def _scoped_professor_sentences(
         if matches:
             return list(dict.fromkeys(matches))[:5]
     return []
-
 
 def _quote_names_conflicting_program(professor: dict[str, Any], quote: str) -> bool:
     """Catch explicit program acronyms that contradict the stored employer."""
@@ -520,6 +587,26 @@ def save_signal_to_db(
             )
             signal_row = cursor.fetchone()
             inserted = bool(signal_row and signal_row.get("inserted"))
+
+            # Keep only the current PRESENT quote for a professor/source pair.
+            # This retires previously cross-attributed evidence after scoping
+            # is corrected, while preserving the old row as historical data.
+            cursor.execute(
+                """
+                UPDATE hiring_signals
+                SET check_status = 'NOT_FOUND',
+                    last_checked_at = NOW(),
+                    consecutive_check_failures = 0,
+                    next_check_at = NOW() + INTERVAL '30 days'
+                WHERE professor_id = %s
+                  AND source_url = %s
+                  AND attribution_status = 'VERIFIED'
+                  AND raw_text_hash <> %s
+                  AND check_status = 'PRESENT'
+                """,
+                (professor_id, source_url, quote_hash),
+            )
+
             opportunity_id = None
             # Hiring evidence is volatile and expires. It is ranked dynamically
             # by the read query, so never bake it into the permanent professor
