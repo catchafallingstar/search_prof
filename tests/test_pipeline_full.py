@@ -1845,6 +1845,73 @@ def test_stage15_shared_page_erik_does_not_get_sara_signal():
     assert "i am looking for a graduate student" not in joined
 
 
+
+def test_stage15_shared_page_paragraph_boundaries():
+    """Live-like GVSU layout: each professor is a normal paragraph."""
+    from ingestion.parse_hiring_signals import _scoped_professor_sentences
+
+    snapshot = {
+        "blocks": [
+            {
+                "tag": "p",
+                "text": (
+                    "Rahat Ibn Rafiq - I'd love to have a graduate "
+                    "student help me build interactive systems."
+                ),
+            },
+            {
+                "tag": "p",
+                "text": (
+                    "Sara Sutton - I am looking for a graduate "
+                    "student to research Machine Learning and Cybersecurity."
+                ),
+            },
+            {
+                "tag": "p",
+                "text": (
+                    "Erik Fredericks - It would be great to have "
+                    "a graduate student interested in search-based "
+                    "software engineering and robotics."
+                ),
+            },
+        ],
+    }
+
+    rahat = {
+        "name": "Rahat Ibn Rafiq",
+        "institution_name": "Grand Valley State University",
+    }
+    sara = {
+        "name": "Sara Sutton",
+        "institution_name": "Grand Valley State University",
+    }
+    erik = {
+        "name": "Erik Fredericks",
+        "institution_name": "Grand Valley State University",
+    }
+
+    rahat_text = " ".join(
+        _scoped_professor_sentences(rahat, snapshot)
+    ).casefold()
+    sara_text = " ".join(
+        _scoped_professor_sentences(sara, snapshot)
+    ).casefold()
+    erik_text = " ".join(
+        _scoped_professor_sentences(erik, snapshot)
+    ).casefold()
+
+    assert "love to have a graduate student" in rahat_text
+    assert "looking for a graduate student" not in rahat_text
+    assert "it would be great" not in rahat_text
+
+    assert "looking for a graduate student" in sara_text
+    assert "love to have a graduate student" not in sara_text
+    assert "it would be great" not in sara_text
+
+    assert "it would be great" in erik_text
+    assert "looking for a graduate student" not in erik_text
+
+
 # ============================================================================
 # STAGE 15B
 # COMPLETE SINGLE-PROFESSOR HIRING EXTRACTION
@@ -2093,7 +2160,7 @@ def test_stage18_db_staff_review_breakdown():
             cur.execute("""
             SELECT
                 COUNT(*) FILTER (
-                    WHERE validation_version < 3
+                    WHERE validation_version < 4
                     AND validation_status NOT IN (
                         'PENDING',
                         'PROFILE_VERIFIED',
@@ -2103,15 +2170,15 @@ def test_stage18_db_staff_review_breakdown():
                         'HISTORICAL_PROFILE',
                         'NOT_GROUP_LEADING_FACULTY'
                     )
-                ) AS historical_v2_review,
+                ) AS historical_pre_v4_review,
 
                 COUNT(*) FILTER (
-                    WHERE validation_version >= 3
+                    WHERE validation_version >= 4
                     AND validation_status='ROLE_UNCLEAR'
                 ) AS current_role_unclear,
 
                 COUNT(*) FILTER (
-                    WHERE validation_version >= 3
+                    WHERE validation_version >= 4
                     AND validation_status='NAME_MISMATCH'
                 ) AS current_name_mismatch,
 
@@ -2146,7 +2213,7 @@ def test_stage18_db_staff_review_breakdown():
             "configured_database": database,
         },
         expected={
-            "historical_v2_review":
+            "historical_pre_v4_review":
                 "0 after historical migration/requeue",
             "technical_profile_unavailable":
                 "may exist but must NOT count as staff review",
@@ -2165,8 +2232,8 @@ def test_stage18_db_staff_review_breakdown():
 
     # Historical v2 unresolved decisions should eventually be zero
     # after you run the migration/requeue cleanup.
-    assert roster["historical_v2_review"] == 0, (
-        "\nHistorical validation-version-2 staff-review rows "
+    assert roster["historical_pre_v4_review"] == 0, (
+        "\nHistorical pre-v4 staff-review rows "
         "still exist. Requeue them with the current validator."
     )
 
@@ -2458,7 +2525,7 @@ def test_stage99_pipeline_contract_versions():
             "faculty_verification_version": 20,
             "research_profile_version": 3,
             "publication_discovery_version": 16,
-            "classification_version": 3,
+            "classification_version": 4,
         },
         actual=actual,
         explanation=(
