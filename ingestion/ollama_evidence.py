@@ -12,7 +12,7 @@ from db import get_db_connection
 from settings import setting, setting_bool, setting_int
 
 
-PROMPT_VERSION = "faculty-evidence-v1"
+PROMPT_VERSION = "faculty-evidence-v2"
 PUBLICATION_PROMPT_VERSION = "publication-identity-v3"
 RESEARCH_INTEREST_PROMPT_VERSION = "research-interest-v3"
 PAPER_RESEARCH_PROMPT_VERSION = "paper-research-v4"
@@ -65,6 +65,9 @@ def validate_review(data: dict[str, Any], source_text: str) -> tuple[str, ...]:
     if str(data.get("record_type") or "").upper() not in ALLOWED_RECORD_TYPES:
         errors.append("invalid record_type")
     evidence = data.get("evidence") or {}
+    if isinstance(evidence, list) and all(isinstance(item, str) for item in evidence):
+        evidence = {f"quote_{index}": quote for index, quote in enumerate(evidence)}
+        data["evidence"] = evidence
     if not isinstance(evidence, dict):
         errors.append("evidence must be an object")
         evidence = {}
@@ -87,6 +90,7 @@ def _prompt(kind: str, institution: str, directory_url: str, source_text: str) -
 Use only the supplied record. Never guess or combine neighboring people.
 If name, email, URL, and role are not one coherent identity, set
 card_boundary_valid=false, identity_coherent=false, and list each conflict.
+Return evidence as an object mapping field names to exact quotation strings.
 Copy exact evidence quotations. Represent missing facts with empty strings.
 Return JSON only with these keys: record_type, subject_name, preferred_name,
 name_aliases, role_exact, department, email, profile_url,

@@ -1790,7 +1790,13 @@ def enqueue_due_maintenance(limit: int = 20) -> int:
                 """
                 SELECT id FROM faculty_directories directory
                 WHERE active = TRUE AND validation_status = 'APPROVED'
-                  AND (last_success_at IS NULL OR last_success_at <= NOW() - INTERVAL '30 days')
+                  AND (last_success_at IS NULL OR last_success_at <= NOW() - INTERVAL '30 days'
+                    OR EXISTS (SELECT 1 FROM roster_member_candidates retry
+                        WHERE retry.directory_id=directory.id
+                        AND retry.validation_status='ROSTER_CONFIRMED_PROFILE_UNAVAILABLE'
+                        AND retry.checked_at <= NOW() - CASE
+                            WHEN retry.profile_evidence->>'http_status' IN ('404','410')
+                            THEN INTERVAL '7 days' ELSE INTERVAL '6 hours' END))
                   AND NOT EXISTS (
                       SELECT 1 FROM radar_jobs active_job
                       WHERE active_job.faculty_directory_id = directory.id
@@ -2623,7 +2629,7 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                          WHERE validation_status NOT IN
                            ('PENDING','PROFILE_VERIFIED','ROSTER_VERIFIED',
                             'REJECTED','NOT_A_PERSON','HISTORICAL_PROFILE',
-                            'NOT_GROUP_LEADING_FACULTY'))
+                            'NOT_GROUP_LEADING_FACULTY','ROSTER_CONFIRMED_PROFILE_UNAVAILABLE'))
                       + (SELECT COUNT(*) FROM professor_identity_review_queue
                          WHERE status='PENDING')
                       + (SELECT COUNT(*) FROM scholar_publication_review_queue
@@ -2639,9 +2645,11 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                            ('REJECTED','NOT_A_PERSON','HISTORICAL_PROFILE',
                             'NOT_GROUP_LEADING_FACULTY'))
                     ) AS automatically_rejected,
-                    (SELECT COUNT(*) FROM radar_jobs
+                    ((SELECT COUNT(*) FROM roster_member_candidates
+                      WHERE validation_status='ROSTER_CONFIRMED_PROFILE_UNAVAILABLE')
+                     + (SELECT COUNT(*) FROM radar_jobs
                      WHERE status='failed'
-                        OR (status='running' AND locked_at < NOW() - INTERVAL '6 minutes'))
+                        OR (status='running' AND locked_at < NOW() - INTERVAL '6 minutes')))
                         AS technical_failures,
                     (SELECT COUNT(*) FROM professors p
                      WHERE p.publication_status IN ('OFFICIAL_PUBLICATIONS_FOUND','SCHOLAR_VERIFIED'))
@@ -2999,12 +3007,28 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
                    WHERE candidate.validation_status NOT IN
                          ('PENDING', 'PROFILE_VERIFIED', 'ROSTER_VERIFIED',
                           'REJECTED', 'NOT_A_PERSON', 'HISTORICAL_PROFILE',
-                          'NOT_GROUP_LEADING_FACULTY')
+                          'NOT_GROUP_LEADING_FACULTY','ROSTER_CONFIRMED_PROFILE_UNAVAILABLE')
                    ORDER BY candidate.checked_at DESC NULLS LAST
                    LIMIT %s""",
                 (max(1, min(250, int(limit))),),
             )
             roster_member_issues = list(cursor.fetchall())
+            cursor.execute(
+                """SELECT candidate.displayed_name AS name, institution.name AS institution,
+                          candidate.profile_url, candidate.validation_reason AS error,
+                          candidate.profile_evidence->>'http_status' AS http_status,
+                          candidate.checked_at,
+                          candidate.checked_at + CASE
+                            WHEN candidate.profile_evidence->>'http_status' IN ('404','410')
+                            THEN INTERVAL '7 days' ELSE INTERVAL '6 hours' END AS retry_eligible_at
+                   FROM roster_member_candidates candidate
+                   JOIN faculty_directories directory ON directory.id=candidate.directory_id
+                   JOIN institutions institution ON institution.id=directory.institution_id
+                   WHERE candidate.validation_status='ROSTER_CONFIRMED_PROFILE_UNAVAILABLE'
+                   ORDER BY candidate.checked_at NULLS FIRST LIMIT %s""",
+                (max(1, min(250, int(limit))),),
+            )
+            profile_fetch_issues = list(cursor.fetchall())
             cursor.execute(
                 """SELECT p.id AS professor_id, p.name, p.institution_name,
                           p.department, p.faculty_title, p.faculty_source_url,
@@ -3080,6 +3104,7 @@ def list_radar_operations(admin_user_id: int, limit: int = 100) -> dict[str, Any
         "directory_issues": directory_issues,
         "faculty_page_issues": faculty_page_issues,
         "roster_member_issues": roster_member_issues,
+        "profile_fetch_issues": profile_fetch_issues,
         "research_profile_issues": research_profile_issues,
         "publication_identity_issues": publication_identity_issues,
         "publication_row_issues": publication_row_issues,

@@ -72,6 +72,12 @@ def live_panel() -> None:
     quality_columns[2].metric("Automatically rejected", int(quality.get("automatically_rejected") or 0))
     quality_columns[3].metric("Technical failures", int(quality.get("technical_failures") or 0))
 
+    profile_fetch_issues = operations.get("profile_fetch_issues") or []
+    if profile_fetch_issues:
+        with st.expander("Profile pages waiting for retry"):
+            st.caption("The worker retries temporary failures after six hours and missing pages after seven days. Actual start time depends on the queue.")
+            st.dataframe(profile_fetch_issues, hide_index=True, width="stretch")
+
     st.subheader("Live activity")
     worker = live.get("worker") or {}
     if worker:

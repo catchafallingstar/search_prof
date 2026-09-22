@@ -17,9 +17,9 @@ from ingestion.ollama_evidence import NONFACULTY_TYPES, OllamaReview, review as 
 
 
 _FACULTY_ROLE = re.compile(
-    r"\b(?:assistant|associate|full|distinguished|endowed|research|clinical|adjunct|"
-    r"visiting|teaching|practice|affiliate)?\s*professor(?:\s+emerit(?:us|a))?\b|"
-    r"\bprofessor\s+emerit(?:us|a)\b|\b(?:senior\s+)?lecturer\b|\binstructor\b|"
+    r"\b(?:(?:assistant|associate|full|distinguished|university|endowed|research|clinical|adjunct|"
+    r"visiting|teaching|practice|affiliate)\s+)*professor(?:\s+emerit(?:us|a))?\b|"
+    r"\bprofessor\s+emerit(?:us|a)\b|\b(?:senior\s+)?(?:lecturer|instructor)\b|"
     r"\b(?:senior\s+)?(?:affiliate|affiliated|visiting|adjunct|research|clinical|teaching|part[- ]time)\s+faculty(?:\s+member)?\b",
     re.I,
 )
@@ -95,6 +95,7 @@ class RosterMember:
     section_heading: str = ""
     research_interests: tuple[str, ...] = ()
     raw_card_html: str = ""
+    structured_title: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,9 +130,9 @@ def _canonical_rank(text: str) -> str | None:
     # research-group pipeline must not treat them as research-group leaders.
     if re.search(r"\b(?:assistant|associate)?\s*teaching professor\b", lowered):
         return "FACULTY_OTHER"
-    if "assistant professor" in lowered:
+    if re.search(r"\bassistant(?:\s+(?:clinical|research|practice))?\s+professor\b", lowered):
         return "ASSISTANT_PROFESSOR"
-    if "associate professor" in lowered:
+    if re.search(r"\bassociate(?:\s+(?:clinical|research|practice))?\s+professor\b", lowered):
         return "ASSOCIATE_PROFESSOR"
     if "professor" in lowered:
         return "PROFESSOR"
@@ -182,6 +183,7 @@ def _clean_display_person_name(value: str) -> str:
     """Normalize common roster display formats without inventing identity data."""
     name = " ".join(str(value or "").split()).strip()
     name = re.sub(r"^(?:Dr|Professor)\.?\s+", "", name, flags=re.I)
+    name = re.sub(r"\s+(?:(?:outdoor|professional|faculty)\s+)?(?:headshot|portrait|photo)(?:graph)?[.!]?\s*$", "", name, flags=re.I)
     if name.count(",") == 1:
         family, given = (part.strip() for part in name.split(",", 1))
         suffix = given.casefold().rstrip(".")
@@ -231,11 +233,16 @@ def _container_signature(container: object) -> str:
 def _smallest_person_container(anchor: object) -> object | None:
     """Return the person's own card, never a broader section containing peers."""
     for parent in anchor.parents:
-        if getattr(parent, "name", None) not in {"article", "li", "tr", "section", "div"}:
+        if getattr(parent, "name", None) not in {"article", "li", "tr", "section", "div", "p"}:
             continue
         local_text = " ".join(parent.get_text(" ", strip=True).split())
         if len(local_text) > 600:
             return None
+        if parent.name == "p" and not (
+            _looks_like_person_name(anchor.get_text(" ", strip=True))
+            or _person_name_from_container(parent)
+        ):
+            continue
         if len(parent.find_all("a", href=True)) <= 6:
             return parent
     return None
@@ -243,7 +250,7 @@ def _smallest_person_container(anchor: object) -> object | None:
 
 def _person_name_from_container(container: object) -> str:
     """Recover a real displayed name when the profile link is an action label."""
-    candidates: list[str] = []
+    candidates: list[str] = [node.get_text(" ", strip=True) for node in container.select(".staff-name, .person-name")]
     for node in container.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"], limit=12):
         candidates.append(node.get_text(" ", strip=True))
     for node in container.find_all("img", alt=True, limit=6):
@@ -276,9 +283,47 @@ def _normalized_research_interest(value: str) -> str:
     return " ".join(re.findall(r"[^\W_]+", value.casefold(), re.UNICODE))
 
 
+def _materialize_directory_grids(root: object) -> None:
+    """Expose header-labelled WPBakery rows to the structured table reader."""
+    for view in root.select('.js-wpv-view-layout'):
+        header = view.select_one('.row.titles')
+        if header is None:
+            # Headers can be siblings preceding the view, not children of it.
+            for previous in view.find_all_previous('div', class_='vc_row', limit=20):
+                columns = previous.find_all('div', class_='vc_column_container', recursive=False)
+                values = [cell.get_text(' ', strip=True).casefold() for cell in columns]
+                if 'name' in values and any(value in {'title', 'position'} for value in values):
+                    header = previous
+                    break
+        if header is None:
+            continue
+        labels = [cell.get_text(' ', strip=True) for cell in header.find_all('div', recursive=False) if cell.get_text(' ', strip=True)]
+        if 'name' not in {label.casefold() for label in labels} or not any(label.casefold() in {'title', 'position'} for label in labels):
+            continue
+        document = BeautifulSoup('<table><tr></tr></table>', 'html.parser')
+        table = document.table
+        for label in labels:
+            cell = document.new_tag('th')
+            cell.string = label
+            table.tr.append(cell)
+        for row in view.select('[id="profile-inside-row"], [id="profile_row"]'):
+            columns = row.find_all('div', class_='vc_column_container', recursive=False)
+            if len(columns) != len(labels):
+                continue
+            record = document.new_tag('tr')
+            for column in columns:
+                cell = document.new_tag('td')
+                fragment = BeautifulSoup(str(column), 'html.parser')
+                cell.append(fragment)
+                record.append(cell)
+            table.append(record)
+        view.append(table)
+
+
 def _table_roster_members(root: object, directory_url: str) -> list[RosterMember]:
     """Parse server-rendered directories whose names and links occupy different cells."""
     members: list[RosterMember] = []
+    _materialize_directory_grids(root)
     for table in root.find_all("table"):
         rows = table.find_all("tr")
         if len(rows) < 4:
@@ -304,24 +349,27 @@ def _table_roster_members(root: object, directory_url: str) -> list[RosterMember
                 continue
             links = [anchor for anchor in row.find_all("a", href=True)
                      if not str(anchor.get("href") or "").casefold().startswith(("mailto:", "tel:", "/cdn-cgi/"))
+                     and "/cdn-cgi/" not in str(anchor.get("href") or "")
                      and str(anchor.get("href") or "") != "#"]
             if not links:
                 continue
-            profile_link = next((anchor for anchor in links if re.search(
+            name_links = cells[name_index].find_all("a", href=True) if name_index is not None else []
+            profile_link = next((anchor for anchor in name_links if anchor in links), None)
+            profile_link = profile_link or next((anchor for anchor in links if re.search(
                 r"\b(?:view|meet|profile|bio)\b", anchor.get_text(" ", strip=True), re.I
             )), links[-1])
             profile_url = urljoin(directory_url, str(profile_link.get("href") or ""))
             if not _canonical_profile_url(profile_url) or _canonical_profile_url(profile_url) == _canonical_profile_url(directory_url):
                 continue
             context = " | ".join(" ".join(cell.get_text(" ", strip=True).split()) for cell in cells)
-            if _NONFACULTY.search(context):
-                continue
-            role = _FACULTY_ROLE.search(context)
+            title_index = next((i for i, value in enumerate(headers) if value in {"title", "position", "rank", "role"}), None)
+            exact_title = cells[title_index].get_text(" ", strip=True) if title_index is not None and title_index < len(cells) else ""
+            role = _FACULTY_ROLE.search(exact_title or context)
             email = next((re.sub(r"^mailto:", "", str(a.get("href") or ""), flags=re.I).split("?", 1)[0]
                           for a in row.find_all("a", href=True)
                           if str(a.get("href") or "").casefold().startswith("mailto:")), "")
             office_index = next((i for i, value in enumerate(headers) if "office" in value and "phone" not in value), None)
-            department_index = next((i for i, value in enumerate(headers) if "department" in value or value == "program"), None)
+            department_index = next((i for i, value in enumerate(headers) if "department" in value or value in {"program", "dept/office"}), None)
             research_index = next((
                 i for i, value in enumerate(headers)
                 if value in {"research", "research interests", "research areas", "expertise", "areas of expertise"}
@@ -333,12 +381,13 @@ def _table_roster_members(root: object, directory_url: str) -> list[RosterMember
                 if research_index is not None and research_index < len(cells) else ""
             )
             members.append(RosterMember(
-                name=name, title=role.group(0).strip() if role else "", profile_url=profile_url,
-                appointment_type=_appointment_type(context), excerpt=context[:500], email=email,
+                name=name, title=exact_title or (role.group(0).strip() if role else ""), profile_url=profile_url,
+                appointment_type=_appointment_type(exact_title or context), excerpt=context[:500], email=email,
                 office_address=cells[office_index].get_text(" ", strip=True) if office_index is not None and office_index < len(cells) else "",
                 section_heading=section,
                 research_interests=research_interests,
                 raw_card_html=str(row)[:24000],
+                structured_title=bool(exact_title),
             ))
     return members
 
@@ -361,7 +410,7 @@ def _linked_profile_card_members(root: object, directory_url: str) -> list[Roste
                 continue
             cleaned = re.sub(r"^(?:Dr|Professor)\.?\s+", "", context.strip(), flags=re.I)
             if _looks_like_person_name(cleaned):
-                container, name = parent, cleaned
+                container, name = parent, _clean_display_person_name(cleaned)
                 break
         if not name:
             image = anchor.find("img", alt=True)
@@ -370,7 +419,7 @@ def _linked_profile_card_members(root: object, directory_url: str) -> list[Roste
                 str(image.get("alt") or "").strip() if image else "", flags=re.I,
             )
             if _looks_like_person_name(image_name):
-                container, name = anchor.parent, image_name
+                container, name = anchor.parent, _clean_display_person_name(image_name)
         if not name:
             slug_match = re.search(r"/faculty-profile-(.+?)(?:-\d+)?/?$", path, re.I)
             slug_name = " ".join(
@@ -484,7 +533,7 @@ def parse_faculty_directory(
         if _FACULTY_ROLE.search(name):
             continue
         profile_url = urljoin(directory_url, str(anchor.get("href") or ""))
-        if _canonical_profile_url(profile_url) == _canonical_profile_url(directory_url):
+        if not _canonical_profile_url(profile_url) or _canonical_profile_url(profile_url) == _canonical_profile_url(directory_url):
             continue
         profile_host = urlparse(profile_url).hostname or ""
         if not profile_host or not (
@@ -495,6 +544,8 @@ def parse_faculty_directory(
         context = " ".join((container or anchor).get_text(" ", strip=True).split())[:1000]
         heading = anchor.find_previous(["h1", "h2", "h3", "h4"])
         section = " ".join(heading.get_text(" ", strip=True).split()) if heading else ""
+        if canonical_name_key(section) == canonical_name_key(name):
+            section = ""
         role_match = _FACULTY_ROLE.search(context)
         if _NONFACULTY.search(section) or _NONFACULTY.search(context):
             continue
@@ -506,7 +557,7 @@ def parse_faculty_directory(
         title = role_match.group(0).strip()
         member = RosterMember(
             name=name, title=title, profile_url=profile_url,
-            appointment_type=_appointment_type(context + " " + section),
+            appointment_type=_appointment_type(title + " " + section),
             excerpt=context[:500],
             email=((container.find("a", href=re.compile(r"^mailto:", re.I)) or {}).get("href", "")[7:].split("?", 1)[0]),
             phone=" ".join((container.find("a", href=re.compile(r"^tel:", re.I)) or anchor).get_text(" ", strip=True).split()) if container.find("a", href=re.compile(r"^tel:", re.I)) else "",
@@ -521,7 +572,7 @@ def parse_faculty_directory(
         if signature in repeated:
             members.setdefault(_canonical_profile_url(member.profile_url), member)
     for member in _table_roster_members(root, directory_url):
-        members.setdefault(_canonical_profile_url(member.profile_url), member)
+        members[_canonical_profile_url(member.profile_url)] = member
     for member in _linked_profile_card_members(root, directory_url):
         members.setdefault(_canonical_profile_url(member.profile_url), member)
     if fetch_embedded:
@@ -574,6 +625,15 @@ def classify_faculty_page(
     members = parse_faculty_directory(html, directory_url, fetch_embedded=fetch_embedded)
     organizational_scope = bool(re.search(r"\b(?:department|school|college|university|program)\b", identity, re.I))
     faculty_scope = bool(re.search(r"\bfacult(?:y|ies)\b", f"{title} {h1} {breadcrumbs}", re.I))
+    # An official .edu page with a faculty heading and repeated same-site
+    # profile records establishes scope even when its brand is an acronym.
+    if faculty_scope and host.endswith('.edu') and len(members) >= minimum_members:
+        institution_host = '.'.join(host.split('.')[-2:])
+        organizational_scope = organizational_scope or all(
+            (urlparse(member.profile_url).hostname or '').removeprefix('www.') == institution_host
+            or (urlparse(member.profile_url).hostname or '').endswith('.' + institution_host)
+            for member in members
+        )
     if not members:
         return DirectoryClassification("NOT_A_ROSTER", "NO_PERSON_ROSTER", "NO_EXTRACTABLE_FACULTY_RECORDS", h1, ())
     if not faculty_scope and not (organizational_scope and len(members) >= max(3, minimum_members)):
@@ -610,7 +670,7 @@ def _main_profile_content(soup: BeautifulSoup) -> object:
         or soup.body or soup
     )
     for node in root.select(
-        "script, style, noscript, header, nav, footer, aside, form, "
+        "script, style, noscript, header[role=banner], header.site-header, #masthead, nav, footer, aside, form, "
         ".navigation, .nav, .menu, .footer, .breadcrumbs, .breadcrumb, "
         ".related-content, .related-news"
     ):
@@ -713,8 +773,8 @@ def validate_directory_detail(
     checked = replace(
         member,
         name=observed_name or member.name,
-        title=role.group(0).strip(),
-        appointment_type=_appointment_type(role.group(0)),
+        title=role_text.strip(),
+        appointment_type=_appointment_type(role_text),
         email=fields.get("email", member.email),
         phone=fields.get("office phone", member.phone),
         office_address=fields.get("office address", fields.get("office", member.office_address)),
@@ -751,6 +811,10 @@ def validate_faculty_profile(
     title_text = " ".join((soup.title.get_text(" ", strip=True) if soup.title else "").split())
     root = _main_profile_content(soup)
     text = " ".join(root.get_text(" ", strip=True).split())
+    if re.search(r"^(?:just a moment|access denied|verify (?:you are|you're) human|attention required|service unavailable)", title_text, re.I):
+        return "ROSTER_CONFIRMED_PROFILE_UNAVAILABLE", "PROFILE_ACCESS_CHALLENGE", member, {}
+    if not text.strip():
+        return "ROSTER_CONFIRMED_PROFILE_UNAVAILABLE", "EMPTY_PROFILE_RESPONSE", member, {}
     # Only the page title and primary H1 identify the profile subject. H2s often
     # contain related stories or publication titles about somebody else.
     heading_values = [" ".join(node.get_text(" ", strip=True).split())
@@ -772,6 +836,16 @@ def validate_faculty_profile(
             and canonical_name_key(member.name) not in canonical_name_key(identity_text + " " + text)):
         return "NAME_MISMATCH", "PROFILE_NAME_DOES_NOT_MATCH_ROSTER", member, {}
     profile_role = _FACULTY_ROLE.search(text)
+    if member.structured_title and member.title:
+        # Labelled current roster fields outrank incidental biography prose.
+        if not _FACULTY_ROLE.search(member.title):
+            excluded = re.search(r"\b(?:emerit(?:us|a)|manager|officer|supervisor|director|specialist|librarian|post[- ]?doctoral|limited term faculty)\b", member.title, re.I)
+            return (
+                "NOT_GROUP_LEADING_FACULTY" if excluded else "ROLE_UNCLEAR",
+                "STRUCTURED_ROSTER_HAS_NO_GROUP_LEADING_RANK", member,
+                {"role": member.title, "role_source": "official_roster", "name": member.name},
+            )
+        profile_role = None
     roster_role = _FACULTY_ROLE.search(member.title or "")
     if not profile_role and not roster_role:
         return "ROLE_UNCLEAR", "NO_EXPLICIT_CURRENT_FACULTY_ROLE", member, {}
@@ -780,10 +854,10 @@ def validate_faculty_profile(
     verified_name = re.sub(
         r",?\s+(?:Ph\.?D\.?|M\.?D\.?)$", "", matched_profile_name, flags=re.I
     ).strip() or member.name
-    role_text = (profile_role or roster_role).group(0).strip()
+    role_text = member.title if member.structured_title and roster_role else (profile_role or roster_role).group(0).strip()
     role_source = "official_profile" if profile_role else "official_roster"
     verified = replace(
-        member, name=verified_name, title=role_text, email=email, profile_url=profile_url,
+        member, name=_clean_display_person_name(verified_name), title=role_text, email=email, profile_url=profile_url,
         appointment_type=_appointment_type(role_text),
     )
     signals = _profile_signals(root, verified, text)
@@ -850,14 +924,15 @@ def _apply_valid_card_review(
     if model_review.status != "VALID":
         return member, None, None
     data = model_review.data
-    if data.get("card_boundary_valid") is False or data.get("identity_coherent") is False:
+    if data.get("conflicts") or data.get("card_boundary_valid") is False or data.get("identity_coherent") is False:
         return member, "NEEDS_REVIEW", "OLLAMA_CARD_IDENTITY_CONFLICT"
     record_type = str(data.get("record_type") or "").upper()
     if record_type in NONFACULTY_TYPES:
         return member, "NOT_A_PERSON", f"OLLAMA_EXPLICIT_{record_type}"
     role_text = str(data.get("role_exact") or "").strip()
     role = _FACULTY_ROLE.search(role_text)
-    if not member.title and role:
+    grounded_role = " ".join(role_text.split()).casefold() in " ".join(member.excerpt.split()).casefold()
+    if not member.title and role and grounded_role:
         member = replace(
             member, title=role.group(0).strip(),
             appointment_type=_appointment_type(role.group(0)),
@@ -875,6 +950,15 @@ def _profile_review_source(html: str, member: RosterMember) -> str:
         f"EXPECTED_ROSTER_EMAIL: {member.email}\n"
         f"PROFILE_PAGE_TITLE: {title}\nPROFILE_MAIN_CONTENT:\n{main_text}"
     )[:24000]
+
+
+def _profile_fetch_failure(error: requests.RequestException, member: RosterMember):
+    response = getattr(error, 'response', None)
+    return (
+        'ROSTER_CONFIRMED_PROFILE_UNAVAILABLE', type(error).__name__, member,
+        {'http_status': getattr(response, 'status_code', None),
+         'fetch_state': 'RETRY_PENDING', 'error_type': type(error).__name__},
+    )
 
 
 def crawl_directory(
@@ -958,9 +1042,7 @@ def crawl_directory(
                     detail_response.text, member, str(directory["primary_domain"] or "")
                 )
             except requests.RequestException as error:
-                result = (
-                    "ROSTER_CONFIRMED_PROFILE_UNAVAILABLE", type(error).__name__, member, {}
-                )
+                result = _profile_fetch_failure(error, member)
         else:
             try:
                 profile_response = requests.get(
@@ -990,9 +1072,7 @@ def crawl_directory(
                     })
                     result = (result[0], result[1], result[2], evidence)
             except requests.RequestException as error:
-                result = (
-                    "ROSTER_CONFIRMED_PROFILE_UNAVAILABLE", type(error).__name__, member, {}
-                )
+                result = _profile_fetch_failure(error, member)
         status_code, reason, checked_member, profile_evidence = result
         profile_evidence = {
             **profile_evidence,
@@ -1027,16 +1107,21 @@ def crawl_directory(
                            section_heading, appointment_type, source_excerpt,
                            validation_status, validation_reason, profile_evidence,
                            validation_version, checked_at, last_seen_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,3,NOW(),NOW())
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,4,NOW(),NOW())
                        ON CONFLICT (directory_id, canonical_profile_url) DO UPDATE SET
                            displayed_name=EXCLUDED.displayed_name,
                            displayed_title=EXCLUDED.displayed_title,
+                           canonical_name_key=EXCLUDED.canonical_name_key,
+                           department=EXCLUDED.department,
+                           section_heading=EXCLUDED.section_heading,
+                           appointment_type=EXCLUDED.appointment_type,
+                           source_excerpt=EXCLUDED.source_excerpt,
                            email=EXCLUDED.email, phone=EXCLUDED.phone,
                            office_address=EXCLUDED.office_address,
                            validation_status=EXCLUDED.validation_status,
                            validation_reason=EXCLUDED.validation_reason,
                            profile_evidence=EXCLUDED.profile_evidence,
-                           validation_version=3,
+                           validation_version=4,
                            checked_at=NOW(), last_seen_at=NOW()
                        RETURNING id""",
                     (directory_id, member.name, name_key, member.title,
@@ -1047,13 +1132,19 @@ def crawl_directory(
                      profile_reason, json.dumps(profile_evidence)),
                 )
                 candidate_id = int(cursor.fetchone()["id"])
+                # Presence in the roster is independent of profile HTTP success.
+                cursor.execute("""UPDATE faculty_directory_memberships membership
+                    SET missing_checks=0, last_seen_at=NOW(), currently_listed=TRUE
+                    FROM professors p WHERE membership.professor_id=p.id
+                    AND membership.directory_id=%s AND p.canonical_profile_url=%s""",
+                    (directory_id, profile_key))
                 if profile_status not in {"PROFILE_VERIFIED", "ROSTER_VERIFIED"}:
                     continue
                 if not eligible_research_group_leader(
                     member.title,
                     member.appointment_type,
                     " | ".join(filter(None, (
-                        member.excerpt,
+                        member.section_heading,
                         str(profile_evidence.get("role") or ""),
                     ))),
                 ):
